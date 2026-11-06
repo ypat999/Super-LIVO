@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>super_livo_visual_b</name>
+  <version>0.0.1</version>
+  <description>方案 B：紧耦合 LiDAR-Visual-Inertial 前端、特征地图与多帧视觉约束（接口骨架，暂不含实现）</description>
+  <maintainer email="ypat999@gmail.com">ypat999</maintainer>
+  <license>GPL-2.0-or-later</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>eigen</depend>
+  <depend>libopencv-dev</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
