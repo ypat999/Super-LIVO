@@ -1,0 +1,12 @@
+[submodule "third_party/FAST-LIVO2-ROS2"]
+	path = third_party/FAST-LIVO2-ROS2
+	url = https://github.com/U-AMC/FAST-LIVO2-ROS2.git
+[submodule "third_party/Super-LIO"]
+	path = third_party/Super-LIO
+	url = https://github.com/ypat999/Super-LIO.git
+[submodule "third_party/basalt"]
+	path = third_party/basalt
+	url = https://github.com/VladyslavUsenko/basalt.git
+[submodule "third_party/rpg_svo_pro_open"]
+	path = third_party/rpg_svo_pro_open
+	url = https://github.com/uzh-rpg/rpg_svo_pro_open.git
