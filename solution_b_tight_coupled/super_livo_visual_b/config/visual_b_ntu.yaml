@@ -1,0 +1,99 @@
+/**:
+  ros__parameters:
+    # ========================================================================
+    # 方案 B · NTU VIRAL（Ouster OS1-16 + 单目灰度相机 + VectorNav VN100）
+    # 传感器参数取自官方 third_party/FAST-LIVO2-ROS2/config/{NTU_VIRAL,camera_NTU_VIRAL}.yaml
+    # ========================================================================
+    image_topic: "/left/image_raw"
+    odom_topic: "lio/odom"
+    cloud_topic: "lio/cloud_world"
+    body_cloud_topic: "lio/cloud_body_dense"
+    imu_topic: "/imu/imu"
+
+    scale: 1.0
+    cam_width: 752
+    cam_height: 480
+    cam_fx: 425.0258563372763
+    cam_fy: 426.7976260903337
+    cam_cx: 386.0151866550880
+    cam_cy: 241.9130336743440
+    cam_d: [-0.288105327549552, 0.074578284234601, 0.0007784489598138802, -0.0002277853975035461]
+
+    Rcl: [0.0218308, 0.99976, -0.00201407,
+          -0.0131205, 0.00230088, 0.999911,
+          0.999676, -0.0218025, 0.0131676]
+    Pcl: [0.122993, 0.0398643, -0.0577101]
+
+    img_time_offset: 0.0
+
+    patch.patch_size: 5
+    patch.pyramid_levels: 4
+    patch.max_features: 200
+    patch.lssd_threshold: 0.5
+    patch.min_distance: 8.0
+    patch.quality_level: 0.01
+    patch.use_lssd: true
+    patch.search_radius: 4
+
+    lifecycle.mature_observations: 4
+    lifecycle.max_failures: 2
+    lifecycle.max_track_length: 30
+
+    kf.max_keyframes: 20
+    kf.min_translation: 0.15
+    kf.min_rotation_deg: 5.0
+    kf.min_tracked_features: 40
+
+    lv.pixel_radius: 3
+    lv.huber_delta: 1.0
+    lv.min_constraints: 8
+    lv.max_pixel_error: 8.0
+    lv.sigma_pix: 1.5
+    lv.sigma_anchor: 0.05
+    lv.prior_pos_sigma: 0.05
+    lv.prior_rot_sigma: 0.02
+
+    msckf.min_observations: 4
+    msckf.max_track_length: 20
+    msckf.min_parallax_deg: 1.0
+    msckf.huber_delta: 1.0
+    msckf.use_nullspace_projection: true
+    msckf.sigma_pix: 1.5
+    msckf.sigma_track_pose: 0.05
+
+    photo.enable: false
+    photo.patch_size: 5
+    photo.pyramid_levels: 3
+    photo.huber_delta: 1.0
+    photo.max_intensity_error: 40.0
+
+    # 视觉注入：与仓库默认一致（已修好，可安全打开；收益判定见 yaml 注释）
+    est.enable_visual: true
+    est.visual_weight: 1.0
+    est.visual_info_ratio: 1.0
+    est.visual_rot_sigma_floor: 0.005
+    est.visual_pos_sigma_floor: 0.02
+    est.visual_pose_only: true
+    est.estimate_extrinsics: false
+    est.gyro_noise: 0.001
+    est.acc_noise: 0.01
+    est.bias_gyro_noise: 0.00001
+    est.bias_acc_noise: 0.0001
+    est.initial_covariance: 1.0
+
+    scheduler.enable: true
+    scheduler.max_pending: 3
+
+    color.sync_max_offset: 0.05
+    color.use_exposure_mid: true
+    color.depth_tolerance: 0.1
+    color.check_depth_edges: true
+    color.edge_threshold: 0.5
+    color.bilinear: true
+    color.keep_best_quality: true
+    color.min_quality: 0.2
+    color.use_own_odom: false
+
+    pcd.save_dir: "/home/ywj/slam_data/pcd/ntu_b"
+    pcd.save_interval_sec: 30.0
+    pcd.max_points: 20000000
