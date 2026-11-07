@@ -1,0 +1,134 @@
+/**:
+  ros__parameters:
+    # ========================================================================
+    # topic 订阅/发布（与 Super-LIO 及 bag 对齐，同方案 A）
+    # ========================================================================
+    image_topic: "/left_camera/image"
+    odom_topic: "lio/odom"
+    cloud_topic: "lio/cloud_world"
+    body_cloud_topic: "lio/cloud_body_dense"
+    imu_topic: "/livox/imu"
+
+    # ========================================================================
+    # 相机内参与畸变（camera_pinhole.yaml，scale=0.5 后，同方案 A）
+    # ========================================================================
+    scale: 0.5
+    cam_width: 640
+    cam_height: 512
+    cam_fx: 646.78472
+    cam_fy: 646.65775
+    cam_cx: 313.456795
+    cam_cy: 261.399612
+    cam_d: [-0.076160, 0.123001, -0.00113, 0.000251]
+
+    # ========================================================================
+    # 外参：相机-LiDAR（Rcl/Pcl）；LiDAR-IMU（extrinsic，可选，默认单位阵）
+    # ========================================================================
+    Rcl: [0.00610193, -0.999863, -0.0154172,
+          -0.00615449, 0.0153796, -0.999863,
+          0.999962, 0.00619598, -0.0060598]
+    Pcl: [0.0194384, 0.104689, -0.0251952]
+
+    # 图像真实采集时刻 = header.stamp + img_time_offset（秒），**只用于取相机位姿**，
+    # 不参与图像-点云配对（配对用 header.stamp，实测差 < 7 ms）。
+    # 取值依据同方案 A：官方轨迹重放做 0~0.15 s 扫描，1 cm 体素颜色标准差在 0.10 s 处
+    # 取极小值，且与官方 avia.yaml 的 0.1 一致。
+    img_time_offset: 0.1
+
+    # ========================================================================
+    # Patch 前端 PatchTracker（对应 gpt §3.2）
+    # ========================================================================
+    patch.patch_size: 5
+    patch.pyramid_levels: 4
+    patch.max_features: 200
+    patch.lssd_threshold: 0.5
+    patch.min_distance: 8.0
+    patch.quality_level: 0.01
+    patch.use_lssd: true
+    patch.search_radius: 4
+
+    # ========================================================================
+    # 特征生命周期 FeatureLifecycle（对应 gpt §3.2 / §四）
+    # ========================================================================
+    lifecycle.mature_observations: 4
+    lifecycle.max_failures: 2
+    lifecycle.max_track_length: 30
+
+    # ========================================================================
+    # 关键帧管理 KeyframeManager（对应 gpt §3.3 / §四）
+    # ========================================================================
+    kf.max_keyframes: 20
+    kf.min_translation: 0.15
+    kf.min_rotation_deg: 5.0
+    kf.min_tracked_features: 40
+
+    # ========================================================================
+    # 2D-3D 约束 LidarVisualConstraint（对应 gpt §3.3）
+    # ========================================================================
+    lv.pixel_radius: 3
+    lv.huber_delta: 1.0
+    lv.min_constraints: 8
+    lv.max_pixel_error: 8.0
+    # LiDAR 先验强度（D2）：越小越信任 lio/odom，视觉修正越弱
+    lv.prior_pos_sigma: 0.05
+    lv.prior_rot_sigma: 0.02
+
+    # ========================================================================
+    # MSCKF 多帧约束 MsckfConstraint（对应 gpt §3.3）
+    # ========================================================================
+    msckf.min_observations: 4
+    msckf.max_track_length: 20
+    msckf.min_parallax_deg: 1.0
+    msckf.huber_delta: 1.0
+    msckf.use_nullspace_projection: true
+
+    # ========================================================================
+    # 光度约束 PhotometricConstraint（可选，默认关，对应 gpt §五）
+    # ========================================================================
+    photo.enable: false
+    photo.patch_size: 5
+    photo.pyramid_levels: 3
+    photo.huber_delta: 1.0
+    photo.max_intensity_error: 40.0
+
+    # ========================================================================
+    # 统一估计器 UnifiedEstimator（对应 gpt §3.4）
+    # ========================================================================
+    est.enable_visual: true
+    est.visual_weight: 1.0
+    est.estimate_extrinsics: false
+    est.gyro_noise: 0.001
+    est.acc_noise: 0.01
+    est.bias_gyro_noise: 0.00001
+    est.bias_acc_noise: 0.0001
+    est.initial_covariance: 1.0
+
+    # ========================================================================
+    # 延迟地图提交 MapCommitScheduler（对应 gpt §3.4）
+    # ========================================================================
+    scheduler.enable: true
+    scheduler.max_pending: 3
+
+    # ========================================================================
+    # 彩色点云（复用 pointcloud_colorizer，对应 gpt §2.4）
+    # ========================================================================
+    # 图像-扫描对齐窗口（秒）。限制 |t_pair - t_cloud|（图像 header 与点云 header）。
+    # 实测该差值 0.4~7.0 ms（P99 5.6 ms），0.05 已足够宽松；原 0.3 会把相邻帧图像
+    # 也算作"匹配"，同一批点被不同时刻图像重复染色，表现为拖影/发糊。
+    color.sync_max_offset: 0.05
+    color.use_exposure_mid: true
+    color.depth_tolerance: 0.1
+    color.check_depth_edges: true
+    color.edge_threshold: 0.5
+    color.bilinear: true
+    color.keep_best_quality: true
+    color.min_quality: 0.2
+
+    # ========================================================================
+    # 彩色地图落盘（把跑完的彩色点云输出为 PCD）
+    #   每帧上色点按扫描时刻位姿变换到世界系累积，定时器周期性覆盖写同一个文件，
+    #   节点退出时再存一次。输出：<save_dir>/super_livo_visual_b_colored.pcd
+    # ========================================================================
+    pcd.save_dir: "/home/ywj/slam_data/pcd"
+    pcd.save_interval_sec: 30.0
+    pcd.max_points: 20000000
