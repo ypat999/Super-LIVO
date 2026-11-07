@@ -39,6 +39,16 @@ class VisualUpdate {
   struct Options {
     bool enable{false};         ///< 视觉更新开关（默认关闭，先保证 A1/A2 可验证）
     double max_dx_norm{0.5};    ///< 增量范数上限，超出则拒绝（防异常跳变）
+    // ---- LiDAR 先验正则项 -------------------------------------------------
+    // 原实现直接解 (w·H_vis)·dx = -(w·b_vis)：权重 w 在左右两边同时出现会**被约掉**，
+    // 所以"轻度退化 0.3 / 严重退化 0.8"的权重其实完全不改变 dx 的大小，
+    // 一旦接受就是无正则的最小二乘全量拟合地图，等于让视觉一步接管位姿。
+    // 现在按贝叶斯写法加上先验信息 H_prior = diag(1/σ_rot², 1/σ_pos²)
+    // （误差状态以当前 LiDAR 位姿为参考，故先验残差为 0）：
+    //   (w·H_vis + H_prior)·dx = -w·b_vis
+    // 这样 w 才真正在"信 LiDAR"与"信视觉"之间插值。
+    double prior_rot_sigma{0.02};  ///< LiDAR 姿态先验标准差（rad）
+    double prior_pos_sigma{0.05};  ///< LiDAR 位置先验标准差（m）
   };
 
   explicit VisualUpdate(const Options& options);

@@ -42,6 +42,12 @@ class MsckfConstraint {
     double min_parallax_deg{1.0};
     double huber_delta{1.0};
     bool use_nullspace_projection{true};
+    // ---- 测量噪声模型（与 LidarVisualConstraint 同一套量级） -------------
+    double sigma_pix{1.5};
+    // 关键帧位姿自身的不确定度（m）。本实现把历史关键帧位姿当作**固定值**
+    // 参与三角化，它们的误差会系统性进入约束；特征位置虽被零空间投影消去，
+    // 位姿误差不消。用它折算成像素级下限，避免多帧约束同样过度自信。
+    double sigma_track_pose{0.05};
   };
 
   explicit MsckfConstraint(const Options& options);

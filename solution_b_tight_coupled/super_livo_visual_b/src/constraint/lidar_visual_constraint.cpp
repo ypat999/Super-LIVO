@@ -91,6 +91,7 @@ std::vector<VisualResidual> LidarVisualConstraint::build(
     // 这里必须看 triangulated（xyz_world 是否有效），否则会用 (0,0,0) 当锚点。
     Eigen::Vector3d anchor = track.xyz_world;
     bool has_anchor = track.triangulated;
+    bool anchor_from_grid = false;
 
     if (!has_anchor) {
       const long long cx = static_cast<long long>(last.pixel.x()) / kCellSize;
@@ -111,6 +112,7 @@ std::vector<VisualResidual> LidarVisualConstraint::build(
               best_distance = distance;
               anchor = p.xyz_world;
               has_anchor = true;
+              anchor_from_grid = true;
             }
           }
         }
@@ -127,6 +129,21 @@ std::vector<VisualResidual> LidarVisualConstraint::build(
     const double inv_z = 1.0 / p_c.z();
     const double u_pred = options_.fx * p_c.x() * inv_z + options_.cx;
     const double v_pred = options_.fy * p_c.y() * inv_z + options_.cy;
+
+    // ---- 测量方差 R = variance·I（像素²） --------------------------------
+    // 此前没有这一项，等价于假定 σ=1 px 且地图点是精确真值。43 个特征在
+    // z≈4 m 处会给出 (f/z)²·43 ≈ 1e7 的信息量，即 ~0.3 mm 的等效位置精度，
+    // 一帧就把位置协方差压塌，之后 LiDAR 先验再也拉不动（实测状态冻结在初值）。
+    // 现在按"像素噪声 ⊕ 锚点三维不确定度投影"给出量级正确的 R。
+    const double f_mean = 0.5 * (options_.fx + options_.fy);
+    const double anchor_pix = f_mean * options_.sigma_anchor * inv_z;
+    double variance = options_.sigma_pix * options_.sigma_pix + anchor_pix * anchor_pix;
+    if (anchor_from_grid) {
+      // 栅格内最近点关联：锚点可能取到同一栅格里的另一个物理点，
+      // 横向偏差最多 pixel_radius 个像素，按均匀分布折算标准差。
+      const double assoc = static_cast<double>(options_.pixel_radius) / std::sqrt(3.0);
+      variance += assoc * assoc;
+    }
 
     const Eigen::Vector2d residual(last.pixel.x() - u_pred, last.pixel.y() - v_pred);
     const double pixel_error = residual.norm();
@@ -148,6 +165,7 @@ std::vector<VisualResidual> LidarVisualConstraint::build(
     out.residual = residual;
     out.jacobian = -dpi_dpc * dPc_ddelta;
     out.weight = huberWeight(pixel_error, options_.huber_delta);
+    out.variance = variance;
     out.valid = true;
     residuals.push_back(out);
   }
@@ -171,8 +189,11 @@ void LidarVisualConstraint::accumulate(const std::vector<VisualResidual>& residu
     if (!r.valid) {
       continue;
     }
-    H += r.weight * r.jacobian.transpose() * r.jacobian;
-    b += r.weight * r.jacobian.transpose() * r.residual;
+    // Huber 权重仍在像素空间起作用（语义不变），噪声归一化单独按 1/variance
+    // 施加，即 H = Σ w·Jᵀ R⁻¹ J、b = Σ w·Jᵀ R⁻¹ r。cost 保持像素²便于诊断。
+    const double w = r.weight / std::max(1e-9, r.variance);
+    H += w * r.jacobian.transpose() * r.jacobian;
+    b += w * r.jacobian.transpose() * r.residual;
     cost += r.weight * r.residual.squaredNorm();
   }
 }

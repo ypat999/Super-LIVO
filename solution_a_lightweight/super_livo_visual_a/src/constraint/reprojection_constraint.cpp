@@ -95,6 +95,13 @@ std::vector<VisualResidualBlock> ReprojectionConstraint::build(
     block.residual = residual;
     block.jacobian = jacobian;
     block.weight = huberWeight(pixel_error, options_.huber_delta);
+    // 测量方差：像素噪声 ⊕ 深度关联锚点不确定度投影（f·σ_anchor/z）。
+    // 缺这一项等价于宣称每个特征能把位姿约束到 1 px（z=5 m 处仅 0.8 cm），
+    // 80 个特征叠加后位姿"精度"达毫米级，视觉会盖过 LiDAR 先验、把位姿
+    // 直接拉到拟合地图上，实测表现为修正量忽大忽小、不可信。
+    const double f_mean = 0.5 * (options_.fx + options_.fy);
+    const double anchor_pix = f_mean * options_.sigma_anchor * inv_z;
+    block.variance = options_.sigma_pix * options_.sigma_pix + anchor_pix * anchor_pix;
     block.valid = true;
     blocks.push_back(block);
   }
@@ -119,9 +126,11 @@ void ReprojectionConstraint::accumulate(const std::vector<VisualResidualBlock>& 
     if (!block.valid) {
       continue;
     }
-    // 注意：jacobian 是 dr/dδ，法方程使用 J^T J 与 J^T r。
-    H += block.weight * block.jacobian.transpose() * block.jacobian;
-    b += block.weight * block.jacobian.transpose() * block.residual;
+    // 注意：jacobian 是 dr/dδ，法方程使用 J^T R^-1 J 与 J^T R^-1 r。
+    // Huber 权重仍在像素空间计算（语义不变），噪声归一化单独按 1/variance 施加。
+    const double w = block.weight / std::max(1e-9, block.variance);
+    H += w * block.jacobian.transpose() * block.jacobian;
+    b += w * block.jacobian.transpose() * block.residual;
     cost += block.weight * block.residual.squaredNorm();
   }
 }

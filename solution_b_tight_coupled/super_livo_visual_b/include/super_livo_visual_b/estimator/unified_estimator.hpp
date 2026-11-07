@@ -33,12 +33,40 @@ class UnifiedEstimator {
     double visual_weight{1.0};
     bool estimate_extrinsics{false};
 
+    // ---- 视觉注入强度上限 -------------------------------------------------
+    // 即使残差方差模型建对了，单帧视觉也不该比 LiDAR 先验更自信：
+    // 地图点/关键帧位姿的误差是系统性的（LIO 漂移），不会随特征数按 √N 平均掉。
+    // 取两个上限的**较小者**：
+    //   ① 相对上限 κ：视觉信息量不超过 κ·λmax(P⁻¹|该块)；
+    //   ② 绝对下限 floor：视觉隐含的位姿精度不得优于 σ_floor。
+    // 只保留 ① 会被"自指"击穿——P 一旦被压小，λmax(P⁻¹) 随之变大、cap 也跟着变大，
+    // 协方差沿正反馈一路压到 1 cm 以下（实测 60 s 漂到 149 m）。
+    double visual_info_ratio{1.0};
+    double visual_rot_sigma_floor{0.005};  ///< 视觉隐含姿态精度下限（rad，≈0.3°）
+    double visual_pos_sigma_floor{0.02};   ///< 视觉隐含位置精度下限（m）
+    // 视觉更新是否只允许修改 rot/pos（屏蔽速度/零偏的协方差耦合项）。
+    // 必须为 true：视觉观测本质是"相对地图的位姿"，对速度没有独立信息，
+    // dx 的速度分量全部来自 P 的耦合项；即便每帧限幅到 0.05 m/s，600 帧也能
+    // 累积 30 m/s，再经 Φ(pos←vel) 放大成百米级漂移（实测 149 m 即此模式）。
+    // 速度/零偏只应由 IMU 传播与 LiDAR 先验修正。
+    bool visual_pose_only{true};
+
     // 过程噪声（简化模型，单位：rad/√s、m/√s² 等）
     double gyro_noise{1.0e-3};
     double acc_noise{1.0e-2};
     double bias_gyro_noise{1.0e-5};
     double bias_acc_noise{1.0e-4};
     double initial_covariance{1.0};
+  };
+
+  /// 最近一次视觉更新的诊断量（供节点日志判断修正量是否合理）。
+  struct VisualDiagnostics {
+    double info_lambda{0.0};   ///< 缩放前 λmax(H_vis)
+    double cap_lambda{0.0};    ///< 允许的上限 κ·λmax(P⁻¹|pose)
+    double scale{1.0};         ///< 实际施加的缩放系数
+    double dx_rot{0.0};        ///< 本帧注入的旋转修正（rad）
+    double dx_pos{0.0};        ///< 本帧注入的平移修正（m）
+    double sigma_pos{0.0};     ///< 更新后位置协方差开方（m）
   };
 
   explicit UnifiedEstimator(const Options& options);
@@ -64,12 +92,29 @@ class UnifiedEstimator {
 
   const Options& options() const;
 
+  /// 最近一次视觉更新的诊断量。
+  const VisualDiagnostics& visualDiagnostics() const { return vis_diag_; }
+
  private:
   /// 信息形式更新：P^-1 <- P^-1 + w·H，dx = -P_new·w·b。
-  void applyInformationUpdate(const Eigen::MatrixXd& H, const Eigen::VectorXd& b, double weight);
+  /// max_* > 0 时按各块上限对 dx 做整体等比限幅（发散防线）。
+  void applyInformationUpdate(const Eigen::MatrixXd& H, const Eigen::VectorXd& b, double weight,
+                              double max_rot = 0.0, double max_pos = 0.0,
+                              double max_vel = 0.0, double max_bg = 0.0, double max_ba = 0.0,
+                              double max_grav = 0.0, bool pose_only = false,
+                              VisualDiagnostics* diag = nullptr);
+
+  /// 视觉更新单帧步长上限：0.5°、2 cm、5 cm/s、1e-4 rad/s、1e-3 m/s²、5e-3 m/s²(重力)。
+  static constexpr double kMaxVisualRotStep = 0.0087;
+  static constexpr double kMaxVisualPosStep = 0.02;
+  static constexpr double kMaxVisualVelStep = 0.05;
+  static constexpr double kMaxVisualBgStep = 1.0e-4;
+  static constexpr double kMaxVisualBaStep = 1.0e-3;
+  static constexpr double kMaxVisualGravStep = 5.0e-3;
 
   Options options_;
   FilterState filter_;
+  VisualDiagnostics vis_diag_;
 };
 
 }  // namespace superlivo_b

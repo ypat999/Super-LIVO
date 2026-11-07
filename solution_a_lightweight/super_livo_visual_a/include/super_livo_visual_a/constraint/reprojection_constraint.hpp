@@ -23,6 +23,7 @@ struct VisualResidualBlock {
   Eigen::Vector2d residual{Eigen::Vector2d::Zero()};                          ///< r = z - pi(...)
   Eigen::Matrix<double, 2, 6> jacobian{Eigen::Matrix<double, 2, 6>::Zero()};  ///< dr/d(se3)
   double weight{1.0};                                                          ///< Huber 权重
+  double variance{1.0};                     ///< 测量方差（像素²），accumulate 按 1/variance 加权
   bool valid{false};
 };
 
@@ -37,6 +38,9 @@ class ReprojectionConstraint {
     double huber_delta{1.0};      ///< Huber 核阈值（像素）
     int min_constraints{8};       ///< 最小有效约束数
     double max_pixel_error{8.0};  ///< 外点阈值（像素）
+    // ---- 测量噪声模型（此前缺失，等价于 σ=1 px 且深度关联完全准确）------
+    double sigma_pix{1.5};        ///< 特征跟踪/亚像素拟合噪声（px）
+    double sigma_anchor{0.05};    ///< 三维锚点横向不确定度（m），折算成 f·σ/z 像素
   };
 
   explicit ReprojectionConstraint(const Options& options);

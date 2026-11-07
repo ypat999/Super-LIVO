@@ -33,6 +33,10 @@ constexpr double kPendingColorTimeoutSec = 1.0;
 /// 待着色队列上限，防止 odom 长时间缺失时内存膨胀。
 constexpr std::size_t kMaxPendingColorFrames = 8;
 
+/// 等图像队列：上限与超时（秒）。
+constexpr std::size_t kMaxPendingClouds = 6;
+constexpr double kPendingCloudTimeoutSec = 1.0;
+
 /// 标准重力幅值（m/s²），用于把加计归一化到 m/s²（对齐官方 G_m_s2）。
 constexpr double kGravityNorm = 9.81;
 
@@ -117,6 +121,9 @@ VisualBNode::VisualBNode(const rclcpp::NodeOptions& options)
 }
 
 VisualBNode::~VisualBNode() {
+  // 收尾：bag 结束时队列里可能还有等图像/等位姿的帧，尽量补完再落盘。
+  drainPendingClouds();
+  drainPendingColorization();
   // 退出（Ctrl+C / SIGTERM 触发 rclcpp::spin 返回）时再存一次，保证短时长运行也有结果。
   saveColoredMap();
 }
@@ -181,6 +188,9 @@ void VisualBNode::loadParameters() {
   lidar_visual_options_.huber_delta = this->declare_parameter<double>("lv.huber_delta", 1.0);
   lidar_visual_options_.min_constraints = this->declare_parameter<int>("lv.min_constraints", 8);
   lidar_visual_options_.max_pixel_error = this->declare_parameter<double>("lv.max_pixel_error", 8.0);
+  // 测量噪声模型：没有它等价于 σ=1 px 且地图点无误差，一帧即可压塌协方差。
+  lidar_visual_options_.sigma_pix = this->declare_parameter<double>("lv.sigma_pix", 1.5);
+  lidar_visual_options_.sigma_anchor = this->declare_parameter<double>("lv.sigma_anchor", 0.05);
   lidar_visual_ = std::make_unique<LidarVisualConstraint>(lidar_visual_options_);
 
   // ---- MSCKF 多帧约束 MsckfConstraint -------------------------------------
@@ -193,6 +203,8 @@ void VisualBNode::loadParameters() {
   msckf_options_.min_parallax_deg = this->declare_parameter<double>("msckf.min_parallax_deg", 1.0);
   msckf_options_.huber_delta = this->declare_parameter<double>("msckf.huber_delta", 1.0);
   msckf_options_.use_nullspace_projection = this->declare_parameter<bool>("msckf.use_nullspace_projection", true);
+  msckf_options_.sigma_pix = this->declare_parameter<double>("msckf.sigma_pix", 1.5);
+  msckf_options_.sigma_track_pose = this->declare_parameter<double>("msckf.sigma_track_pose", 0.05);
   msckf_ = std::make_unique<MsckfConstraint>(msckf_options_);
 
   // ---- 光度约束 PhotometricConstraint（可选，默认关） ----------------------
@@ -216,6 +228,13 @@ void VisualBNode::loadParameters() {
   estimator_options_.bias_gyro_noise = this->declare_parameter<double>("est.bias_gyro_noise", 1.0e-5);
   estimator_options_.bias_acc_noise = this->declare_parameter<double>("est.bias_acc_noise", 1.0e-4);
   estimator_options_.initial_covariance = this->declare_parameter<double>("est.initial_covariance", 1.0);
+  // 视觉注入强度上限与信息耦合方式（详见 UnifiedEstimator::Options 注释）。
+  estimator_options_.visual_info_ratio = this->declare_parameter<double>("est.visual_info_ratio", 1.0);
+  estimator_options_.visual_rot_sigma_floor =
+      this->declare_parameter<double>("est.visual_rot_sigma_floor", 0.005);
+  estimator_options_.visual_pos_sigma_floor =
+      this->declare_parameter<double>("est.visual_pos_sigma_floor", 0.02);
+  estimator_options_.visual_pose_only = this->declare_parameter<bool>("est.visual_pose_only", true);
   estimator_ = std::make_unique<UnifiedEstimator>(estimator_options_);
 
   // ---- 延迟地图提交 MapCommitScheduler ------------------------------------
@@ -225,6 +244,8 @@ void VisualBNode::loadParameters() {
 
   // ---- 彩色点云 ColorizerPipeline（复用方案 A 的包） ----------------------
   colorizer_options_.intrinsics = intrinsics_;
+  // 着色轨迹源：默认 false=/lio/odom；true=统一估计器修正后的位姿（own_pose_cache_）。
+  color_use_own_odom_ = this->declare_parameter<bool>("color.use_own_odom", false);
   // T_cl 在实现中的语义是 T_cw（作用于世界系点），逐帧变化，见 runColorizer。
   colorizer_options_.T_cl = Eigen::Matrix4d::Identity();
   colorizer_options_.sync.max_offset = this->declare_parameter<double>("color.sync_max_offset", 0.15);
@@ -402,11 +423,8 @@ void VisualBNode::onBodyCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPt
   }
   body_stamp_ = rclcpp::Time(msg->header.stamp).seconds();
 
-  // 顺带推进待着色队列：位姿到齐的立即着色，等太久的按超时丢弃。
-  // 放在这里（10 Hz）而不是只在 onOdom，是为了 bag 结束时没有后续 odom 也能清空队列。
-  if (!pending_color_.empty()) {
-    drainPendingColorization();
-  }
+  // 新扫描到达即入队等图像/位姿（大图回调比云慢约 1 帧，不能等图像回调才入队）。
+  runColorizer(*msg);
 }
 
 void VisualBNode::onImu(const sensor_msgs::msg::Imu::ConstSharedPtr& msg) {
@@ -620,6 +638,20 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   // 12) 发布：以统一估计器的位姿为准（视觉修正后的结果）
   const auto t_update = std::chrono::steady_clock::now();
   publishOdomAndPath(T_wl_updated, toRosStamp(stamp));
+
+  // 12.5) 缓存修正位姿（按图像 header 时刻），供 color.use_own_odom=true 时着色插值。
+  {
+    colorizer::PoseSample own;
+    own.stamp = stamp;
+    own.T_wl = T_wl_updated;
+    own_pose_cache_.push_back(own);
+    if (own_pose_cache_.size() > max_pose_samples_) {
+      own_pose_cache_.erase(own_pose_cache_.begin(),
+                            own_pose_cache_.begin() +
+                                (own_pose_cache_.size() - max_pose_samples_));
+    }
+  }
+
   if (!body_points_.empty() && last_cloud_) {
     runColorizer(*last_cloud_);
   }
@@ -629,12 +661,16 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     return std::chrono::duration<double, std::milli>(b - a).count();
   };
 
+  const UnifiedEstimator::VisualDiagnostics& vd = estimator_->visualDiagnostics();
   RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 1000,
       "视觉帧: obs=%zu tracks=%zu lv=%zu mscfk=%d used=%d quality=%.2f | "
+      "注入 λ=%.2e cap=%.2e scale=%.4f dxθ=%.4frad dxp=%.4fm σp=%.3fm | "
       "耗时 ms: 前端=%.1f 约束=%.1f 更新=%.1f 彩色=%.1f 合计=%.1f",
       obs.size(), constraint_tracks.size(), lv_residuals.size(), msckf_eq.used_features,
-      used_features, quality, ms(t_start, t_front), ms(t_front, t_vis), ms(t_vis, t_update),
+      used_features, quality, vd.info_lambda, vd.cap_lambda, vd.scale, vd.dx_rot, vd.dx_pos,
+      vd.sigma_pos,
+      ms(t_start, t_front), ms(t_front, t_vis), ms(t_vis, t_update),
       ms(t_update, t_end), ms(t_start, t_end));
 }
 
@@ -647,59 +683,85 @@ void VisualBNode::runColorizer(const sensor_msgs::msg::PointCloud2& cloud_msg) {
   //   t_pair  = 图像 header.stamp → 选图（实测 |t_pair-t_cloud| < 7 ms）
   //   t_img   = t_pair + img_time_offset_ → 取相机位姿（本数据集最优 0.1 s）
   (void)cloud_msg;
-  if (body_points_.empty() || image_cache_.empty() || pose_cache_.empty()) {
+  if (body_points_.empty()) {
     return;
   }
 
   const double t_cloud = body_stamp_;
 
-  // 同一帧 dense 点云只着色一次（含"已入队未处理"）。
-  const bool already_handled =
+  // 把当前 dense 云放入"等图像"队列（去重）：大图回调比云慢约 1 帧，
+  // 立即配对会把绝大多数帧误判"无图像"丢弃（bag2 实测 97.7 ms）。
+  const bool already_queued =
       std::abs(t_cloud - last_colored_cloud_stamp_) < 1e-6 ||
+      std::any_of(pending_clouds_.begin(), pending_clouds_.end(),
+                  [t_cloud](const PendingCloudWait& c) {
+                    return std::abs(c.t_cloud - t_cloud) < 1e-6;
+                  }) ||
       std::any_of(pending_color_.begin(), pending_color_.end(),
                   [t_cloud](const PendingColorFrame& f) {
                     return std::abs(f.t_cloud - t_cloud) < 1e-6;
                   });
-  if (already_handled) {
-    return;
+  if (!already_queued) {
+    PendingCloudWait pc;
+    pc.points_lidar = body_points_;
+    pc.t_cloud = t_cloud;
+    pc.queued_at = std::chrono::steady_clock::now();
+    pending_clouds_.push_back(std::move(pc));
+    while (pending_clouds_.size() > kMaxPendingClouds) {
+      pending_clouds_.pop_front();
+      ++stat_drop_no_image_;
+      RCLCPP_WARN(this->get_logger(), "彩色[丢弃] 等图像队列溢出，丢弃最早一帧");
+    }
   }
 
-  // 显式配对：按 header.stamp 挑最接近 t_cloud 的一帧，并受同步窗口约束。
-  const colorizer::TimedImage* chosen = nullptr;
-  double best_dt = std::numeric_limits<double>::max();
-  for (const auto& image : image_cache_) {
-    if (!image.valid || image.image.empty()) {
+  drainPendingClouds();
+  drainPendingColorization();
+}
+
+void VisualBNode::drainPendingClouds() {
+  const auto now = std::chrono::steady_clock::now();
+  for (auto it = pending_clouds_.begin(); it != pending_clouds_.end();) {
+    // 显式配对：按 header.stamp 挑最接近 t_cloud 的一帧图像。
+    const colorizer::TimedImage* chosen = nullptr;
+    double best_dt = std::numeric_limits<double>::max();
+    for (const auto& image : image_cache_) {
+      if (!image.valid || image.image.empty()) {
+        continue;
+      }
+      const double dt = std::abs(image.arrival_stamp - it->t_cloud);
+      if (dt < best_dt) {
+        best_dt = dt;
+        chosen = &image;
+      }
+    }
+    if (chosen != nullptr && best_dt <= colorizer_options_.sync.max_offset) {
+      PendingColorFrame frame;
+      frame.points_lidar = it->points_lidar;
+      frame.t_cloud = it->t_cloud;
+      frame.t_pair = chosen->arrival_stamp;
+      frame.t_img = frame.t_pair + img_time_offset_;
+      frame.image = chosen->image;
+      frame.queued_at = now;
+      pending_color_.push_back(std::move(frame));
+      while (pending_color_.size() > kMaxPendingColorFrames) {
+        pending_color_.pop_front();
+        ++stat_drop_pose_;
+        RCLCPP_WARN(this->get_logger(), "彩色[丢弃] 待处理队列溢出，丢弃最早一帧");
+      }
+      it = pending_clouds_.erase(it);
       continue;
     }
-    const double dt = std::abs(image.arrival_stamp - t_cloud);
-    if (dt < best_dt) {
-      best_dt = dt;
-      chosen = &image;
+    const double waited = std::chrono::duration<double>(now - it->queued_at).count();
+    if (waited > kPendingCloudTimeoutSec) {
+      ++stat_drop_no_image_;
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "彩色[丢弃] 等待图像超时: t_cloud=%.4f 最近差=%.4f 阈值=%.4f 已等 %.2fs",
+                           it->t_cloud, best_dt, colorizer_options_.sync.max_offset, waited);
+      it = pending_clouds_.erase(it);
+      continue;
     }
+    ++it;
   }
-  if (chosen == nullptr || best_dt > colorizer_options_.sync.max_offset) {
-    ++stat_drop_no_image_;
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "彩色[丢弃] 无匹配图像: t_cloud=%.4f 最近差=%.4f 阈值=%.4f",
-                         t_cloud, best_dt, colorizer_options_.sync.max_offset);
-    return;
-  }
-
-  PendingColorFrame frame;
-  frame.points_lidar = body_points_;
-  frame.t_cloud = t_cloud;
-  frame.t_pair = chosen->arrival_stamp;
-  frame.t_img = frame.t_pair + img_time_offset_;
-  frame.image = chosen->image;
-  frame.queued_at = std::chrono::steady_clock::now();
-  pending_color_.push_back(std::move(frame));
-  while (pending_color_.size() > kMaxPendingColorFrames) {
-    pending_color_.pop_front();
-    ++stat_drop_pose_;
-    RCLCPP_WARN(this->get_logger(), "彩色[丢弃] 待处理队列溢出，丢弃最早一帧");
-  }
-
-  drainPendingColorization();
 }
 
 void VisualBNode::drainPendingColorization() {
@@ -776,8 +838,11 @@ bool VisualBNode::colorizeFrame(const PendingColorFrame& frame) {
 bool VisualBNode::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
   // 查询时刻晚于最新采样时必须拒绝：插值器会直接用最后一个采样顶替，
   // 那等于把 t_img 的位姿退化成 t_cloud 的位姿，offset 就白加了。
+  // 轨迹源由 color.use_own_odom 决定：默认 /lio/odom；true 时用统一估计器修正位姿。
+  const std::vector<colorizer::PoseSample>& cache =
+      color_use_own_odom_ ? own_pose_cache_ : pose_cache_;
   double newest = -std::numeric_limits<double>::max();
-  for (const auto& sample : pose_cache_) {
+  for (const auto& sample : cache) {
     newest = std::max(newest, sample.stamp);
   }
   if (stamp > newest) {
@@ -786,7 +851,7 @@ bool VisualBNode::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
 
   colorizer::LidarPoseInterpolator interp(
       colorizer::LidarPoseInterpolator::Options{kPoseHistoryMaxGapSec});
-  for (const auto& sample : pose_cache_) {
+  for (const auto& sample : cache) {
     interp.addSample(sample);
   }
   return interp.poseAt(stamp, T_wl);

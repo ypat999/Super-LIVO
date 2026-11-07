@@ -55,6 +55,12 @@ class DegeneracyGate {
     double max_condition{1.0e3};     ///< 雅可比条件数上限
     double assist_weight{0.3};       ///< 轻度退化时的视觉权重
     double high_weight{0.8};         ///< 严重退化时的视觉权重
+    /// 进入"视觉参与更新"的 LiDAR 退化阈值（原硬编码 0.3/0.7）。
+    /// 代理式退化检测（lidarDegeneracyProxy）在普通室内场景恒为 0，
+    /// 导致视觉永远只在跟踪态、修正量恒为 0，无法评测视觉的真实作用；
+    /// 把它做成参数后，可用 0.0 强制视觉常开做判别实验。
+    double assist_degeneracy{0.3};
+    double high_degeneracy{0.7};
   };
 
   explicit DegeneracyGate(const Options& options);

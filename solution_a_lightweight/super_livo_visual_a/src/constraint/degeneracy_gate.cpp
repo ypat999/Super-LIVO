@@ -37,7 +37,7 @@ GateDecision DegeneracyGate::evaluate(const GateInputs& inputs) const {
   // ---- 第 2 步：LiDAR 退化程度决定参与方式 -------------------------------
   const double degeneracy = inputs.lidar_degeneracy;
 
-  if (degeneracy < 0.3) {
+  if (degeneracy < options_.assist_degeneracy) {
     // LiDAR 正常：只跟踪，不更新（视觉权重为 0）。
     decision.mode = VisualMode::kTrackingOnly;
     decision.visual_weight = 0.0;
@@ -45,7 +45,7 @@ GateDecision DegeneracyGate::evaluate(const GateInputs& inputs) const {
     return decision;
   }
 
-  if (degeneracy < 0.7) {
+  if (degeneracy < options_.high_degeneracy) {
     decision.mode = VisualMode::kAssistUpdate;
     decision.visual_weight = options_.assist_weight;
     decision.reason = "lidar mildly degenerate, assist update";

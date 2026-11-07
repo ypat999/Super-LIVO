@@ -108,6 +108,28 @@ MultiFrameNormalEquations MsckfConstraint::build(const std::vector<FeatureTrack>
       continue;
     }
 
+    // ---- 该轨迹的测量标准差（像素） ------------------------------------
+    // 与 LV 约束同一思路：σ² = σ_pix² + (f·σ_kf/z̄)²。z̄ 取各观测平均深度。
+    double sum_depth = 0.0;
+    int depth_count = 0;
+    for (const auto& obs : trimmed.observations) {
+      const Eigen::Matrix4d T_cw = obs.T_wc.inverse();
+      const double z = (T_cw.block<3, 3>(0, 0) * xyz_world + T_cw.block<3, 1>(0, 3)).z();
+      if (z > 1e-3) {
+        sum_depth += z;
+        ++depth_count;
+      }
+    }
+    if (depth_count == 0) {
+      continue;
+    }
+    const double f_mean = 0.5 * (options_.fx + options_.fy);
+    const double mean_depth = sum_depth / static_cast<double>(depth_count);
+    const double pose_pix = f_mean * options_.sigma_track_pose / mean_depth;
+    const double inv_sigma =
+        1.0 / std::max(1e-6, std::sqrt(options_.sigma_pix * options_.sigma_pix +
+                                       pose_pix * pose_pix));
+
     const std::size_t n = trimmed.observations.size();
     const long rows = static_cast<long>(2 * n);
 
@@ -138,8 +160,8 @@ MultiFrameNormalEquations MsckfConstraint::build(const std::vector<FeatureTrack>
 
       const Eigen::Matrix<double, 2, 3> dr_df = -dpi_dpc * T_cw.block<3, 3>(0, 0);
 
-      r.segment<2>(static_cast<long>(2 * i)) = weight * residual;
-      J_f.block<2, 3>(static_cast<long>(2 * i), 0) = weight * dr_df;
+      r.segment<2>(static_cast<long>(2 * i)) = weight * inv_sigma * residual;
+      J_f.block<2, 3>(static_cast<long>(2 * i), 0) = weight * inv_sigma * dr_df;
 
       // 只有最后一个观测（当前位姿）参与状态更新，历史位姿视为固定。
       if (i + 1 == n) {
@@ -147,7 +169,8 @@ MultiFrameNormalEquations MsckfConstraint::build(const std::vector<FeatureTrack>
         Eigen::Matrix<double, 3, 6> dPc_ddelta;
         dPc_ddelta.block<3, 3>(0, 0) = T_cw.block<3, 3>(0, 0) * skew(xyz_world);
         dPc_ddelta.block<3, 3>(0, 3) = -T_cw.block<3, 3>(0, 0);
-        J_x.block<2, 6>(static_cast<long>(2 * i), 0) = weight * (-dpi_dpc * dPc_ddelta);
+        J_x.block<2, 6>(static_cast<long>(2 * i), 0) =
+            weight * inv_sigma * (-dpi_dpc * dPc_ddelta);
       }
     }
     if (!valid) {

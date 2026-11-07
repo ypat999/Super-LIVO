@@ -267,6 +267,24 @@ class VisualBNode : public rclcpp::Node {
   // ---- 彩色着色调度 --------------------------------------------------------
   /// 待着色队列：t_img 时刻的位姿通常要等 0.1 s 才发布，收到后由 drainPendingColorization 处理。
   std::deque<PendingColorFrame> pending_color_;
+
+  /// 待配对图像的 dense 云队列（大图回调比云慢约 1 帧，云先入队等图）。
+  /// 命名注意：`PendingCloud` 已被 MapCommitScheduler 占用（命名空间级），这里用独立名字。
+  struct PendingCloudWait {
+    std::vector<Eigen::Vector3f> points_lidar;
+    double t_cloud{0.0};
+    std::chrono::steady_clock::time_point queued_at;
+  };
+  std::deque<PendingCloudWait> pending_clouds_;
+
+  /// 遍历等待图像的 dense 云：能配到图的转入 pending_color_，超时的丢弃。
+  void drainPendingClouds();
+
+  /// 着色用哪条轨迹：false=/lio/odom（Super-LIO 原始），true=统一估计器修正后的 odom。
+  bool color_use_own_odom_{false};
+  /// 修正位姿缓存（按图像 header 时刻），color_use_own_odom_=true 时供插值。
+  std::vector<colorizer::PoseSample> own_pose_cache_;
+
   double last_colored_cloud_stamp_{-1.0};  ///< 已着色或已入队的最近 dense 帧时刻
   std::size_t stat_colored_frames_{0};
   std::size_t stat_drop_no_image_{0};

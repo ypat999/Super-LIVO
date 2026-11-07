@@ -22,6 +22,9 @@ struct VisualResidual {
   Eigen::Vector2d residual{Eigen::Vector2d::Zero()};
   Eigen::Matrix<double, 2, 6> jacobian{Eigen::Matrix<double, 2, 6>::Zero()};
   double weight{1.0};
+  /// 该残差的测量方差（像素²）。accumulate 里按 1/variance 加权，
+  /// 等价于 R = variance·I 的白化。默认 1.0 表示不缩放（光度残差用）。
+  double variance{1.0};
   bool valid{false};
 };
 
@@ -39,6 +42,14 @@ class LidarVisualConstraint {
     double huber_delta{1.0};
     int min_constraints{8};
     double max_pixel_error{8.0};
+    // ---- 测量噪声模型（此前完全没有，等价于 σ_pix = 1 px 且锚点无误差）----
+    // 单像素特征跟踪/亚像素拟合噪声（px）。
+    double sigma_pix{1.5};
+    // 三维锚点（LiDAR 地图点）的横向位置不确定度（m）。它投影到像素上是
+    // f·σ_anchor/z，在 z=4 m、σ_anchor=5 cm 时约 7.6 px，远大于 σ_pix。
+    // 这一项才是"视觉不能一帧压塌协方差"的关键：地图点带有 LIO 漂移造成的
+    // 系统性误差，绝不能当成精确真值。
+    double sigma_anchor{0.05};
   };
 
   explicit LidarVisualConstraint(const Options& options);

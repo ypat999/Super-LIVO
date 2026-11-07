@@ -78,6 +78,11 @@
     reproj.huber_delta: 1.0
     reproj.min_constraints: 8
     reproj.max_pixel_error: 8.0
+    # 残差测量噪声：σ² = sigma_pix² + (f·sigma_anchor/z)²。
+    # 缺这一项等价于宣称每个特征把位姿约束到 1 px（z=5 m 处仅 0.8 cm），
+    # 上百个特征叠加后视觉会盖过 LiDAR 先验、一步全量拟合地图。
+    reproj.sigma_pix: 1.5
+    reproj.sigma_anchor: 0.05
 
     # ========================================================================
     # 退化门控 DegeneracyGate（对应 gpt §2.3）
@@ -87,17 +92,32 @@
     # 原 2.0 会把绝大多数帧判为拒绝；放宽到 3.0 更贴合该数据。
     gate.max_reprojection_rmse: 3.0
     gate.min_spread: 0.15
-    # 6x6 视觉信息矩阵在前进方向上天然弱可观测，实测条件数 1e3~3e4，
-    # 数值上仍然稳定（double 精度），阈值放到 1e5 只拦截真正病态的帧。
+    # 条件数在**无量纲**矩阵 S·H·S 上计算（S=diag(σ_rot,σ_pos)，见 update.prior_*）。
+    # 原来直接在有量纲的 H 上算，得到的是 rad²与 m² 的单位之比而不是几何病态程度；
+    # 加方差归一化后 cond 从 2e4 跳到 3e7，几乎每帧都被误判为病态而拒绝。
     gate.max_condition: 1.0e5
     gate.assist_weight: 0.3
     gate.high_weight: 0.8
+    # 进入"视觉参与更新"的退化阈值。代理式退化检测（当前扫描点空间协方差，
+    # ratio<0.01 才给非零值）在普通室内/街道恒为 0，所以默认 0.3 时视觉
+    # 永远处于"只跟踪不更新"，自身 odom 与 lio/odom 逐位相同（实测 86.5% 完全一致）。
+    # 判别实验可设 0.0 强制常开。
+    gate.assist_degeneracy: 0.3
+    gate.high_degeneracy: 0.7
 
     # ========================================================================
     # 视觉更新 VisualUpdate
     # ========================================================================
     update.enable: true
     update.max_dx_norm: 0.5
+    # LiDAR 先验信息量（贝叶斯正则）。原实现解 (w·H)dx=-(w·b)，w 会被左右约掉，
+    # 门控权重对 dx 大小毫无影响；加入 H_prior=diag(1/σ_rot²,1/σ_pos²) 后 w 才真正
+    # 在"信 LiDAR"与"信视觉"之间插值。
+    update.prior_rot_sigma: 0.02
+    update.prior_pos_sigma: 0.05
+
+    # 视觉链路是否使用图像曝光时刻的插值位姿（false=退回"最新一条 lio/odom"）。
+    visual.use_exposure_pose: true
 
     # ========================================================================
     # 彩色点云 ColorizerPipeline（对应 gpt §2.4）

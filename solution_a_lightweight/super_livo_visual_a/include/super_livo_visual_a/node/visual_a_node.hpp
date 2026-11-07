@@ -254,9 +254,32 @@ class VisualANode : public rclcpp::Node {
   double last_colored_cloud_stamp_{-1.0};
   /// 待着色队列：t_img 时刻的位姿通常要等 0.1 s 才发布，收到后由 drainPendingColorization 处理。
   std::deque<PendingColorFrame> pending_color_;
+
+  /// 待配对图像的 dense 云队列。
+  /// bag2（1280x800 图像）实测图像回调比 dense 云慢约 1 帧（97.7 ms）：
+  /// 云到达时对应图像还没进缓存，直接配对会整帧误判"无图像"丢弃。
+  /// 改为云先入队，图像到齐后再配对（drainPendingClouds）。
+  struct PendingCloud {
+    std::vector<Eigen::Vector3f> points_lidar;
+    double t_cloud{0.0};
+    std::chrono::steady_clock::time_point queued_at;
+  };
+  std::deque<PendingCloud> pending_clouds_;
+
+  /// 遍历等待图像的 dense 云：能配到图的转入 pending_color_，超时的丢弃。
+  void drainPendingClouds();
+
+  /// 着色用哪条轨迹：false=/lio/odom（Super-LIO 原始），true=本节点视觉修正后的 odom。
+  bool color_use_own_odom_{false};
+  /// 视觉链路是否用"图像曝光时刻"的插值位姿（visual.use_exposure_pose）。
+  /// 关掉即回到旧行为（直接用最新一条 lio/odom），用于判别实验对比 rmse。
+  bool use_exposure_pose_{true};
+  /// 本节点修正位姿缓存（按图像 header 时刻），color_use_own_odom_=true 时供插值。
+  std::vector<colorizer::PoseSample> own_pose_cache_;
+
   std::size_t stat_colorizer_calls_{0};  ///< runColorizer 调用次数
   std::size_t stat_colored_frames_{0};   ///< 真正完成着色的 dense 帧数
-  std::size_t stat_drop_no_image_{0};    ///< 丢弃：同步窗口内没有匹配图像
+  std::size_t stat_drop_no_image_{0};    ///< 丢弃：等待超时仍没有匹配图像
   std::size_t stat_drop_pose_{0};        ///< 丢弃：等待超时后 t_cloud / t_img 位姿仍不可用
   std::size_t stat_deferred_{0};         ///< 因位姿未到齐而延后处理的帧数
   std::size_t stat_skip_duplicate_{0};   ///< 跳过：同一 dense 帧重复调用

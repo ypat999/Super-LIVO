@@ -37,6 +37,23 @@ VisualUpdateOutput VisualUpdate::apply(const VisualUpdateInput& input,
   Eigen::MatrixXd H = weight * input.H;
   Eigen::VectorXd b = weight * input.b;
 
+  // LiDAR 先验正则：把"当前位姿即 LiDAR 位姿"当成一个信息量为
+  // diag(1/σ_rot², 1/σ_pos²) 的高斯先验（残差为 0）叠加进来。
+  // 没有它，dx 就是无正则最小二乘解，门控权重 w 会被左右同时约掉、
+  // 视觉一旦接受就一步全量接管位姿。有了它，w 才真正插值两种传感器。
+  if (H.rows() >= 6) {
+    const double kp_rot = 1.0 / std::max(1e-12, options_.prior_rot_sigma *
+                                                    options_.prior_rot_sigma);
+    const double kp_pos = 1.0 / std::max(1e-12, options_.prior_pos_sigma *
+                                                    options_.prior_pos_sigma);
+    for (int i = 0; i < 3; ++i) {
+      H(i, i) += kp_rot;
+    }
+    for (int i = 3; i < 6; ++i) {
+      H(i, i) += kp_pos;
+    }
+  }
+
   // 阻尼项：防止退化方向上的病态求解。
   const double damping = 1e-6 * std::max(1.0, H.diagonal().cwiseAbs().maxCoeff());
   H.diagonal().array() += damping;

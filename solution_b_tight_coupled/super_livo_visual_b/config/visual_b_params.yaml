@@ -69,6 +69,10 @@
     lv.huber_delta: 1.0
     lv.min_constraints: 8
     lv.max_pixel_error: 8.0
+    # 残差测量噪声：σ² = sigma_pix² + (f·sigma_anchor/z)²（栅格关联再加 pixel_radius²/3）。
+    # sigma_anchor 是关键项——地图点带 LIO 漂移的系统误差，不能当精确真值。
+    lv.sigma_pix: 1.5
+    lv.sigma_anchor: 0.05
     # LiDAR 先验强度（D2）：越小越信任 lio/odom，视觉修正越弱
     lv.prior_pos_sigma: 0.05
     lv.prior_rot_sigma: 0.02
@@ -81,6 +85,9 @@
     msckf.min_parallax_deg: 1.0
     msckf.huber_delta: 1.0
     msckf.use_nullspace_projection: true
+    # 同上：像素噪声 + 关键帧位姿不确定度折算（本实现把历史关键帧位姿当固定值）。
+    msckf.sigma_pix: 1.5
+    msckf.sigma_track_pose: 0.05
 
     # ========================================================================
     # 光度约束 PhotometricConstraint（可选，默认关，对应 gpt §五）
@@ -94,8 +101,39 @@
     # ========================================================================
     # 统一估计器 UnifiedEstimator（对应 gpt §3.4）
     # ========================================================================
+    # 视觉注入总开关。2026-11 已修好，可安全打开：
+    #   ① IMU 加计 g 单位归一化；
+    #   ② propagate 补 Φ 协方差传播（速度/零偏/重力与位置耦合，恢复可观性）；
+    #   ③ 更新步长分块限幅；
+    #   ④ 重力状态冻结 + 幅值兜底；
+    #   ⑤ **残差测量噪声模型**（lv.sigma_pix / lv.sigma_anchor，msckf 同理）。
+    #      此前没有 R 阵，等价于宣称 σ=1 px 且地图点是精确真值：43 个特征在
+    #      z≈4 m 处给出 λ≈1e7，即 0.3 mm 的"等效位姿精度"，一帧就把位置协方差
+    #      压塌，之后先验再也拉不动（表现为状态冻结在初值、自身 odom 全零）。
+    #   ⑥ **信息量上限**：视觉每块信息不超过 min(κ·λmax(P⁻¹|该块), 1/σ_floor²)。
+    #      只用相对 κ 会被自指正反馈击穿（P 越小 cap 越大，实测 60s 漂到 149m）；
+    #      加上绝对下限后 σp 稳定钉在 floor 上、轨迹不再跑飞。
+    #   ⑦ visual_pose_only=true：视觉只改 rot/pos。视觉观测本质是"相对地图的
+    #      位姿"，对速度无独立信息，dx 的速度项全部来自 P 耦合；每帧哪怕只
+    #      限幅 0.05 m/s，600 帧也累积成 30 m/s → 经 Φ(pos←vel) 放大成百米漂移。
+    #
+    # 实测结论（bag2 全量，160 s）：
+    #   数值上已安全——不发散，轨迹范围 x[-15.3,3.5] y[-22.9,4.7] z[-0.5,0.4]，
+    #   与 lio/odom 偏差中位 0.099 m（视觉 OFF 时 0.131 m），对官方轨迹 APE 中位
+    #   0.27 m（OFF 同为 0.27 m），σp 稳定钉在 2 cm 下限，单帧修正 dxp≈0.1 mm。
+    #   但**质量收益无法证实**：两个"首尾房间鬼影偏转"指标都太粗——
+    #     ① ICP 残余 yaw：同一路 lio/odom 四次跑测出 8.07/8.43/8.88/11.53°（±1.7°）；
+    #     ② 出发腿/回程腿夹角：窗口 8/12/15/20 s 分别给 116.75/150.60/152.97/164.36°
+    #        （B 视觉ON），符号随窗口翻转，无法判定好坏。
+    #   结构性原因：LV 的三维锚点与 MSCKF 的关键帧位姿都取自 LIO 自建地图，
+    #   状态本就与地图自洽，视觉梯度自然趋零；要真正消 yaw 漂移需要回环/长基线重观测。
+    #   因此本开关的含义是"可以安全打开"，不是"打开就一定更好"。
     est.enable_visual: true
     est.visual_weight: 1.0
+    est.visual_info_ratio: 1.0
+    est.visual_rot_sigma_floor: 0.005
+    est.visual_pos_sigma_floor: 0.02
+    est.visual_pose_only: true
     est.estimate_extrinsics: false
     est.gyro_noise: 0.001
     est.acc_noise: 0.01

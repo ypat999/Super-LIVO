@@ -34,6 +34,11 @@ constexpr double kPendingColorTimeoutSec = 1.0;
 /// 待着色队列上限，防止 odom 长时间缺失时内存膨胀。
 constexpr std::size_t kMaxPendingColorFrames = 8;
 
+/// 等图像队列：上限与超时（秒）。图像回调比 dense 云慢约 1 帧属正常，
+/// 队列 6 帧≈0.6 s 足够吸收；超过 1 s 配不到图说明相机真断流。
+constexpr std::size_t kMaxPendingClouds = 6;
+constexpr double kPendingCloudTimeoutSec = 1.0;
+
 /// double 秒 -> ROS 时间戳（bag 的时间戳为传感器时钟，秒值 ~9.4e8，仍在 int32 范围内）。
 builtin_interfaces::msg::Time toRosStamp(double sec) {
   builtin_interfaces::msg::Time stamp;
@@ -107,6 +112,9 @@ VisualANode::VisualANode(const rclcpp::NodeOptions& options)
 }
 
 VisualANode::~VisualANode() {
+  // 收尾：bag 结束时队列里可能还有等图像/等位姿的帧，尽量把它们补完再落盘。
+  drainPendingClouds();
+  drainPendingColorization();
   // 退出（Ctrl+C / SIGTERM 触发 rclcpp::spin 返回）时再存一次，保证短时长运行也有结果。
   saveColoredMap();
   // 时间基准诊断汇总：用于判断丢帧到底是"没图"还是"没位姿"。
@@ -183,6 +191,9 @@ void VisualANode::loadParameters() {
   reproj_options_.huber_delta = this->declare_parameter<double>("reproj.huber_delta", 1.0);
   reproj_options_.min_constraints = this->declare_parameter<int>("reproj.min_constraints", 8);
   reproj_options_.max_pixel_error = this->declare_parameter<double>("reproj.max_pixel_error", 8.0);
+  // 测量噪声模型：没有它等价于 σ=1 px、且认为 LiDAR 深度关联完全准确。
+  reproj_options_.sigma_pix = this->declare_parameter<double>("reproj.sigma_pix", 1.5);
+  reproj_options_.sigma_anchor = this->declare_parameter<double>("reproj.sigma_anchor", 0.05);
   reproj_ = std::make_unique<ReprojectionConstraint>(reproj_options_);
 
   // ==========================================================================
@@ -194,6 +205,9 @@ void VisualANode::loadParameters() {
   gate_options_.max_condition = this->declare_parameter<double>("gate.max_condition", 1.0e3);
   gate_options_.assist_weight = this->declare_parameter<double>("gate.assist_weight", 0.3);
   gate_options_.high_weight = this->declare_parameter<double>("gate.high_weight", 0.8);
+  // 退化阈值参数化：默认 0.3/0.7（原硬编码）；设 0.0 可让视觉常开做判别实验。
+  gate_options_.assist_degeneracy = this->declare_parameter<double>("gate.assist_degeneracy", 0.3);
+  gate_options_.high_degeneracy = this->declare_parameter<double>("gate.high_degeneracy", 0.7);
   gate_ = std::make_unique<DegeneracyGate>(gate_options_);
 
   // ==========================================================================
@@ -201,12 +215,19 @@ void VisualANode::loadParameters() {
   // ==========================================================================
   update_options_.enable = this->declare_parameter<bool>("update.enable", true);
   update_options_.max_dx_norm = this->declare_parameter<double>("update.max_dx_norm", 0.5);
+  // LiDAR 先验信息量（贝叶斯正则），使门控权重 w 真正起作用。
+  update_options_.prior_rot_sigma = this->declare_parameter<double>("update.prior_rot_sigma", 0.02);
+  update_options_.prior_pos_sigma = this->declare_parameter<double>("update.prior_pos_sigma", 0.05);
   visual_update_ = std::make_unique<VisualUpdate>(update_options_);
 
   // ==========================================================================
   // 彩色点云 ColorizerPipeline
   // ==========================================================================
   colorizer_options_.intrinsics = intrinsics_;
+  // 着色轨迹源：默认 false=/lio/odom；true=本节点视觉修正后的 odom（own_pose_cache_）。
+  color_use_own_odom_ = this->declare_parameter<bool>("color.use_own_odom", false);
+  // 视觉链路位姿时刻：true=图像曝光时刻插值（正确），false=最新一条 lio/odom（旧行为）。
+  use_exposure_pose_ = this->declare_parameter<bool>("visual.use_exposure_pose", true);
   // TODO(flash)：colorizer 的 Options.T_cl 语义实为 T_cw（世界->相机，逐帧变化）。
   //  此处先置单位阵，runColorizer 里按每帧相机位姿重建 pipeline 或修正库后再填。
   colorizer_options_.T_cl = Eigen::Matrix4d::Identity();
@@ -364,11 +385,8 @@ void VisualANode::onBodyCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPt
   }
   body_stamp_ = rclcpp::Time(msg->header.stamp).seconds();
 
-  // 新扫描到达时顺带推进待着色队列：位姿若已到齐立即着色，等太久的按超时丢弃。
-  // 放在这里（10 Hz）而不是只在 onOdom，是为了 bag 结束时没有后续 odom 也能清空队列。
-  if (!pending_color_.empty()) {
-    drainPendingColorization();
-  }
+  // 新扫描到达即入队等图像/位姿（bag2 的图像回调比云慢约 1 帧，不能等图像回调才入队）。
+  runColorizer(*msg);
 }
 
 void VisualANode::processVisualFrame(const cv::Mat& gray, double stamp) {
@@ -382,7 +400,16 @@ void VisualANode::processVisualFrame(const cv::Mat& gray, double stamp) {
   const auto t_front = std::chrono::steady_clock::now();
 
   // 2) 计算当前相机位姿 T_wc = T_wl · T_lc
-  const Eigen::Matrix4d T_wc = T_wl_ * T_lc_;
+  //    关键：必须取**图像曝光时刻**的位姿。此前直接用 T_wl_（最新一条 lio/odom），
+  //    两者相差可达 0.05~0.15 s；按 0.5 m/s 平移 + 中等角速度折算就是几厘米的
+  //    系统性锚点偏移，在 z≈5 m 处对应 2~3 px，正好是重投影 RMSE 长期卡在
+  //    2.8 px、门控（阈值 3.0）整帧全拒的主要原因。
+  const double t_capture = stamp + img_time_offset_;
+  Eigen::Matrix4d T_wl_img = Eigen::Matrix4d::Identity();
+  if (!use_exposure_pose_ || !poseAtStamp(t_capture, T_wl_img)) {
+    T_wl_img = T_wl_;  // 关闭开关 / 启动初期缓存还不够，退回最新值
+  }
+  const Eigen::Matrix4d T_wc = T_wl_img * T_lc_;
 
   // 3) 深度关联：把局部地图与当前扫描喂给深度关联器
   depth_assoc_->setLocalMap(local_map_);
@@ -428,21 +455,43 @@ void VisualANode::processVisualFrame(const cv::Mat& gray, double stamp) {
   inputs.spatial_spread = spread;
   inputs.motion_observability = std::min(1.0, spread / std::max(1e-6, gate_options_.min_spread));
 
-  // 5.2 重投影残差 RMS（像素）。
+  // 5.2 重投影残差 RMS（像素），并分解"系统性偏差 ⊥ 随机噪声"。
+  //     rmse² = bias² + noise²；bias 是全体残差的均值模长，
+  //     它大说明存在时间戳/外参/深度关联一类的系统误差（可修），
+  //     它小而 noise 大则是特征跟踪与地图噪声（只能靠多特征平均）。
   double sum_sq = 0.0;
   int valid_blocks = 0;
+  double sum_du = 0.0;
+  double sum_dv = 0.0;
   for (const auto& block : blocks) {
     if (block.valid) {
       sum_sq += block.residual.squaredNorm();
+      sum_du += block.residual.x();
+      sum_dv += block.residual.y();
       ++valid_blocks;
     }
   }
+  double bias_px = 0.0;
   inputs.reprojection_rmse =
       valid_blocks > 0 ? std::sqrt(sum_sq / static_cast<double>(valid_blocks)) : 0.0;
+  if (valid_blocks > 0) {
+    const double inv_n = 1.0 / static_cast<double>(valid_blocks);
+    bias_px = std::hypot(sum_du * inv_n, sum_dv * inv_n);
+  }
 
   // 5.3 雅可比条件数：H 的特征值比（越大越病态）。
+  //     必须在**无量纲**的矩阵上算：H 的旋转块单位是 1/rad²、平移块是 1/m²，
+  //     直接求特征值比得到的是"单位之比"而不是几何病态程度（加了方差归一化后
+  //     实测 cond 从 2e4 暴涨到 3e7，把几乎每一帧都误判成病态而拒绝）。
+  //     按先验标准差各向缩放 H_norm = S·H·S（S=diag(σ_rot,σ_pos)）后，
+  //     特征值就是"该方向相对先验的信息量"，条件数才真正反映某个方向没被约束。
   if (H.rows() == 6 && H.cols() == 6) {
-    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(H);
+    const double s_rot = std::max(1e-9, update_options_.prior_rot_sigma);
+    const double s_pos = std::max(1e-9, update_options_.prior_pos_sigma);
+    Eigen::Matrix<double, 6, 1> s;
+    s << s_rot, s_rot, s_rot, s_pos, s_pos, s_pos;
+    const Eigen::MatrixXd h_norm = (s.asDiagonal() * H * s.asDiagonal()).eval();
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(h_norm);
     if (solver.info() == Eigen::Success) {
       const double lmax = std::max(1e-12, solver.eigenvalues()(5));
       const double lmin = std::max(1e-12, solver.eigenvalues()(0));
@@ -457,11 +506,15 @@ void VisualANode::processVisualFrame(const cv::Mat& gray, double stamp) {
   update_input.H = H;
   update_input.b = b;
   update_input.cost = cost;
-  // 质量：内点比例 + 残差水平综合（0~1），供 VisualUpdate 与门控权重相乘。
+  // 质量：跟踪成功率 + 残差水平综合（0~1），供 VisualUpdate 与门控权重相乘。
+  // 修正：原来用 tracked/detected，而 detected 是"本帧**新检测**角点数"，
+  // 稳态跟踪时常年为 0（特征数已满、不再补点），于是 inlier_ratio 恒为 0、
+  // quality 被压到 0.5/(1+rmse)≈0.13，且随补点与否抖动 5 倍——权重完全是噪声。
+  // 真正反映跟踪质量的是前后向一致性成功率 tracked/(tracked+rejected_fb)。
+  const int attempted = static_cast<int>(track.tracked.size()) + track.rejected_fb;
   const double inlier_ratio =
-      track.detected > 0
-          ? std::min(1.0, static_cast<double>(track.tracked.size()) / track.detected)
-          : 0.0;
+      attempted > 0 ? std::min(1.0, static_cast<double>(track.tracked.size()) / attempted)
+                    : 0.0;
   update_input.quality =
       std::clamp(0.5 * inlier_ratio + 0.5 / (1.0 + inputs.reprojection_rmse), 0.0, 1.0);
   const VisualUpdateOutput output = visual_update_->apply(update_input, decision);
@@ -477,6 +530,19 @@ void VisualANode::processVisualFrame(const cv::Mat& gray, double stamp) {
   publishOdomAndPath(T_wl_, toRosStamp(stamp));
   const auto t_pub = std::chrono::steady_clock::now();
 
+  // 8.5) 缓存本帧修正位姿（按图像 header 时刻），供 color.use_own_odom=true 时着色插值。
+  {
+    colorizer::PoseSample own;
+    own.stamp = stamp;
+    own.T_wl = T_wl_;
+    own_pose_cache_.push_back(own);
+    if (own_pose_cache_.size() > max_pose_samples_) {
+      own_pose_cache_.erase(own_pose_cache_.begin(),
+                            own_pose_cache_.begin() +
+                                (own_pose_cache_.size() - max_pose_samples_));
+    }
+  }
+
   // 9) 若缓存了机体系点云，触发彩色点云（与视觉定位解耦，独立工作）
   if (!body_points_.empty() && last_cloud_) {
     runColorizer(*last_cloud_);
@@ -490,11 +556,11 @@ void VisualANode::processVisualFrame(const cv::Mat& gray, double stamp) {
   // 10) 诊断日志（1 Hz 节流，便于跑 bag 时确认各模块在工作与耗时分布）
   RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 1000,
-      "视觉帧: tracked=%zu/%d spread=%.3f rmse=%.2f cond=%.1f deg=%.2f mode=%d w=%.2f %s | "
+      "视觉帧: tracked=%zu/%d spread=%.3f rmse=%.2f bias=%.2f cond=%.1f deg=%.2f mode=%d w=%.2f %s | "
       "耗时 ms: 前端=%.1f 深度=%.1f 重投影=%.1f 门控=%.1f 更新=%.1f 发布=%.1f 彩色=%.1f "
       "合计=%.1f",
       track.tracked.size(), track.detected, inputs.spatial_spread,
-      inputs.reprojection_rmse, inputs.jacobian_condition, inputs.lidar_degeneracy,
+      inputs.reprojection_rmse, bias_px, inputs.jacobian_condition, inputs.lidar_degeneracy,
       static_cast<int>(decision.mode), decision.visual_weight, decision.reason.c_str(),
       ms(t_start, t_front), ms(t_front, t_depth), ms(t_depth, t_reproj), ms(t_reproj, t_gate),
       ms(t_gate, t_update), ms(t_update, t_pub), ms(t_pub, t_end), ms(t_start, t_end));
@@ -532,64 +598,88 @@ void VisualANode::runColorizer(const sensor_msgs::msg::PointCloud2& cloud_msg) {
   (void)cloud_msg;
   ++stat_colorizer_calls_;
 
-  if (body_points_.empty() || image_cache_.empty() || pose_cache_.empty()) {
+  if (body_points_.empty()) {
     return;
   }
 
   const double t_cloud = body_stamp_;
 
-  // (1) 同一帧 dense 点云只允许着色一次：否则同一批点会被相邻时刻的多帧图像
-  //     重复染色，颜色被多次覆盖叠加，表现为整体"拖影 / 发糊"。
-  //     已入队但尚未处理（等位姿）的帧同样算"已占用"，否则每来一帧图像都会重复入队。
-  const bool already_handled =
+  // (1) 把当前 dense 云放入"等图像"队列（按时间戳去重）。
+  //     1280x800 这类大图的回调比 dense 云慢约 1 帧（bag2 实测 97.7 ms），
+  //     云到达时对应图像往往还没进缓存；立即配对会把绝大多数帧误判"无图像"丢弃。
+  //     改为云先入队，图像/里程计到达时由 drainPendingClouds 补配对。
+  const bool already_queued =
       std::abs(t_cloud - last_colored_cloud_stamp_) < 1e-6 ||
+      std::any_of(pending_clouds_.begin(), pending_clouds_.end(),
+                  [t_cloud](const PendingCloud& c) {
+                    return std::abs(c.t_cloud - t_cloud) < 1e-6;
+                  }) ||
       std::any_of(pending_color_.begin(), pending_color_.end(),
                   [t_cloud](const PendingColorFrame& f) {
                     return std::abs(f.t_cloud - t_cloud) < 1e-6;
                   });
-  if (already_handled) {
-    ++stat_skip_duplicate_;
-    return;
+  if (!already_queued) {
+    PendingCloud pc;
+    pc.points_lidar = body_points_;
+    pc.t_cloud = t_cloud;
+    pc.queued_at = std::chrono::steady_clock::now();
+    pending_clouds_.push_back(std::move(pc));
+    while (pending_clouds_.size() > kMaxPendingClouds) {
+      pending_clouds_.pop_front();
+      ++stat_drop_no_image_;
+      RCLCPP_WARN(this->get_logger(), "彩色[丢弃] 等图像队列溢出，丢弃最早一帧");
+    }
   }
 
-  // (2) 显式配对图像：按 header.stamp（不是 t_img）与 t_cloud 的差值挑选。
-  const colorizer::TimedImage* chosen = nullptr;
-  double best_dt = std::numeric_limits<double>::max();
-  for (const auto& image : image_cache_) {
-    if (!image.valid || image.image.empty()) {
+  drainPendingClouds();
+  drainPendingColorization();
+}
+
+void VisualANode::drainPendingClouds() {
+  const auto now = std::chrono::steady_clock::now();
+  for (auto it = pending_clouds_.begin(); it != pending_clouds_.end();) {
+    // 显式配对：按 header.stamp（不是 t_img）与 t_cloud 的差值挑最接近的一帧图像。
+    const colorizer::TimedImage* chosen = nullptr;
+    double best_dt = std::numeric_limits<double>::max();
+    for (const auto& image : image_cache_) {
+      if (!image.valid || image.image.empty()) {
+        continue;
+      }
+      const double dt = std::abs(image.arrival_stamp - it->t_cloud);
+      if (dt < best_dt) {
+        best_dt = dt;
+        chosen = &image;
+      }
+    }
+    if (chosen != nullptr && best_dt <= colorizer_options_.sync.max_offset) {
+      PendingColorFrame frame;
+      frame.points_lidar = it->points_lidar;
+      frame.t_cloud = it->t_cloud;
+      frame.t_pair = chosen->arrival_stamp;
+      frame.t_img = frame.t_pair + img_time_offset_;
+      frame.image = chosen->image;
+      frame.queued_at = now;
+      pending_color_.push_back(std::move(frame));
+      while (pending_color_.size() > kMaxPendingColorFrames) {
+        pending_color_.pop_front();
+        ++stat_drop_pose_;
+        RCLCPP_WARN(this->get_logger(), "彩色[丢弃] 待处理队列溢出，丢弃最早一帧");
+      }
+      it = pending_clouds_.erase(it);
       continue;
     }
-    const double dt = std::abs(image.arrival_stamp - t_cloud);
-    if (dt < best_dt) {
-      best_dt = dt;
-      chosen = &image;
+    // 图像还没到：等下一帧图像/云/里程计再试；等太久（例如相机断流）才真丢弃。
+    const double waited = std::chrono::duration<double>(now - it->queued_at).count();
+    if (waited > kPendingCloudTimeoutSec) {
+      ++stat_drop_no_image_;
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "彩色[丢弃] 等待图像超时: t_cloud=%.4f 最近差=%.4f 阈值=%.4f 已等 %.2fs",
+                           it->t_cloud, best_dt, colorizer_options_.sync.max_offset, waited);
+      it = pending_clouds_.erase(it);
+      continue;
     }
+    ++it;
   }
-  if (chosen == nullptr || best_dt > colorizer_options_.sync.max_offset) {
-    ++stat_drop_no_image_;
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "彩色[丢弃] 无匹配图像: t_cloud=%.4f 最近差=%.4f 阈值=%.4f",
-                         t_cloud, best_dt, colorizer_options_.sync.max_offset);
-    return;
-  }
-
-  // (3) 入队等待 t_img 时刻的位姿。通常 t_img 比当前已收到的 odom 还晚一个
-  //     img_time_offset，所以这里大概率不立刻成功，由 drainPendingColorization 稍后完成。
-  PendingColorFrame frame;
-  frame.points_lidar = body_points_;
-  frame.t_cloud = t_cloud;
-  frame.t_pair = chosen->arrival_stamp;
-  frame.t_img = frame.t_pair + img_time_offset_;
-  frame.image = chosen->image;
-  frame.queued_at = std::chrono::steady_clock::now();
-  pending_color_.push_back(std::move(frame));
-  while (pending_color_.size() > kMaxPendingColorFrames) {
-    pending_color_.pop_front();
-    ++stat_drop_pose_;
-    RCLCPP_WARN(this->get_logger(), "彩色[丢弃] 待处理队列溢出，丢弃最早一帧");
-  }
-
-  drainPendingColorization();
 }
 
 void VisualANode::drainPendingColorization() {
@@ -675,8 +765,11 @@ bool VisualANode::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
   // Interpolator 在查询时刻晚于最新采样时会直接返回最后一个采样，那等于把
   // t_img 的位姿退化成 t_cloud 的位姿，offset 就白加了。这里显式拒绝未来查询，
   // 由调用方延后重试。
+  // 轨迹源由 color.use_own_odom 决定：默认 /lio/odom；true 时用本节点视觉修正后的位姿。
+  const std::vector<colorizer::PoseSample>& cache =
+      color_use_own_odom_ ? own_pose_cache_ : pose_cache_;
   double newest = -std::numeric_limits<double>::max();
-  for (const auto& sample : pose_cache_) {
+  for (const auto& sample : cache) {
     newest = std::max(newest, sample.stamp);
   }
   if (stamp > newest) {
@@ -686,7 +779,7 @@ bool VisualANode::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
   // 与彩色流水线 / 累积逻辑保持同一套插值规则和同一个采样间隔上限。
   colorizer::LidarPoseInterpolator interpolator(
       colorizer::LidarPoseInterpolator::Options{kPoseHistoryMaxGapSec});
-  for (const auto& sample : pose_cache_) {
+  for (const auto& sample : cache) {
     interpolator.addSample(sample);
   }
   return interpolator.poseAt(stamp, T_wl);
