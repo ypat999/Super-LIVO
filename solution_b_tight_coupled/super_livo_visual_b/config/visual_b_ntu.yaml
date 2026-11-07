@@ -75,10 +75,13 @@
     est.visual_pos_sigma_floor: 0.02
     est.visual_pose_only: true
     est.estimate_extrinsics: false
-    est.gyro_noise: 0.001
-    est.acc_noise: 0.01
-    est.bias_gyro_noise: 0.00001
-    est.bias_acc_noise: 0.0001
+    # 过程噪声要覆盖真实 IMU 噪声量级，否则协方差塌缩后（实测 σθ=0.0017 rad）
+    # 位姿先验（0.02 rad / 0.05 m）在信息形式更新里权重约 1e-4，几乎拉不动状态，
+    # 残余俯仰误差持续泄漏重力 → 速度自由漂移（实测 |v| 涨到 45 m/s、轨迹 km 级）。
+    est.gyro_noise: 0.01
+    est.acc_noise: 0.2
+    est.bias_gyro_noise: 0.0001
+    est.bias_acc_noise: 0.001
     est.initial_covariance: 1.0
 
     scheduler.enable: true
@@ -95,5 +98,7 @@
     color.use_own_odom: false
 
     pcd.save_dir: "/home/ywj/slam_data/pcd/ntu_b"
-    pcd.save_interval_sec: 30.0
+    # <=0 表示不做周期性落盘，只在退出时存一次：单线程 executor 下 4M 点落盘约 25 s，
+    # 期间图像/IMU 回调全阻塞，估计算法会按陈旧 acc 外推导致速度爆掉（实测发散到 km 级）。
+    pcd.save_interval_sec: 0.0
     pcd.max_points: 20000000

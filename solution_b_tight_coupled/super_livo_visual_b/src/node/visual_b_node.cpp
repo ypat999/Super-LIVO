@@ -111,10 +111,15 @@ VisualBNode::VisualBNode(const rclcpp::NodeOptions& options)
   loadParameters();
 
   // 周期性把累积的彩色地图落盘（默认 10 s 一次，覆盖写同一个文件）。
-  pcd_save_timer_ = this->create_wall_timer(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::duration<double>(std::max(1.0, pcd_save_interval_sec_))),
-      std::bind(&VisualBNode::saveColoredMap, this));
+  // 注意：单线程 executor 下这里会阻塞所有订阅回调（实测 NTU 4M 点落盘一次 ~25 s，
+  // 期间图像/IMU 全丢，恢复后按陈旧 acc 外推 25 s，速度直接冲到几十 m/s）。
+  // 需要对 odom 精度做评测时把 pcd.save_interval_sec 设成 <=0，只在退出时存一次。
+  if (pcd_save_interval_sec_ > 0.0) {
+    pcd_save_timer_ = this->create_wall_timer(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::duration<double>(pcd_save_interval_sec_)),
+        std::bind(&VisualBNode::saveColoredMap, this));
+  }
 
   path_msg_.header.frame_id = "world";
   RCLCPP_INFO(this->get_logger(), "VisualBNode 初始化完成");
@@ -262,6 +267,9 @@ void VisualBNode::loadParameters() {
   pcd_save_interval_sec_ = this->declare_parameter<double>("pcd.save_interval_sec", 30.0);
   max_colored_map_points_ = static_cast<std::size_t>(
       this->declare_parameter<int>("pcd.max_points", 20000000));
+  // 体素多视图融合边长（米）。>0 时同址重复观测合并为 1 点、颜色按 quality 加权平均，
+  // 消除"同一面墙存 10~30 个不同颜色的重复点"造成的盐噪声；<=0 退回逐帧 append。
+  fusion_.set_voxel_size(this->declare_parameter<double>("pcd.fusion_voxel_size", 0.01));
 
   params_loaded_ = true;
 }
@@ -342,21 +350,31 @@ void VisualBNode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
 
     // 加计单位归一化（对齐官方 IMU_Processing::IMU_init）：
     //   静止段 mean_acc 主要由重力构成，|mean_acc|≈1g ⇒ scale=9.81/|mean_acc| 把 acc 变 m/s²；
-    //   重力方向取 -mean_acc 方向（世界系下），幅值固定 9.81，避免与 init.R 的朝向不一致。
+    //   世界系重力 = -R * mean_acc（加计静止时测的是比力 -R^T g）。
+    //   注意必须左乘 init.R：NTU 的 Super-LIO 初始姿态 roll≈180°，不旋会把 g 的 z 符号搞反，
+    //   传播里重力补偿变成 2g，轨迹立刻自由落体（实测 180 s 漂到 200 km）。
     if (!imu_buffer_.empty()) {
       Eigen::Vector3d mean_acc = Eigen::Vector3d::Zero();
+      Eigen::Vector3d mean_gyro = Eigen::Vector3d::Zero();
       for (const auto& s : imu_buffer_) {
         mean_acc += s.acc;
+        mean_gyro += s.gyro;
       }
       mean_acc /= static_cast<double>(imu_buffer_.size());
+      mean_gyro /= static_cast<double>(imu_buffer_.size());
       const double norm = mean_acc.norm();
       if (norm > 1e-3) {
         imu_acc_scale_ = kGravityNorm / norm;
-        init.g = -mean_acc / norm * kGravityNorm;
+        init.g = init.R * (-mean_acc / norm * kGravityNorm);
       }
+      // 陀螺零偏必须用静止段均值初始化：NTU 的 VN100 零偏约 (0.40,0.20,0.11) °/s，
+      // 从 0 起估计会让姿态在 60 s 内漂 20~30°，重力泄漏成水平加速度后轨迹发散（实测 3 km）。
+      init.bg = mean_gyro;
       RCLCPP_INFO(this->get_logger(),
-                  "IMU 加计归一化: |mean_acc|=%.4f ⇒ acc_scale=%.4f, gravity=(%.2f,%.2f,%.2f)",
-                  norm, imu_acc_scale_, init.g.x(), init.g.y(), init.g.z());
+                  "IMU 加计归一化: |mean_acc|=%.4f ⇒ acc_scale=%.4f, gravity=(%.2f,%.2f,%.2f), "
+                  "gyro_bias=(%.4f,%.4f,%.4f) rad/s",
+                  norm, imu_acc_scale_, init.g.x(), init.g.y(), init.g.z(),
+                  init.bg.x(), init.bg.y(), init.bg.z());
     }
 
     estimator_->resetState(init);
@@ -580,7 +598,15 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
       gyro_prev = s.gyro;
     }
     if (stamp > t_prev) {
-      estimator_->propagate(acc_prev * imu_acc_scale_, gyro_prev, stamp - t_prev);
+      // 长间隔（回调被阻塞/IMU 丢包）不能用陈旧 acc 外推：dt 大 1 个量级，
+      // 速度误差就大 1 个量级且再也拉不回来。超过 0.2 s 视为中断，不积分。
+      const double gap = stamp - t_prev;
+      if (gap > 0.2) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "IMU 中断 %.3f s，跳过该段传播（速度状态保持）", gap);
+      } else {
+        estimator_->propagate(acc_prev * imu_acc_scale_, gyro_prev, gap);
+      }
       t_prev = stamp;
     }
     last_imu_stamp_ = t_prev;
@@ -665,11 +691,12 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 1000,
       "视觉帧: obs=%zu tracks=%zu lv=%zu mscfk=%d used=%d quality=%.2f | "
-      "注入 λ=%.2e cap=%.2e scale=%.4f dxθ=%.4frad dxp=%.4fm σp=%.3fm | "
+      "注入 λ=%.2e cap=%.2e scale=%.4f dxθ=%.4frad dxp=%.4fm σp=%.3fm σθ=%.4frad |v|=%.2fm/s | "
       "耗时 ms: 前端=%.1f 约束=%.1f 更新=%.1f 彩色=%.1f 合计=%.1f",
       obs.size(), constraint_tracks.size(), lv_residuals.size(), msckf_eq.used_features,
       used_features, quality, vd.info_lambda, vd.cap_lambda, vd.scale, vd.dx_rot, vd.dx_pos,
       vd.sigma_pos,
+      vd.sigma_rot, vd.vel_norm,
       ms(t_start, t_front), ms(t_front, t_vis), ms(t_vis, t_update),
       ms(t_update, t_end), ms(t_start, t_end));
 }
@@ -939,7 +966,8 @@ void VisualBNode::accumulateColoredMap(const std::vector<colorizer::ColoredPoint
   if (points.empty()) {
     return;
   }
-  if (colored_map_.size() >= max_colored_map_points_) {
+  const std::size_t cur_size = fusion_.enabled() ? fusion_.size() : colored_map_.size();
+  if (cur_size >= max_colored_map_points_) {
     if (!pcd_capacity_warned_) {
       pcd_capacity_warned_ = true;
       RCLCPP_WARN(this->get_logger(), "彩色地图点数达到上限 %zu，后续帧不再累积",
@@ -961,6 +989,19 @@ void VisualBNode::accumulateColoredMap(const std::vector<colorizer::ColoredPoint
 
   const Eigen::Matrix3d R = T_wl.block<3, 3>(0, 0);
   const Eigen::Vector3d t = T_wl.block<3, 1>(0, 3);
+
+  // ---- 体素融合路径：每体素 1 点，位置质心、颜色按 quality 加权平均 ----------
+  if (fusion_.enabled()) {
+    for (const auto& cp : points) {
+      if (cp.quality <= 0.0F) {
+        continue;
+      }
+      const Eigen::Vector3f pw = (R * cp.xyz.cast<double>() + t).cast<float>();
+      fusion_.insert(pw, cp.rgb, cp.quality);
+    }
+    return;
+  }
+
   const std::size_t room = max_colored_map_points_ - colored_map_.size();
   // 注意：这里不能调用 reserve(size + room)，否则每帧都会强制按精确容量重分配
   //   （百万级点的整块拷贝），单帧耗时会被拖到 200 ms 以上。
@@ -992,7 +1033,8 @@ void VisualBNode::accumulateColoredMap(const std::vector<colorizer::ColoredPoint
 }
 
 void VisualBNode::saveColoredMap() {
-  if (colored_map_.empty() || colored_map_.size() == pcd_saved_points_) {
+  const std::size_t cur_size = fusion_.enabled() ? fusion_.size() : colored_map_.size();
+  if (cur_size == 0 || cur_size == pcd_saved_points_) {
     return;  // 无新增点则跳过，避免重复写同一个大文件
   }
 
@@ -1005,17 +1047,45 @@ void VisualBNode::saveColoredMap() {
     return;
   }
 
-  // 直接落盘累积点云（PointXYZRGB 16 B/点，binary 即 16 B/点）。
-  colored_map_.width = static_cast<std::uint32_t>(colored_map_.size());
-  colored_map_.height = 1;
-  colored_map_.is_dense = false;
-
   const std::string path =
       (std::filesystem::path(pcd_save_dir_) / "super_livo_visual_b_colored.pcd").string();
-  if (pcl::io::savePCDFileBinary(path, colored_map_) == 0) {
-    pcd_saved_points_ = colored_map_.size();
-    RCLCPP_INFO(this->get_logger(), "彩色地图已保存: %s（%zu 点，世界系）", path.c_str(),
-                colored_map_.size());
+  std::size_t saved = 0;
+  bool ok = false;
+  if (fusion_.enabled()) {
+    // 体素融合输出：每体素 1 点（质心位置 + 加权平均颜色）。
+    pcl::PointCloud<pcl::PointXYZRGB> out;
+    out.reserve(fusion_.size());
+    const auto clamp_u8 = [](double v) {
+      return static_cast<std::uint8_t>(std::clamp(v, 0.0, 255.0));
+    };
+    fusion_.forEach([&](const Eigen::Vector3d& pos, const Eigen::Vector3d& rgb) {
+      pcl::PointXYZRGB q;
+      q.x = static_cast<float>(pos.x());
+      q.y = static_cast<float>(pos.y());
+      q.z = static_cast<float>(pos.z());
+      q.r = clamp_u8(rgb.x());
+      q.g = clamp_u8(rgb.y());
+      q.b = clamp_u8(rgb.z());
+      q.a = 255;
+      out.push_back(q);
+    });
+    out.width = static_cast<std::uint32_t>(out.size());
+    out.height = 1;
+    out.is_dense = false;
+    ok = (pcl::io::savePCDFileBinary(path, out) == 0);
+    saved = out.size();
+  } else {
+    // 直接落盘累积点云（PointXYZRGB 16 B/点，binary 即 16 B/点）。
+    colored_map_.width = static_cast<std::uint32_t>(colored_map_.size());
+    colored_map_.height = 1;
+    colored_map_.is_dense = false;
+    ok = (pcl::io::savePCDFileBinary(path, colored_map_) == 0);
+    saved = colored_map_.size();
+  }
+  if (ok) {
+    pcd_saved_points_ = saved;
+    RCLCPP_INFO(this->get_logger(), "彩色地图已保存: %s（%zu 点，世界系%s）", path.c_str(),
+                saved, fusion_.enabled() ? "，体素融合" : "");
   } else {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                          "保存 PCD 失败: %s", path.c_str());

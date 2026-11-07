@@ -51,6 +51,17 @@ def load_gt(path):
 
 def load_odom(bag_dir, topic, time_source='header'):
     """纯 Python 读 ROS2 bag（不需要 source ROS 环境）。"""
+    if bag_dir.endswith('.txt'):
+        # 官方 FAST-LIVO2 的 Log/result/<seq>.txt：TUM 格式 t x y z qx qy qz qw（时间为数据时间）
+        rows = []
+        for line in open(bag_dir):
+            p = line.split()
+            if len(p) < 8:
+                continue
+            rows.append([float(x) for x in p[:8]])
+        a = np.array(rows)
+        print('  官方轨迹文件 %s  n=%d' % (os.path.basename(bag_dir), len(a)))
+        return a[np.argsort(a[:, 0])] if len(a) >= 10 else None
     from rosbags.rosbag2 import Reader
     from rosbags.typesys import Stores, get_typestore
 
@@ -61,8 +72,9 @@ def load_odom(bag_dir, topic, time_source='header'):
         if topic not in topics:
             print('  话题缺失 %s；该 bag 有: %s' % (topic, sorted(topics)))
             return None
-        for conn, t_ns, raw in r.messages(topics=[topic]):
-            msg = r.deserialize(raw, conn.msgtype)
+        conns = [c for c in r.connections if c.topic == topic]
+        for conn, t_ns, raw in r.messages(connections=conns):
+            msg = ts.deserialize_cdr(raw, conn.msgtype)
             if time_source == 'header':
                 st = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
             else:
@@ -155,6 +167,9 @@ def main():
     ap.add_argument('--topic', action='append', default=[])
     ap.add_argument('--label', action='append', default=[])
     ap.add_argument('--time-source', default='header', choices=['header', 'bag'])
+    # 官方 FAST-LIVO2 用 rclcpp::now() 给 odom 打时间戳（墙钟），与 bag 内数据时间不同源。
+    # auto = 把估计的首个时刻平移到真值首个时刻；也可直接给常数偏移（秒，加到估计时间上）。
+    ap.add_argument('--time-shift', default='')
     ap.add_argument('--out', default='')
     a = ap.parse_args()
 
@@ -167,6 +182,10 @@ def main():
         est = load_odom(bag, a.topic[i], a.time_source)
         if est is None:
             continue
+        if a.time_shift:
+            shift = gt[0, 0] - est[0, 0] if a.time_shift == 'auto' else float(a.time_shift)
+            est[:, 0] += shift
+            print('  时间平移 %+.3f s（对齐到真值基准）' % shift)
         # 时间基准对齐：真值与 odom 的 ns 时钟同源，但 header 可能有常数偏差
         r = evaluate(lab, est, gt)
         if r:

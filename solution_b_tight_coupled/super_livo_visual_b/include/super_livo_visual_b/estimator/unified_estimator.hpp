@@ -67,6 +67,8 @@ class UnifiedEstimator {
     double dx_rot{0.0};        ///< 本帧注入的旋转修正（rad）
     double dx_pos{0.0};        ///< 本帧注入的平移修正（m）
     double sigma_pos{0.0};     ///< 更新后位置协方差开方（m）
+    double sigma_rot{0.0};     ///< 更新后旋转协方差开方（rad）
+    double vel_norm{0.0};      ///< 当前速度估计（m/s），用于诊断发散
   };
 
   explicit UnifiedEstimator(const Options& options);

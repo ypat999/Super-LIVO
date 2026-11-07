@@ -351,6 +351,9 @@ void UnifiedEstimator::applyInformationUpdate(const Eigen::MatrixXd& H,
     diag->dx_pos = dx.segment<3>(StateLayout::kPos).norm();
     diag->sigma_pos =
         std::sqrt(std::max(0.0, covariance_new(StateLayout::kPos, StateLayout::kPos)));
+    diag->sigma_rot =
+        std::sqrt(std::max(0.0, covariance_new(StateLayout::kRot, StateLayout::kRot)));
+    diag->vel_norm = filter_.state.v.norm();
   }
 
   injectError(dx);

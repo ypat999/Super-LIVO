@@ -83,6 +83,11 @@ if [ $CONVERT_ONLY -eq 0 ]; then
     echo "下载中（断点续传 -C -）..."
     "${CURL[@]}" -C - -o "$ZIP" "$URL"
   fi
+fi
+
+# 无论是否 --convert-only，解压目录缺失时都要先解压，否则下面 find 不到 .bag
+if [ -z "$(find "$RAW/$SEQ" -maxdepth 2 -name '*.bag' 2>/dev/null | head -1)" ]; then
+  [ -s "$ZIP" ] || { echo "缺少 $ZIP，无法解压"; exit 1; }
   echo "解压..."
   unzip -n -q "$ZIP" -d "$RAW/$SEQ" || { echo "解压失败"; exit 1; }
 fi
@@ -108,6 +113,10 @@ export PATH="$HOME/.local/bin:$PATH"
 rosbags-convert --src "$BAG" --dst "$DST" --dst-storage sqlite3 \
   --exclude-topic /uwb_endorange_info /uwb_exorange_info /node_pos_sc \
                   /imu/temperature /imu/magnetic_field
+
+# rosbags 写的是 offered_qos_profiles: []，Humble 的 yaml-cpp 会报 bad conversion
+# 让 ros2 bag play/info 直接失败；改成空字符串即可。
+sed -i 's|offered_qos_profiles: \[\]|offered_qos_profiles: ""|g' "$DST/metadata.yaml"
 
 echo "=== 转换后核对：话题 + 相机内参（CameraInfo）==="
 python3 - "$DST" <<'PY'

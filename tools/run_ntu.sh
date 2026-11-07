@@ -9,12 +9,12 @@
 #   python3 tools/odom_vs_gt.py --gt ntu_viral/gt/$SEQ/ground_truth.csv \
 #       --bag ~/slam_data/ntu_odom_${SEQ}_a --topic /lio/odom --label "lio/odom" \
 #       --bag ~/slam_data/ntu_odom_${SEQ}_a --topic /super_livo_visual_a/odom --label "方案A"
-set -uo pipefail
+set -o pipefail  # 不用 -u：ROS 的 setup.bash 会引用未定义变量
 
 SEQ=${SEQ:-eee_03}
 SIDE=${1:-a}
 BAG=/home/ywj/slam_data/ntu_viral/bags2/$SEQ
-SL_NTU=/home/ywj/git/Super-LIVO/third_party/Super-LIO/src/super_lio/config/NTU.yaml
+SL_NTU=${SL_NTU:-/home/ywj/git/Super-LIVO/third_party/Super-LIO/src/super_lio/config/NTU.yaml}
 WS_FL=/home/ywj/fastlivo2_ws
 FL_CFG=/home/ywj/git/Super-LIVO/third_party/FAST-LIVO2-ROS2/config
 GT=/home/ywj/slam_data/ntu_viral/gt/$SEQ/ground_truth.csv
@@ -41,20 +41,29 @@ if [ "$SIDE" = "fl" ]; then
     --params-file "$FL_CFG/camera_NTU_VIRAL.yaml" > /tmp/fl_bb_${SEQ}.log 2>&1 &
   BB=$!
   sleep 8
+  # IMG_EN=0 关掉视觉，只跑官方 LIO（消融对照）
+  IMG_EN=${IMG_EN:-1}
   $WS_FL/install/fast_livo/lib/fast_livo/fastlivo_mapping --ros-args \
     --params-file "$FL_CFG/NTU_VIRAL.yaml" --params-file "$FL_CFG/camera_NTU_VIRAL.yaml" \
-    -p evo.seq_name:="$SEQ" -p pcd_save.pcd_save_en:=false -p pcd_save.interval:=-1 \
+    -p evo.seq_name:="${SEQ}${FL_TAG:-}" -p pcd_save.pcd_save_en:=false -p pcd_save.interval:=-1 \
+    -p common.img_en:="$IMG_EN" \
     > /tmp/fl_${SEQ}_${SIDE}.log 2>&1 &
   NODE_PID=$!
   sleep 12
+  rm -rf "$ODOMDIR"
+  ros2 bag record -o "$ODOMDIR" /aft_mapped_to_init \
+    > /tmp/rec_${SEQ}_${SIDE}.log 2>&1 &
+  REC=$!
   ros2 bag play "$BAG" --rate 1.0 > /tmp/bagplay_${SEQ}_${SIDE}.log 2>&1
   sleep 5
+  kill -INT $REC 2>/dev/null; sleep 4; kill $REC 2>/dev/null
   kill -INT $NODE_PID 2>/dev/null; sleep 8
   kill $BB 2>/dev/null
   pkill -f fastlivo_mapping 2>/dev/null
   echo "=== 官方收尾（位姿文件见 third_party/FAST-LIVO2-ROS2/Log）==="
   tail -3 /tmp/fl_${SEQ}_${SIDE}.log
   find /home/ywj/git/Super-LIVO/third_party/FAST-LIVO2-ROS2/Log -name "*.txt" -newermt "-10 minutes" 2>/dev/null | head
+  echo "评测：python3 tools/odom_vs_gt.py --gt /home/ywj/slam_data/ntu_viral/gt/$SEQ/ground_truth.csv --bag ${ODOMDIR} --topic /aft_mapped_to_init --label 官方FAST-LIVO2 --out /tmp/ntu_${SEQ}_fl.png"
   exit 0
 fi
 
