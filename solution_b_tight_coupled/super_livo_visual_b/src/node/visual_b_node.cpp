@@ -267,10 +267,6 @@ void VisualBNode::loadParameters() {
   pcd_save_interval_sec_ = this->declare_parameter<double>("pcd.save_interval_sec", 30.0);
   max_colored_map_points_ = static_cast<std::size_t>(
       this->declare_parameter<int>("pcd.max_points", 20000000));
-  // 体素多视图融合边长（米）。>0 时同址重复观测合并为 1 点、颜色按 quality 加权平均，
-  // 消除"同一面墙存 10~30 个不同颜色的重复点"造成的盐噪声；<=0 退回逐帧 append。
-  fusion_.set_voxel_size(this->declare_parameter<double>("pcd.fusion_voxel_size", 0.01));
-
   params_loaded_ = true;
 }
 
@@ -966,8 +962,7 @@ void VisualBNode::accumulateColoredMap(const std::vector<colorizer::ColoredPoint
   if (points.empty()) {
     return;
   }
-  const std::size_t cur_size = fusion_.enabled() ? fusion_.size() : colored_map_.size();
-  if (cur_size >= max_colored_map_points_) {
+  if (colored_map_.size() >= max_colored_map_points_) {
     if (!pcd_capacity_warned_) {
       pcd_capacity_warned_ = true;
       RCLCPP_WARN(this->get_logger(), "彩色地图点数达到上限 %zu，后续帧不再累积",
@@ -989,18 +984,6 @@ void VisualBNode::accumulateColoredMap(const std::vector<colorizer::ColoredPoint
 
   const Eigen::Matrix3d R = T_wl.block<3, 3>(0, 0);
   const Eigen::Vector3d t = T_wl.block<3, 1>(0, 3);
-
-  // ---- 体素融合路径：每体素 1 点，位置质心、颜色按 quality 加权平均 ----------
-  if (fusion_.enabled()) {
-    for (const auto& cp : points) {
-      if (cp.quality <= 0.0F) {
-        continue;
-      }
-      const Eigen::Vector3f pw = (R * cp.xyz.cast<double>() + t).cast<float>();
-      fusion_.insert(pw, cp.rgb, cp.quality);
-    }
-    return;
-  }
 
   const std::size_t room = max_colored_map_points_ - colored_map_.size();
   // 注意：这里不能调用 reserve(size + room)，否则每帧都会强制按精确容量重分配
@@ -1033,8 +1016,7 @@ void VisualBNode::accumulateColoredMap(const std::vector<colorizer::ColoredPoint
 }
 
 void VisualBNode::saveColoredMap() {
-  const std::size_t cur_size = fusion_.enabled() ? fusion_.size() : colored_map_.size();
-  if (cur_size == 0 || cur_size == pcd_saved_points_) {
+  if (colored_map_.empty() || colored_map_.size() == pcd_saved_points_) {
     return;  // 无新增点则跳过，避免重复写同一个大文件
   }
 
@@ -1049,43 +1031,13 @@ void VisualBNode::saveColoredMap() {
 
   const std::string path =
       (std::filesystem::path(pcd_save_dir_) / "super_livo_visual_b_colored.pcd").string();
-  std::size_t saved = 0;
-  bool ok = false;
-  if (fusion_.enabled()) {
-    // 体素融合输出：每体素 1 点（质心位置 + 加权平均颜色）。
-    pcl::PointCloud<pcl::PointXYZRGB> out;
-    out.reserve(fusion_.size());
-    const auto clamp_u8 = [](double v) {
-      return static_cast<std::uint8_t>(std::clamp(v, 0.0, 255.0));
-    };
-    fusion_.forEach([&](const Eigen::Vector3d& pos, const Eigen::Vector3d& rgb) {
-      pcl::PointXYZRGB q;
-      q.x = static_cast<float>(pos.x());
-      q.y = static_cast<float>(pos.y());
-      q.z = static_cast<float>(pos.z());
-      q.r = clamp_u8(rgb.x());
-      q.g = clamp_u8(rgb.y());
-      q.b = clamp_u8(rgb.z());
-      q.a = 255;
-      out.push_back(q);
-    });
-    out.width = static_cast<std::uint32_t>(out.size());
-    out.height = 1;
-    out.is_dense = false;
-    ok = (pcl::io::savePCDFileBinary(path, out) == 0);
-    saved = out.size();
-  } else {
-    // 直接落盘累积点云（PointXYZRGB 16 B/点，binary 即 16 B/点）。
-    colored_map_.width = static_cast<std::uint32_t>(colored_map_.size());
-    colored_map_.height = 1;
-    colored_map_.is_dense = false;
-    ok = (pcl::io::savePCDFileBinary(path, colored_map_) == 0);
-    saved = colored_map_.size();
-  }
-  if (ok) {
-    pcd_saved_points_ = saved;
-    RCLCPP_INFO(this->get_logger(), "彩色地图已保存: %s（%zu 点，世界系%s）", path.c_str(),
-                saved, fusion_.enabled() ? "，体素融合" : "");
+  colored_map_.width = static_cast<std::uint32_t>(colored_map_.size());
+  colored_map_.height = 1;
+  colored_map_.is_dense = false;
+  if (pcl::io::savePCDFileBinary(path, colored_map_) == 0) {
+    pcd_saved_points_ = colored_map_.size();
+    RCLCPP_INFO(this->get_logger(), "彩色地图已保存: %s（%zu 点，世界系）", path.c_str(),
+                colored_map_.size());
   } else {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                          "保存 PCD 失败: %s", path.c_str());
