@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>super_livo_visual_a</name>
+  <version>0.0.1</version>
+  <description>方案 A：Super-LIO 轻量视觉前端与视觉约束（接口骨架，暂不含实现）</description>
+  <maintainer email="ypat999@gmail.com">ypat999</maintainer>
+  <license>GPL-2.0-or-later</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>eigen</depend>
+  <depend>libopencv-dev</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>pcl_conversions</depend>
+  <depend>pointcloud_colorizer</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

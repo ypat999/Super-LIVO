@@ -26,7 +26,7 @@ ODOMDIR=/home/ywj/slam_data/ntu_odom_${SEQ}_${SIDE}
 source /opt/ros/humble/setup.bash
 source /home/ywj/git/3d_dog_navi_ros2/install/setup.bash
 source /home/ywj/git/Super-LIVO/third_party/Super-LIO/install/setup.bash
-source /tmp/sl_install/setup.bash
+source /home/ywj/git/Super-LIVO/install/setup.bash
 
 pkill -x super_lio_node 2>/dev/null; pkill -x visual_a_node 2>/dev/null
 pkill -x visual_b_node 2>/dev/null; pkill -f fastlivo_mapping 2>/dev/null

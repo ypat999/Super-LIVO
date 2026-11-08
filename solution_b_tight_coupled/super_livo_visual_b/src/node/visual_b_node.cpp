@@ -267,6 +267,9 @@ void VisualBNode::loadParameters() {
   pcd_save_interval_sec_ = this->declare_parameter<double>("pcd.save_interval_sec", 30.0);
   max_colored_map_points_ = static_cast<std::size_t>(
       this->declare_parameter<int>("pcd.max_points", 20000000));
+  median_map_.set_voxel_size(
+      static_cast<float>(this->declare_parameter<double>("pcd.median_voxel_size", 0.01)));
+
   params_loaded_ = true;
 }
 
@@ -985,6 +988,17 @@ void VisualBNode::accumulateColoredMap(const std::vector<colorizer::ColoredPoint
   const Eigen::Matrix3d R = T_wl.block<3, 3>(0, 0);
   const Eigen::Vector3d t = T_wl.block<3, 1>(0, 3);
 
+  // ---- 时间中位数：只统计颜色，几何仍按原逻辑全量 append ----------------
+  // 注意：这里不能 return —— 体素只用来算“该位置的多数色”，落盘时回填到
+  //   每一个保留下来的几何点上。点数与坐标完全不变，不会把点云变稀。
+  if (median_map_.enabled()) {
+    for (const auto& cp : points) {
+      if (cp.quality <= 0.0F) continue;
+      const Eigen::Vector3f pw = (R * cp.xyz.cast<double>() + t).cast<float>();
+      median_map_.insert(pw, cp.rgb);
+    }
+  }
+
   const std::size_t room = max_colored_map_points_ - colored_map_.size();
   // 注意：这里不能调用 reserve(size + room)，否则每帧都会强制按精确容量重分配
   //   （百万级点的整块拷贝），单帧耗时会被拖到 200 ms 以上。
@@ -1017,7 +1031,7 @@ void VisualBNode::accumulateColoredMap(const std::vector<colorizer::ColoredPoint
 
 void VisualBNode::saveColoredMap() {
   if (colored_map_.empty() || colored_map_.size() == pcd_saved_points_) {
-    return;  // 无新增点则跳过，避免重复写同一个大文件
+    return;
   }
 
   std::error_code ec;
@@ -1031,13 +1045,30 @@ void VisualBNode::saveColoredMap() {
 
   const std::string path =
       (std::filesystem::path(pcd_save_dir_) / "super_livo_visual_b_colored.pcd").string();
+
+  // 时间中位数：只回填颜色，几何/点数完全不动（避免体素化把点云变稀）。
+  if (median_map_.enabled()) {
+    const auto c8 = [](double v) {
+      return static_cast<std::uint8_t>(std::clamp(v, 0.0, 255.0));
+    };
+    for (auto& p : colored_map_.points) {
+      Eigen::Vector3d rgb;
+      if (median_map_.colorAt(Eigen::Vector3f(p.x, p.y, p.z), rgb)) {
+        p.r = c8(rgb.x());
+        p.g = c8(rgb.y());
+        p.b = c8(rgb.z());
+      }
+    }
+  }
+
   colored_map_.width = static_cast<std::uint32_t>(colored_map_.size());
   colored_map_.height = 1;
   colored_map_.is_dense = false;
   if (pcl::io::savePCDFileBinary(path, colored_map_) == 0) {
     pcd_saved_points_ = colored_map_.size();
-    RCLCPP_INFO(this->get_logger(), "彩色地图已保存: %s（%zu 点，世界系）", path.c_str(),
-                colored_map_.size());
+    RCLCPP_INFO(this->get_logger(), "彩色地图已保存: %s（%zu 点，世界系%s）", path.c_str(),
+                colored_map_.size(),
+                median_map_.enabled() ? "，时间中位数回填色" : "");
   } else {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                          "保存 PCD 失败: %s", path.c_str());

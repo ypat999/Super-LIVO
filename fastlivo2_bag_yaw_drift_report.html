@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>rosbag2_fastlivo2_2026_10_30-18_00_25 —— yaw 漂移诊断报告</title>
+<style>
+  :root { --ink:#1b1f24; --muted:#5b6672; --line:#e3e7ec; --bg:#fbfcfd;
+          --red:#c0392b; --amber:#b7791f; --green:#1e7d5a; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:48px 24px 72px; background:var(--bg); color:var(--ink);
+         font:15px/1.75 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:980px; margin:0 auto; }
+  h1 { font-size:26px; line-height:1.35; margin:0 0 6px; letter-spacing:.2px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:34px; }
+  h2 { font-size:18px; margin:40px 0 12px; padding-bottom:8px; border-bottom:1px solid var(--line); }
+  h3 { font-size:15px; margin:26px 0 8px; color:#2d3742; }
+  p { margin:10px 0; }
+  table { border-collapse:collapse; width:100%; margin:14px 0 6px; font-size:13.5px; background:#fff; }
+  th, td { border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:#f3f5f8; font-weight:600; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .verdict { background:#fff; border:1px solid var(--line); border-left:4px solid var(--red);
+             padding:16px 18px; margin:18px 0 8px; }
+  .verdict b { color:var(--red); }
+  .note { background:#fff; border:1px solid var(--line); border-left:4px solid var(--amber);
+          padding:12px 16px; margin:16px 0; font-size:13.5px; color:#3c4650; }
+  .ok { border-left-color:var(--green); }
+  figure { margin:20px 0 8px; }
+  img { width:100%; border:1px solid var(--line); border-radius:4px; background:#fff; }
+  figcaption { font-size:12.5px; color:var(--muted); margin-top:6px; }
+  code { background:#eef1f5; padding:1px 5px; border-radius:3px; font-size:12.5px;
+         font-family:ui-monospace,Consolas,monospace; }
+  .two { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:760px){ .two{ grid-template-columns:1fr; } }
+  ul { margin:8px 0; padding-left:22px; }
+  li { margin:5px 0; }
+  .small { font-size:12.5px; color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>rosbag2_fastlivo2_2026_10_30-18_00_25 建图 yaw 漂移诊断</h1>
+<div class="sub">
+  诊断对象：FAST-LIVO2-ROS2（纯 LIO / 完整 LIVO）与 Super-LIO，同一份 bag · 2026-11-06 ·
+  仅诊断，未修改数据、未重跑、未做回环校正
+</div>
+
+<div class="verdict">
+  <b>结论：现象成立。</b>这不是 roll/pitch 倾斜，而是<b>绕垂直轴的 yaw 累计漂移</b>。
+  108 m 路径绕一圈回到起始大房间（离起点 0.99 m），姿态却已经转过 <b>17.2°</b>，
+  同一面墙因此建出两套互成十几度的墙线（重影）。纯 LIO 与 LIVO 结果几乎一致
+  （终点 yaw 误差 −18.4° / −19.4°），说明误差来自激光-惯性部分，视觉没有纠正它；
+  两条管线都不带回环，Super-LIO 同样无法避免。
+</div>
+
+<h2>1. 数据与运行条件</h2>
+<table>
+  <tr><th style="width:30%">项目</th><th>内容</th></tr>
+  <tr><td>bag</td><td><code>/home/ywj/slam_data/rosbag2_fastlivo2_2026_10_30-18_00_25</code></td></tr>
+  <tr><td>时长 / 消息</td><td>160.3 s；<code>/livox/lidar</code> 1602 帧（10 Hz，<code>x y z intensity tag line timestamp</code>）、
+      <code>/livox/imu</code> 约 3.2 万帧（200 Hz）、<code>/camera/color/image_raw</code> 1604 帧（1280×800 rgb8）</td></tr>
+  <tr><td>轨迹</td><td>路径长度 107.5 m（LIVO 108.6 m）；起点在房间内，多个 20 s 窗口内姿态转过 100°~359°（大量原地旋转）</td></tr>
+  <tr><td>FAST-LIVO2（纯 LIO）</td><td><code>img_en:=0</code>、<code>preprocess.lidar_type:=8</code>、2× 播放</td></tr>
+  <tr><td>FAST-LIVO2（LIVO）</td><td><code>img_en:=1</code>、<code>img_topic:=/camera/color/image_raw</code>、1× 播放，
+      外参 Rcl/Pcl 取自 bag 内 <code>标定参数.txt</code> 的 <code>T_cam_lidar</code>，
+      <code>img_time_offset:=0</code>、关闭 rolling shutter</td></tr>
+  <tr><td>IMU 同步</td><td>1× 播放时 <code>IMU and LiDAR not synced</code> 警告 <b>0 条</b>，
+      不存在 IMU 丢帧导致的传播中断（2× 播放时的刷屏是播放速度造成的）</td></tr>
+</table>
+
+<h2>2. 证据一：回环闭合处的 yaw 误差</h2>
+<p>
+  从轨迹能看出机器人绕行一圈回到起点所在房间。取“距起点 &lt; 3 m 且 t &gt; 20 s”的帧，
+  与第 0 帧比较位置和姿态：
+</p>
+<table>
+  <tr><th>运行</th><th class="num">回环时刻</th><th class="num">位置偏差</th><th class="num">yaw 偏差</th><th class="num">终点位置偏差</th><th class="num">终点 yaw 偏差</th></tr>
+  <tr><td>FAST-LIVO2 纯 LIO</td><td class="num">147.1 s</td><td class="num">0.99 m</td><td class="num"><b>−17.2°</b></td><td class="num">2.32 m</td><td class="num">−18.4°</td></tr>
+  <tr><td>FAST-LIVO2 LIVO</td><td class="num">148.2 s</td><td class="num">0.98 m</td><td class="num"><b>−17.0°</b></td><td class="num">2.44 m</td><td class="num">−19.4°</td></tr>
+</table>
+<p class="small">
+  位置回到同一处 1 m 内，朝向却差 17°——这正是重影的来源：同一段墙体在两次经过时被放到相差 17° 的位姿下。
+</p>
+
+<div class="two">
+  <figure>
+    <img src="fastlivo2_bag_loop_diag.png" alt="LIO 轨迹与回环偏差">
+    <figcaption>纯 LIO：轨迹（颜色=时间）与“到起点距离”曲线，红点为 t=147 s 的回环时刻。</figcaption>
+  </figure>
+  <figure>
+    <img src="fastlivo2_bag_livo_loop_diag.png" alt="LIVO 轨迹与回环偏差">
+    <figcaption>LIVO：轨迹形状、回环位置与偏差几乎与纯 LIO 相同（差 &lt;1°），说明视觉未参与纠偏。</figcaption>
+  </figure>
+</div>
+
+<h2>3. 证据二：误差是渐变漂移，不是跳变或崩溃</h2>
+<p>
+  逐帧 yaw 变化统计：>10° 的单帧跳变 <b>0 次</b>；yaw 角速率 p50 5.8°/s、p95 44.3°/s、峰值 72.3°/s，
+  与平台大量原地旋转相符。误差是随旋转时间累积的，没有某一次匹配失败式的突跳。
+  位姿 yaw 角速率与陀螺 z 的相关性 0.997、尺度 0.9916，滤波器与 IMU 本身是自洽的。
+</p>
+
+<h2>4. 证据三：地图上的重影</h2>
+<figure>
+  <img src="fastlivo2_start_room_ghost.png" alt="起始房间重影切面">
+  <figcaption>
+    纯 LIO 地图在起点 22 m 半径内、z∈[−0.3, 2.2] m 的切面（红点为起点）。
+    同一房间的墙体出现两套互相旋转的结构，夹角与轨迹给出的 17° 一致。
+  </figcaption>
+</figure>
+
+<h2>5. 证据四：IMU 静态零偏</h2>
+<p>
+  bag 开头 0~9 s 平台基本静止（角速度模长均值 0.018 rad/s，≈1°/s），但陀螺输出并不为零：
+</p>
+<table>
+  <tr><th>时间段</th><th class="num">gx [rad/s]</th><th class="num">gy [rad/s]</th><th class="num">gz [rad/s]</th><th class="num">gz 标准差</th></tr>
+  <tr><td>0 – 2 s（静止）</td><td class="num">+0.0014</td><td class="num">−0.0154</td><td class="num">−0.0073</td><td class="num">0.0048</td></tr>
+  <tr><td>2 – 5 s（静止）</td><td class="num">+0.0005</td><td class="num">−0.0152</td><td class="num">−0.0076</td><td class="num">0.0052</td></tr>
+  <tr><td>5 – 9 s（静止）</td><td class="num">+0.0010</td><td class="num">−0.0154</td><td class="num">−0.0062</td><td class="num">0.0074</td></tr>
+</table>
+<p>
+  即静止时 z 轴约有 <b>−0.42°/s</b>、y 轴约 −0.88°/s 的常值输出。z 轴零偏直接积分会带来
+  0.42°/s × 160 s ≈ 67° 的 yaw 误差；FAST-LIVO2 的在线零偏估计吸收了其中大部分，
+  残余为 17.2° / 147 s ≈ <b>0.12°/s</b>，与实测回环误差完全对得上。
+</p>
+<div class="note">
+  为什么残余这么大：整个过程中平台反复原地大角度旋转，而大房间内墙面近似对称、缺少可约束 yaw 的结构，
+  激光对航向的观测很弱；视线方向又没有回环或全局约束，残余零偏只能一路累积。
+</div>
+
+<h2>6. 为什么“地面看着不歪”</h2>
+<p>
+  俯仰/横滚被重力和地面平面牢牢约束住，所以地面法向始终接近 +Z，但这与 yaw 无关：
+</p>
+<table>
+  <tr><th>运行</th><th class="num">地面法向 roll</th><th class="num">pitch</th><th class="num">地面 RMS</th></tr>
+  <tr><td>FAST-LIVO2 LIO（本包）</td><td class="num">0.001°</td><td class="num">0.018°</td><td class="num">1.97 cm</td></tr>
+  <tr><td>FAST-LIVO2 LIVO（本包）</td><td class="num">−0.008°</td><td class="num">0.062°</td><td class="num">2.17 cm</td></tr>
+  <tr><td>Super-LIO（本包）</td><td class="num">−0.007°</td><td class="num">0.013°</td><td class="num">1.70 cm</td></tr>
+</table>
+<div class="note">
+  之前用“地面拟合”判断“不歪”只覆盖了 roll/pitch，结论对俯仰横滚有效，<b>对 yaw 无效</b>；
+  本报告更正这一点。
+</div>
+
+<h2>7. 三套运行的一致性</h2>
+<table>
+  <tr><th>运行</th><th class="num">点数</th><th class="num">地图范围</th><th class="num">终点 yaw 误差</th><th>说明</th></tr>
+  <tr><td>Super-LIO</td><td class="num">4137 万</td><td class="num">—</td><td class="num">同样存在</td><td>共用同一份 IMU，无回环，现象一致</td></tr>
+  <tr><td>FAST-LIVO2 LIO</td><td class="num">2897 万</td><td class="num">58 × 62 × 9.4 m</td><td class="num">−18.4°</td><td>2× 播放，1× 复跑无同步告警</td></tr>
+  <tr><td>FAST-LIVO2 LIVO</td><td class="num">451 万（带 rgb）</td><td class="num">58 × 57 × 5.7 m</td><td class="num">−19.4°</td><td>LIVO 只保存被图像着色的点，故点数少</td></tr>
+</table>
+
+<h2>8. 复现方式</h2>
+<ul>
+  <li>位姿文件：LIO <code>/home/ywj/slam_data/fl2_bag_lio/lidar_poses.txt</code>；
+      LIVO <code>FAST-LIVO2-ROS2/Log/pcd/lidar_poses.txt</code>（每行 <code>t x y z qx qy qz qw</code>）</li>
+  <li>轨迹/回环统计脚本：<code>/tmp/loop_diag.py</code>、<code>/tmp/analyze_traj.py</code></li>
+  <li>陀螺提取与静止段统计：<code>/tmp/extract_gyro.py</code>、<code>/tmp/gyro_rest.py</code></li>
+  <li>房间切面：<code>/tmp/crop_start_room.py</code></li>
+</ul>
+
+<h2>9. 可选的改进方向（本次未执行）</h2>
+<ul>
+  <li><b>回环 / 全局优化</b>：对两次到访的同一房间做 ICP 配准，把后段点云按回环位姿纠正，可得到无重影地图（不改原始数据）。</li>
+  <li><b>去零偏重跑</b>：用静止段估计的零偏对 IMU 做预补偿后再跑两条管线，对比回环误差是否下降，用以判断残余零偏占比。</li>
+  <li><b>参数侧</b>：提高 IMU 权重/降低零偏过程噪声、或延长静止初始化、降低旋转段的速度，观察 yaw 漂移变化。</li>
+  <li><b>数据侧</b>：该 IMU 静止零偏偏大（z 轴 0.42°/s），建议做温补与标定；若必须无回环长期运行，建议引入外部航向/回环约束。</li>
+</ul>
+
+<p class="small" style="margin-top:36px">
+  本报告仅基于上述 bag 的三次运行结果与 bag 内原始 IMU/位姿数据，未修改任何数据与参数。
+</p>
+
+</div>
+</body>
+</html>

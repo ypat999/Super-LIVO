@@ -25,6 +25,7 @@
 #include "super_livo_visual_a/frontend/klt_frontend.hpp"
 #include "super_livo_visual_a/update/visual_update.hpp"
 #include "pointcloud_colorizer/colorizer_pipeline.hpp"
+#include "pointcloud_colorizer/voxel_color_median.hpp"
 namespace superlivo_a {
 
 // ============================================================================
@@ -238,6 +239,9 @@ class VisualANode : public rclcpp::Node {
   // ---- 彩色地图落盘（PCD） -------------------------------------------------
   /// 世界系彩色点（直接累积成 PCL 点云，落盘时无需再复制一遍）。
   pcl::PointCloud<pcl::PointXYZRGB> colored_map_;
+  /// 逐体素多帧 RGB 时间中位数（pcd.median_voxel_size>0 时启用，替代 append）。
+  /// 对同一 1cm 格子的最近 6 帧颜色取中位，椒盐噪声天然被压制，不模糊边缘。
+  colorizer::VoxelColorMedian median_map_;
   std::string pcd_save_dir_{"/home/ywj/slam_data/pcd"};  ///< 输出目录
   double pcd_save_interval_sec_{30.0};                   ///< 周期保存间隔（秒）
   /// 地图点数上限：全量点云约 2 万点/帧、上色后约 1 万点/帧，1 万点/秒 →
