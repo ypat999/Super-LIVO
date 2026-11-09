@@ -1,0 +1,19 @@
+/**:
+  ros__parameters:
+    # Data path. adjust them!
+    common:
+        image_path:  "/data/DeltaElect/lib/calib_ros2_ws/src/calib_ros2/result/img_camera1"
+        pcd_path:  "/data/DeltaElect/lib/calib_ros2_ws/src/calib_ros2/result/pcd_camera1"
+        result_path:  "/data/DeltaElect/lib/calib_ros2_ws/src/calib_ros2/result/extrinsic_camera1_1.txt"
+        data_num: 7
+    # Camera Parameters. Adjust them!
+    camera:
+        camera_matrix: [608.82753,    0.0     , 655.19155,
+                          0.0     , 608.39169,  475.33728,
+                          0.0     ,   0.0     ,   1.0     ]
+        dist_coeffs: [-0.232659, 0.040986, 0.000583, -0.000404, 0.000000]
+
+    # Calibration Parameters.!
+    calib:
+        calib_config_file: "/data/DeltaElect/lib/calib_ros2_ws/src/calib_ros2/config/config_indoor_camera1.yaml"
+        use_rough_calib: true # set true if your initial_extrinsic is bad
