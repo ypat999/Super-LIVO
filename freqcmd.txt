@@ -1,0 +1,106 @@
+# freqcmd.txt — Super-LIVO 换机/换环境常用命令（测速用）
+# 适用：Ubuntu 20.04/22.04 + ROS2 Humble，Livox Avia + 集成 IMU + 相机（Retail_Street 数据集同款）
+# 换环境时只需改下面的路径变量，其余命令原样可用。
+
+# ============================================================
+# 0. 路径与环境变量（按需修改）
+# ============================================================
+export REPO=~/git/Super-LIVO                                  # 本仓库
+export DATA=~/slam_data                                       # bag 与结果根目录
+export BAG=$DATA/Retail_Street                                # ROS2 sqlite3 bag（135.47s，/livox/lidar /livox/imu /left_camera/image 640x512 rgb8）
+export DOG_WS=~/dog_slam/LIO-SAM_MID360_ROS2_PKG/ros2         # FAST-LIO2/Point-LIO fork 工作区
+export PL_WS=~/slam_data/pl_ros2_ws                           # 开源 Point-LIO ROS2 移植（SMBU）
+export FL2_WS=~/fastlivo2_ws                                  # 官方 FAST-LIVO2 ROS2 移植
+
+# ROS2 通信（WSL/单机必设，否则发现不了节点/丢消息）
+export ROS_LOCALHOST_ONLY=1
+export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+
+# ============================================================
+# 1. 系统依赖（新机器一次性）
+# ============================================================
+sudo apt install -y ros-humble-desktop ros-humble-cv-bridge ros-humble-image-transport \
+  ros-humble-pcl-ros ros-humble-tf2-ros libeigen3-dev libpcl-dev libopencv-dev \
+  libboost-all-dev libgoogle-glog-dev libgflags-dev libyaml-cpp-dev \
+  time python3-numpy
+# 注: /usr/bin/time 来自 time 包（测峰值内存用）；WSL 下全部 headless 跑即可（脚本均不带 rviz）
+
+# ============================================================
+# 2. 构建（在各自工作区根目录）
+# ============================================================
+# 2.1 Super-LIO（LIO 核）
+source /opt/ros/humble/setup.bash
+source ~/git/3d_dog_navi_ros2/install/setup.bash 2>/dev/null || true   # Super-LIO 依赖的 dog 工作区，换机可缺省
+cd $REPO/third_party/Super-LIO && colcon build --packages-select super_lio --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+# 2.2 方案A/B 着色（仓库根工作区）
+cd $REPO && source third_party/Super-LIO/install/setup.bash && \
+colcon build --packages-select pointcloud_colorizer super_livo_visual_a super_livo_visual_b \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release
+# ⚠️ 必须 Release：Debug 下着色耗时从 4~5ms 劣化到几十 ms（见 HANDOVER 2026-11-08）
+
+# 2.3 开源 Point-LIO ROS2（SMBU 移植，对比基线用）
+cd $PL_WS && colcon build --packages-select point_lio
+
+# 2.4 官方 FAST-LIVO2（ROS2 移植，参考轨迹/测速对照）
+cd $FL2_WS && colcon build --packages-select fast_livo
+
+# ============================================================
+# 3. 主链路完整跑（Super-LIO + 方案A 上色，输出彩色 PCD）
+# ============================================================
+source /opt/ros/humble/setup.bash
+source $REPO/third_party/Super-LIO/install/setup.bash
+source $REPO/install/setup.bash
+pkill -x super_lio_node; pkill -x visual_a_node; sleep 2
+ros2 run super_lio super_lio_node --ros-args \
+  --params-file $REPO/third_party/Super-LIO/src/super_lio/config/r3live.yaml > /tmp/slio.log 2>&1 &
+ros2 run super_livo_visual_a visual_a_node --ros-args \
+  --params-file $REPO/solution_a_lightweight/super_livo_visual_a/config/visual_a_params.yaml \
+  -p pcd.save_dir:=$DATA/run_map -p pcd.save_interval_sec:=0.0 > /tmp/vis.log 2>&1 &
+# 等 LIO 初始化（"Map init done"）再放 bag
+for i in $(seq 1 60); do grep -aq "Map init done" /tmp/slio.log && break; sleep 1; done
+ros2 bag play $BAG --rate 1.0 --disable-keyboard-controls < /dev/null > /tmp/play.log 2>&1
+sleep 15                                   # 追帧余量
+pkill -INT -x visual_a_node; sleep 50      # 退出时落盘彩色地图（必须等）
+pkill -x super_lio_node; pkill -x visual_a_node
+grep -a "彩色地图已保存" /tmp/vis.log | tail -1
+
+# ============================================================
+# 4. 测速（核心：实时率 = 处理总耗时 / bag 时长 135.47s）
+# ============================================================
+# 4.1 整体墙钟 + 峰值内存（对单个节点）
+/usr/bin/time -v ros2 run fast_livo fastlivo_mapping --ros-args --params-file $CFG > node.log 2>&1
+# 结果看 "Elapsed (wall clock)" 与 "Maximum resident set size"
+
+# 4.2 各系统帧内处理耗时（日志自带，单位 s/帧）
+grep -a "Total Processing Time" node.log | tail            # FAST-LIVO2 / Super-LIO 系
+grep -a "耗时\|ms" /tmp/vis.log | tail                     # 方案A：深度/门控/着色分项
+# 判据：单帧处理耗时 < 帧周期（lidar 10Hz → 100ms）即实时；累加/均值除以帧数得平均。
+
+# 4.3 对照跑（同 bag 同参数）
+# 官方 FAST-LIVO2：bash $REPO/experiments/octvox_ablation/07_run_fastlivo2.sh
+# FAST-LIO2 / Point-LIO(dog_slam fork) + 方案A上色：bash .../11_run_colored_lio_bench.sh
+# 开源 Point-LIO(ROS2 SMBU) + 方案A上色：bash .../13_run_colored_pointlio_smbu.sh
+
+# ============================================================
+# 5. 结果核验（点数/跨度/彩色）
+# ============================================================
+python3 - <<'EOF'
+# 简单 PCD 头核验；完整脚本见 tools/
+import struct, sys
+for p in sys.argv[1:]:
+    f=open(p,'rb'); head=[f.readline().decode().strip() for _ in range(12)]
+    print(p, [h for h in head if h.startswith(('FIELDS','WIDTH','HEIGHT','POINTS','DATA'))])
+EOF
+
+# ============================================================
+# 6. 已知坑（换环境大概率踩）
+# ============================================================
+# - ros2 bag play 后台运行必须 --disable-keyboard-controls + < /dev/null，否则提前退出（实测只播 30s）
+# - WSL/单机 DDS：ROS_LOCALHOST_ONLY=1 + FASTDDS_BUILTIN_TRANSPORTS=UDPv4，否则订阅不到
+# - visual_a 落盘在 SIGINT 后 ~50s，别提前 pkill 掉
+# - 编译务必 -DCMAKE_BUILD_TYPE=Release（Debug 着色慢一个数量级）
+# - bag 消息 stamp 是设备时钟域（2000 年纪元），与录制时间差 ~717580s，各传感器一致，不影响同步
+# - 相机内参：Retail_Street 用 1280x1024 全分辨率内参 fx=1293.56944 fy=1293.3155 cx=626.91359 cy=522.799224，
+#   bag 实际 640x512，靠 scale=0.5（FAST-LIVO2 系）/scale=2.0（Point-line 系）折算
+# - 官方 FAST-LIVO2 的 parameter_blackboard 在部分环境不可达：用 07a_wrap_official_cfg.py 把内参并入主参数文件
