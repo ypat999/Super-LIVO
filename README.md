@@ -58,7 +58,8 @@ K=8 拟合邻域、平面残差软降权等）；其余子模块保持上游原�
 | [docs/HANDOVER_2026-11-08.md](docs/HANDOVER_2026-11-08.md) | **工作主线交接文档**：§16 总纲、§17 按帧染色诊断链、§18/§20 官方图像消融、§19 RTK-SLAM 真值评测 |
 | [docs/](docs/) | 专项审计：地图更新机制（MAP_UPDATE_*）、OctVox 审计、去畸变管线、点云质量指标、数据清单（DATA_INVENTORY）等 |
 | [tools/](tools/) | 评测与取数脚本：`odom_vs_gt.py`（官方协议 ATE）、`traj_compare.py`、着色一致性/耗时/平面厚度等 |
-| [experiments/](experiments/) | 成对消融实验：`fl2_img_ablation`（官方 FAST-LIVO2 有/无图像 ×3 轮）、`octvox_ablation`（地图表示消融） |
+| [experiments/](experiments/) | 成对消融实验：`fl2_img_ablation`（官方 FAST-LIVO2 有/无图像 ×3 轮）、`octvox_ablation`（地图表示消融；`10~13_*.sh` 为 LIO 核 + 方案A 上色对比跑批） |
+| [freqcmd.txt](freqcmd.txt) | 换环境/换机常用命令清单：依赖、构建、主链路跑批、测速方法与已知坑 |
 | [speed_test.md](speed_test.md) | RK3588 实机测速报告（Super-LIO / FAST-LIVO2 / 方案 A/B，绑核公平对比） |
 | 根目录 `*.png` / `*.html` | 各数据集点云预览图与诊断报告（如 `fastlivo2_bag_yaw_drift_report.html`） |
 
