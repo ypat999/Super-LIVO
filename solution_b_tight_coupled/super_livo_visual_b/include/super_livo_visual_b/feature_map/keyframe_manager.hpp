@@ -51,6 +51,15 @@ class KeyframeManager {
   /// 取当前可参与多帧约束的轨迹（观测数足够、视差足够）。
   std::vector<FeatureTrack> constraintTracks(int min_observations, double min_parallax_deg) const;
 
+  /// 轨迹池规模（耗时排查用）：条数、观测总数、单条最长观测数、观测对总数上限。
+  struct TrackPoolStats {
+    std::size_t num_tracks{0};
+    std::size_t total_obs{0};
+    std::size_t max_obs{0};
+    std::size_t pair_work{0};  ///< Σ n(n-1)/2，视差扫描的配对数上限
+  };
+  TrackPoolStats trackPoolStats() const;
+
   /// 清空地图。
   void clear();
 

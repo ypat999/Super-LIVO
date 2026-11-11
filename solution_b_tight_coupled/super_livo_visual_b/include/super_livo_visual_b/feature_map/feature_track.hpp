@@ -28,14 +28,23 @@ struct FeatureTrack {
   bool triangulated{false};
   bool valid{false};
 
-  /// 追加一次观测（自动保持时间升序）。
+  /// 单条轨迹的观测史上限：保留首帧（最长基线，视差与三角化最有利）+ 最近若干帧。
+  /// 不截断的话，长期存活的锚点观测数会涨到数百，视差扫描与 MSCKF 零空间都按 n² 膨胀。
+  static constexpr std::size_t kMaxObservations = 16;
+
+  /// 追加一次观测（自动保持时间升序，并按 kMaxObservations 裁剪过长历史）。
   void addObservation(const FeatureObservation& observation);
 
-  /// 计算轨迹内最大视差（度）。视差过小时三角化与航向约束都不可靠。
+  /// 轨迹内最大视差（度）。视差过小时三角化与航向约束都不可靠。
+  /// 观测数已被 kMaxObservations 限制，全量扫描最多 120 对；结果按缓存复用，追加观测时失效。
   double parallaxDeg() const;
 
   /// 轨迹是否具备进入多帧约束的基本条件。
   bool readyForConstraint(int min_observations, double min_parallax_deg) const;
+
+ private:
+  /// 最大视差缓存，-1 表示待重建。
+  mutable double max_parallax_cache_{-1.0};
 };
 
 }  // namespace superlivo_b

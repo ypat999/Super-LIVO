@@ -104,14 +104,28 @@ void KeyframeManager::updateTracks(const std::vector<FeatureTrack>& tracks) {
 
 std::vector<FeatureTrack> KeyframeManager::constraintTracks(int min_observations,
                                                             double min_parallax_deg) const {
+  // 通过率通常远低于 100%（tracks_ 里大量是刚建立、观测数不足的轨迹），
+  // 按 tracks_.size() 预留每次都要分配一份大缓冲并做深拷贝，改为小初值按需增长。
   std::vector<FeatureTrack> result;
-  result.reserve(tracks_.size());
+  result.reserve(std::min<std::size_t>(tracks_.size(), 256));
   for (const auto& kv : tracks_) {
     if (kv.second.readyForConstraint(min_observations, min_parallax_deg)) {
       result.push_back(kv.second);
     }
   }
   return result;
+}
+
+KeyframeManager::TrackPoolStats KeyframeManager::trackPoolStats() const {
+  TrackPoolStats s;
+  s.num_tracks = tracks_.size();
+  for (const auto& kv : tracks_) {
+    const std::size_t n = kv.second.observations.size();
+    s.total_obs += n;
+    s.max_obs = std::max(s.max_obs, n);
+    s.pair_work += n * (n - 1) / 2;
+  }
+  return s;
 }
 
 void KeyframeManager::clear() {

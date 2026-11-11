@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 
 // Matrix4d::inverse() 需要 LU 模块的 Inverse 求值特化，否则运行期无限递归。
 #include <Eigen/Geometry>
@@ -11,6 +12,19 @@ namespace superlivo_b {
 
 namespace {
 constexpr double kPi = 3.14159265358979323846;
+
+/// 两帧观测的视线夹角（度）：把 a 的视线方向变到 b 的相机系，再与 b 的视线求夹角。
+/// 只用旋转块（平移从未参与视差定义），且旋转乘单位向量仍是单位向量，只需 clamp 余弦。
+double pairAngleDeg(const FeatureObservation& a, const FeatureObservation& b) {
+  const Eigen::Vector3d ray_a =
+      Eigen::Vector3d(a.pixel.x(), a.pixel.y(), 1.0).normalized();
+  const Eigen::Vector3d ray_b =
+      Eigen::Vector3d(b.pixel.x(), b.pixel.y(), 1.0).normalized();
+  const Eigen::Vector3d ray_a_in_b =
+      b.T_wc.block<3, 3>(0, 0).transpose() * a.T_wc.block<3, 3>(0, 0) * ray_a;
+  const double cos_angle = std::max(-1.0, std::min(1.0, ray_a_in_b.dot(ray_b)));
+  return std::acos(cos_angle) * 180.0 / kPi;
+}
 }  // namespace
 
 void FeatureTrack::addObservation(const FeatureObservation& observation) {
@@ -20,6 +34,19 @@ void FeatureTrack::addObservation(const FeatureObservation& observation) {
                                return a.stamp < stamp;
                              });
   observations.insert(it, observation);
+
+  if (observations.size() > kMaxObservations) {
+    // 超出上限：保留首帧（最长基线）+ 最近的 kMaxObservations-1 帧。
+    std::vector<FeatureObservation> kept;
+    kept.reserve(kMaxObservations);
+    kept.push_back(observations.front());
+    kept.insert(kept.end(), observations.end() - static_cast<std::ptrdiff_t>(kMaxObservations - 1),
+                observations.end());
+    observations.swap(kept);
+  }
+  // 视差缓存只做失效，不在这里读位姿：更新轨迹的路径上不碰 Eigen 数据，
+  // 下一次 parallaxDeg() 按上限规模（最多 120 对）重建，成本可忽略。
+  max_parallax_cache_ = -1.0;
   valid = observations.size() >= 2;
 }
 
@@ -27,27 +54,17 @@ double FeatureTrack::parallaxDeg() const {
   if (observations.size() < 2) {
     return 0.0;
   }
-
-  // 视差 = 同一空间点在两帧中的视线夹角。
-  // 做法：把第 i 帧的视线方向变换到第 j 帧的相机系，再与第 j 帧的视线求夹角。
-  // 注意必须包含相对平移（T_ji），只比较旋转会把纯平移运动的视差误判为 0。
-  double max_angle = 0.0;
-  for (std::size_t i = 0; i < observations.size(); ++i) {
-    const Eigen::Vector3d ray_i(observations[i].pixel.x(), observations[i].pixel.y(), 1.0);
-    const Eigen::Vector3d ray_i_normalized = ray_i.normalized();
-
-    for (std::size_t j = i + 1; j < observations.size(); ++j) {
-      // T_ji：第 i 帧相机系 -> 第 j 帧相机系
-      const Eigen::Matrix4d T_ji = observations[j].T_wc.inverse() * observations[i].T_wc;
-      const Eigen::Vector3d ray_i_in_j = T_ji.block<3, 3>(0, 0) * ray_i_normalized;
-      const Eigen::Vector3d ray_j(observations[j].pixel.x(), observations[j].pixel.y(), 1.0);
-
-      const double cos_angle =
-          std::max(-1.0, std::min(1.0, ray_i_in_j.normalized().dot(ray_j.normalized())));
-      max_angle = std::max(max_angle, std::acos(cos_angle) * 180.0 / kPi);
+  if (max_parallax_cache_ < 0.0) {
+    // 缓存失效（新建轨迹或被裁剪）才走全量，规模已被 kMaxObservations 限制。
+    double max_angle = 0.0;
+    for (std::size_t i = 0; i < observations.size(); ++i) {
+      for (std::size_t j = i + 1; j < observations.size(); ++j) {
+        max_angle = std::max(max_angle, pairAngleDeg(observations[i], observations[j]));
+      }
     }
+    max_parallax_cache_ = max_angle;
   }
-  return max_angle;
+  return max_parallax_cache_;
 }
 
 bool FeatureTrack::readyForConstraint(int min_observations, double min_parallax_deg) const {
