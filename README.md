@@ -13,7 +13,7 @@ git submodule update --init --recursive
 
 | 路径 | 上游仓库 | 分支 | 固定提交 |
 | --- | --- | --- | --- |
-| `third_party/FAST-LIVO2-ROS2` | https://github.com/ypat999/FAST-LIVO2-ROS2.git（fork 自 U-AMC/FAST-LIVO2-ROS2） | main | `ae28b0c` |
+| `third_party/FAST-LIVO2-ROS2` | https://github.com/ypat999/FAST-LIVO2-ROS2.git（fork 自 U-AMC/FAST-LIVO2-ROS2） | main | `b9f931f` |
 | `third_party/Super-LIO` | https://github.com/ypat999/Super-LIO.git | ros2 → no-de-check → exp/degeneracy-adaptive | `326ed21`（工作区检出 `67c0acd`） |
 | `third_party/basalt` | https://github.com/VladyslavUsenko/basalt.git | master | `0f3b2b5` |
 | `third_party/rpg_svo_pro_open` | https://github.com/uzh-rpg/rpg_svo_pro_open.git | master | `ca371f3` |
@@ -24,8 +24,11 @@ git submodule update --init --recursive
 说明：后三个为相机-雷达外参标定工具（ROS2 版）。Super-LIO 与 FAST-LIVO2-ROS2 为自有 fork：
 Super-LIO 的实验改动在 `no-de-check` / `exp/degeneracy-adaptive` 分支上推进（beam_err/dept_err
 距离自适应方差、K=8 拟合邻域、平面残差软降权等）；FAST-LIVO2-ROS2 的 fork 在上游 `a09599a`
-之上修了三处（`ae28b0c`）：`blind_sqr` 分支未赋值、MID360 话题订阅缺失、发布 odom 的时间戳
-改用 lidar 帧时刻（原为系统时间，评测时会被 evo 判成时间轴错位）。其余子模块保持上游原始代码。
+之上有两批改动：
+① `ae28b0c` 修三处功能缺陷——`blind_sqr` 分支未赋值、MID360 话题订阅缺失、发布 odom 的时间戳
+改用 lidar 帧时刻（原为系统时间，评测时会被 evo 判成时间轴错位）；
+② `b9f931f` 加**滚动淘汰视觉地图点**（`pruneVisualMap`），解决视觉地图随时间线性增长导致长序列
+OOM 的问题，详见「关键实验结论」。其余子模块保持上游原始代码。
 
 ## 相机-雷达外参标定流程
 
@@ -124,8 +127,8 @@ python3 /tmp/bench/parse_bench.py slio.log fl2.log vis_a.log vis_b.log <bag时�
   2.1 ms，B 是否仍"单大核实时临界"必须重测才能下结论。
 - **FL2 在单大核上跑不满实时**：处理需求 ≈0.99 帧周期，长序列必然积压，odom 延迟退化到
   秒级（均值 5.3 s、峰值 20 s）。所以"在 RK3588 上测 FL2"要么放开绑核/降帧频，要么明确
-  标注"该组为积压态，延迟指标不代表算法耗时"，否则对比不公平。另外其视觉地图常驻累积，
-  长序列会 OOM（详见"关键实验结论"里的内存坑）。
+  标注"该组为积压态，延迟指标不代表算法耗时"，否则对比不公平。另外其视觉地图原本常驻累积、
+  长序列会 OOM，现已在 fork `b9f931f` 用滚动淘汰修掉（详见"关键实验结论"）。
 - **不要只看延迟**：A/B 的价值在退化段，健康段应与 LIO 逐点贴合（`|B−LIO|` p50 ≈ 2~5 cm）。
   建议的判据组合是「延迟分布 + 同 bag 逐点差 + 退化段终点误差多跑分布」三者一起看，
   任何单一指标都能给出误导性结论。
@@ -134,7 +137,7 @@ python3 /tmp/bench/parse_bench.py slio.log fl2.log vis_a.log vis_b.log <bag时�
 
 | 路径 | 内容 |
 | --- | --- |
-| [docs/HANDOVER_2026-11-08.md](docs/HANDOVER_2026-11-08.md) | **工作主线交接文档**：§16 总纲、§17 按帧染色诊断链、§18/§20 官方图像消融、§19 RTK-SLAM 真值评测 |
+| [docs/HANDOVER_2026-11-08.md](docs/HANDOVER_2026-11-08.md) | **工作主线交接文档**：§16 总纲、§17 按帧染色诊断链、§18/§20 官方图像消融、§19 RTK-SLAM 真值评测、§22 滚动淘汰视觉地图点（99.3% 覆盖 / ATE 0.561 m）与三层点云偏差结果 |
 | [docs/](docs/) | 专项审计：地图更新机制（MAP_UPDATE_*）、OctVox 审计、去畸变管线、点云质量指标、数据清单（DATA_INVENTORY）等 |
 | [tools/](tools/) | 评测与取数脚本：`odom_vs_gt.py`（官方协议 ATE）、`traj_compare.py`、着色一致性/耗时/平面厚度等；RTK-SLAM 参考跑批链路 `run_fl2_rtk.sh` / `run_rtk.sh`（经 `ros_batch_guard.sh` 做互斥与"只杀同批"收尾）+ `fl2_pcd_merge.py`（合并 pcd 分片）+ `rtk_traj_prep.py` / `rtk_pcdev.py`（轨迹导出与点云偏差） |
 | [experiments/](experiments/) | 成对消融实验：`fl2_img_ablation`（官方 FAST-LIVO2 有/无图像 ×3 轮）、`octvox_ablation`（地图表示消融；`10~13_*.sh` 为 LIO 核 + 方案A 上色对比跑批） |
@@ -146,13 +149,24 @@ python3 /tmp/bench/parse_bench.py slio.log fl2.log vis_a.log vis_b.log <bag时�
 
 - **NTU eee_03 ATE**：官方 LIVO 0.028 m / 官方纯 LIO 0.043 m；Super-LIO 0.138→0.130 m
   （观测模型对齐后）。剩余差距主因是地图表示（0.25 m 子体素均值压缩）的内存/速度取舍，不建议改。
-- **RTK-SLAM Dataset**（全站仪 <1cm 真值，不做 SE(3) 对齐）：Super-LIO 绝对 ATE 0.347 m
-  vs 官方 FAST-LIO-SAM 0.374 m；无累积漂移，误差主要是子图刚体偏置而非逐帧抖动。
-- **官方 FAST-LIVO2 在 RTK construction_seq2 上的内存坑**（做参考图/参考轨迹时必踩）：开图像时
-  其内部关键帧-视觉地图常驻累积，599 s 整轮会涨到 ~23 GB 并被 OOM killer 打死（实测 23 GB 机器
-  上跑到 ~480 s / 80% 即被杀）。`pcd_save.interval=200` 分片落盘只能保住已 flush 的地图（46 片
-  / 302 MB + `lidar_poses.txt`），**并不限制内存增长**；`interval=-1` 更是整轮堆内存、退出才写盘，
-  被杀则颗粒无收。要拿完整整轮参考图必须换大内存机或关掉图像（`common.img_en=0`）。
+- **RTK-SLAM Dataset**（全站仪 <1cm 真值，不做 SE(3) 对齐，`construction_seq2` 整轮 16 个 GT 点全覆盖）：
+  `super-lio` 0.347 m / `fast-lio-sam` 0.374 m / `super-lio-beam3` 0.508 m / **官方 FAST-LIVO2 0.561 m** /
+  `super-lio-beam` 0.656 m。fl2 的 SE(3) 误差 0.091 m 是最低的一档——"形状准、绝对位置不准"；
+  其余系统无累积漂移，误差主要是子图刚体偏置而非逐帧抖动。
+- **三层点云偏差（`tools/rtk_pcdev.py`）**：以 fl2 的稠密建图为参考面网（39457 面 / 覆盖 26.7%），
+  量各系统点的 L1 距离分层散布、L2 跨帧重影、L3 绝对刚体偏差。L1 出斜率（如 fl2 σ0=0.96 cm、
+  σθ=0.134°，beam3 σθ=0.282°）；**L3 目前分辨率只到 ~10 cm**（参考面厚度上限 8 cm 主导），
+  各系统法向 MAD 7.7–10.6 cm 全落在自比对刻度 9.53 cm 的 0.81–1.11 倍内，**不能据此排序**；
+  L2 样本稀疏且非单调，暂不结论。要让 L3 可排序需换更薄的面或改点到最近点的法向距离。
+- **官方 FAST-LIVO2 的内存坑已解决（`b9f931f`）**：开图像时原实现会让每个视觉地图点钉住一帧
+  完整原图（`FEATURE::img_`），1.92 MB/帧 × 16.5 Hz ≈ 32 MB/s，加上 VisualPoint 自身增长 ≈
+  16 MB/s，合计 ≈48 MB/s 无界涨；`img_en=1` 51.8 MB/数据秒 vs `img_en=0` 4.3 MB/数据秒，
+  12 倍差全在视觉侧。`pcd_save.interval` 分片只保住已 flush 的地图，**对这部分内存无效**
+  （旧轮 46 分片仍在 480 s / 80% 被 OOM）。现在 `pruneVisualMap` 在每次分片落盘后以当前帧时刻
+  为 cutoff 删掉已落盘点（连带释放图像）并清空 `warp_map`，当前帧点留到下一轮匹配：本机 23 GB
+  可跑满 **595.5/599.5 s = 99.3%**，58 分片对应 58 次 prune，合并 24.88M → 8.92M 点 @5 cm。
+  代价是视觉地图只保留最近一片（约 200 帧 / 12 s），**长时视觉重观测能力被放弃**；
+  若要做长序列回环需改成按空间距离淘汰。
 - **图像消融**（§20）：官方 `img_en=1/0` ×3 轮判决——图像确实参与位姿（厘米级），稳态精度增益≈0，
   有效作用是"锚定/防跑飞"。
 - **LiDAR 退化对抗**（NTU eee_03 走廊裁剪，`Y_HALF=1.2` 温和退化，B 侧 8 次重复单跑
