@@ -33,6 +33,10 @@ constexpr double kPendingColorTimeoutSec = 1.0;
 /// 待着色队列上限，防止 odom 长时间缺失时内存膨胀。
 constexpr std::size_t kMaxPendingColorFrames = 8;
 
+/// 待处理视觉帧：/lio/odom 相对图像采集时刻约滞后 0.2 s，留 1 s 余量后丢弃。
+constexpr double kPendingVisualTimeoutSec = 1.0;
+constexpr std::size_t kMaxPendingVisualFrames = 8;
+
 /// 等图像队列：上限与超时（秒）。
 constexpr std::size_t kMaxPendingClouds = 6;
 constexpr double kPendingCloudTimeoutSec = 1.0;
@@ -99,6 +103,11 @@ VisualBNode::VisualBNode(const rclcpp::NodeOptions& options)
   imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
       imu_topic, rclcpp::SensorDataQoS(),
       std::bind(&VisualBNode::onImu, this, std::placeholders::_1));
+  degen_topic_ = this->declare_parameter<std::string>("degen_topic", "lio/degeneracy");
+  degen_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
+      degen_topic_,
+      rclcpp::SensorDataQoS(),
+      std::bind(&VisualBNode::onDegeneracy, this, std::placeholders::_1));
 
   // ---- 创建发布器 ---------------------------------------------------------
   colored_cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -127,6 +136,11 @@ VisualBNode::VisualBNode(const rclcpp::NodeOptions& options)
 
 VisualBNode::~VisualBNode() {
   // 收尾：bag 结束时队列里可能还有等图像/等位姿的帧，尽量补完再落盘。
+  // 待处理视觉帧不会再等到位姿了，直接按最新位姿算完，保证轨迹不缺尾段。
+  for (const auto& frame : pending_visual_) {
+    processVisualFrame(frame.gray, frame.stamp);
+  }
+  pending_visual_.clear();
   drainPendingClouds();
   drainPendingColorization();
   // 退出（Ctrl+C / SIGTERM 触发 rclcpp::spin 返回）时再存一次，保证短时长运行也有结果。
@@ -154,6 +168,28 @@ void VisualBNode::loadParameters() {
   // LiDAR 先验强度（D2）：先验越小越"信任" lio/odom，视觉修正越弱。
   prior_pos_sigma_ = this->declare_parameter<double>("lv.prior_pos_sigma", 0.05);
   prior_rot_sigma_ = this->declare_parameter<double>("lv.prior_rot_sigma", 0.02);
+  // 退化感知先验：退化方向松开、垂直方向收紧（详见头文件注释）
+  prior_directional_en_ =
+      this->declare_parameter<bool>("lv.prior_directional_en", true);
+  prior_pos_sigma_healthy_ =
+      this->declare_parameter<double>("lv.prior_pos_sigma_healthy", 0.005);
+  prior_pos_sigma_degen_ =
+      this->declare_parameter<double>("lv.prior_pos_sigma_degen", 1.0);
+  // sev 对数映射标尺（本数据集实测）：健康段 cond_t≈25-40，必须映射为 sev≈0，
+  // 否则先验在健康段就被无端松开一半（旧默认 10/100 使 cond_t=33 映射成 0.5）。
+  // 完全退化（n_effect=0，cond=1e12）由 axes/active 硬触发直接置 1，不走该映射。
+  gate_cond_lo_ = this->declare_parameter<double>("gate.cond_lo", 35.0);
+  gate_cond_hi_ = this->declare_parameter<double>("gate.cond_hi", 10000.0);
+  degen_timeout_ = this->declare_parameter<double>("gate.degen_timeout", 1.0);
+
+  // 退化段守卫（Trust + 速度限幅）
+  guard_enable_ = this->declare_parameter<bool>("guard.enable", true);
+  guard_lio_jump_pos_ = this->declare_parameter<double>("guard.lio_jump_pos", 1.0);
+  guard_lio_jump_rot_ = this->declare_parameter<double>("guard.lio_jump_rot", 0.2618);
+  guard_sev_threshold_ = this->declare_parameter<double>("guard.sev_threshold", 0.9);
+  guard_vel_ratio_ = this->declare_parameter<double>("guard.vel_ratio", 1.5);
+  guard_vel_fallback_ = this->declare_parameter<double>("guard.vel_fallback", 3.0);
+  guard_vel_abs_cap_ = this->declare_parameter<double>("guard.vel_abs_cap", 3.0);
 
   // 默认值与官方 avia.yaml 一致（0.1 s），本数据集已通过 offset 扫描验证最优。
   img_time_offset_ = this->declare_parameter<double>("img_time_offset", 0.1);
@@ -193,9 +229,13 @@ void VisualBNode::loadParameters() {
   lidar_visual_options_.huber_delta = this->declare_parameter<double>("lv.huber_delta", 1.0);
   lidar_visual_options_.min_constraints = this->declare_parameter<int>("lv.min_constraints", 8);
   lidar_visual_options_.max_pixel_error = this->declare_parameter<double>("lv.max_pixel_error", 8.0);
+  lidar_visual_options_.max_pixel_error_anchored =
+      this->declare_parameter<double>("lv.max_pixel_error_anchored", 60.0);
   // 测量噪声模型：没有它等价于 σ=1 px 且地图点无误差，一帧即可压塌协方差。
   lidar_visual_options_.sigma_pix = this->declare_parameter<double>("lv.sigma_pix", 1.5);
   lidar_visual_options_.sigma_anchor = this->declare_parameter<double>("lv.sigma_anchor", 0.05);
+  lidar_visual_options_.anchor_keep_sec =
+      this->declare_parameter<double>("lv.anchor_keep_sec", 20.0);
   lidar_visual_ = std::make_unique<LidarVisualConstraint>(lidar_visual_options_);
 
   // ---- MSCKF 多帧约束 MsckfConstraint -------------------------------------
@@ -239,6 +279,11 @@ void VisualBNode::loadParameters() {
       this->declare_parameter<double>("est.visual_rot_sigma_floor", 0.005);
   estimator_options_.visual_pos_sigma_floor =
       this->declare_parameter<double>("est.visual_pos_sigma_floor", 0.02);
+  // 退化时的视觉上限（LiDAR 已不可信，需让视觉真正接管）
+  estimator_options_.visual_info_ratio_degen =
+      this->declare_parameter<double>("est.visual_info_ratio_degen", 5.0);
+  estimator_options_.visual_pos_sigma_floor_degen =
+      this->declare_parameter<double>("est.visual_pos_sigma_floor_degen", 0.01);
   estimator_options_.visual_pose_only = this->declare_parameter<bool>("est.visual_pose_only", true);
   estimator_ = std::make_unique<UnifiedEstimator>(estimator_options_);
 
@@ -311,7 +356,66 @@ void VisualBNode::onImage(const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
                        image_cache_.begin() + (image_cache_.size() - max_image_cache_));
   }
 
-  processVisualFrame(gray, stamp);
+  // 等 t_pose 时刻的位姿到齐再处理，避免用 0.2 s 前的位姿算视觉残差。
+  const double t_pose = stamp + img_time_offset_;
+  const double newest_pose_stamp = pose_cache_.empty() ? -1e18 : pose_cache_.back().stamp;
+  if (newest_pose_stamp >= t_pose) {
+    processVisualFrame(gray, stamp);
+    return;
+  }
+  pending_visual_.push_back({gray, stamp, std::chrono::steady_clock::now()});
+  while (pending_visual_.size() > kMaxPendingVisualFrames) {
+    ++stat_drop_pose_;
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "视觉[丢弃] 待定队列超限（%zu 帧），丢弃最旧帧", pending_visual_.size());
+    pending_visual_.pop_front();
+  }
+}
+
+void VisualBNode::onDegeneracy(
+    const std_msgs::msg::Float64MultiArray::ConstSharedPtr& msg) {
+  // 布局：[cond6, axes, active, cond_t, evt_min, ux, uy, uz]
+  if (msg->data.size() < 8) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(degen_mutex_);
+  degen_axes_ = static_cast<int>(msg->data[1]);
+  degen_active_ = msg->data[2] > 0.5;
+  degen_cond_t_ = msg->data[3];
+  const Eigen::Vector3d u(msg->data[5], msg->data[6], msg->data[7]);
+  if (u.norm() > 1e-6) {
+    degen_dir_w_ = u.normalized();
+  } else {
+    degen_dir_w_.setZero();  // 无方向（非 trans_only 模式）时不能沿用上一帧
+  }
+  degen_recv_time_ = this->now().seconds();
+}
+
+bool VisualBNode::degeneracySignature(double& severity,
+                                      Eigen::Vector3d& dir_w) const {
+  severity = 0.0;
+  dir_w.setZero();
+  std::lock_guard<std::mutex> lock(degen_mutex_);
+  if (degen_recv_time_ < 0.0 ||
+      this->now().seconds() - degen_recv_time_ > degen_timeout_) {
+    return false;
+  }
+  // cond=0 说明 Super-LIO 侧没跑检测或不是 trans_only 模式，不能当"健康"用。
+  if (degen_cond_t_ <= 0.0) {
+    return false;
+  }
+  dir_w = degen_dir_w_;
+  // 硬判据（Super-LIO 自己的退化阈值）触发即满权；未触发时按 cond_t 连续映射，
+  // 不能用"不退化"短路，否则严重度只会在硬阈值处 0→1 跳变。
+  if (degen_axes_ > 0 || degen_active_) {
+    severity = 1.0;
+    return true;
+  }
+  const double lo = std::max(1e-6, gate_cond_lo_);
+  const double hi = std::max(lo * 1.001, gate_cond_hi_);
+  const double c = std::max(lo, degen_cond_t_);
+  severity = std::min(1.0, std::max(0.0, std::log(c / lo) / std::log(hi / lo)));
+  return true;
 }
 
 void VisualBNode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
@@ -388,6 +492,11 @@ void VisualBNode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
       last_imu_stamp_ = sample.stamp;
     }
     RCLCPP_INFO(this->get_logger(), "统一状态已用首帧 lio/odom 初始化");
+  }
+
+  // 新采样到齐后重试待处理视觉帧（t_pose 通常比 /lio/odom 的最新时刻还晚）。
+  if (!pending_visual_.empty()) {
+    drainPendingVisualFrames();
   }
 
   // 新采样到齐后重试待着色帧（t_img = t_cloud + img_time_offset，通常要等未来位姿）。
@@ -467,6 +576,31 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   // ==========================================================================
   const auto t_start = std::chrono::steady_clock::now();
 
+  // 0) 位姿时基对齐：T_wl_ 是"最新一条" lio/odom，未必是本图像时刻的位姿。
+  //    相机 header 戳比 LiDAR/IMU 钟晚 img_time_offset_（实测 0.1 s），
+  //    真正的采集时刻在 LiDAR 钟上是 stamp + img_time_offset_。
+  //    取位姿、发布 odom 都必须用这个时刻，否则整条轨迹恒落后 LIO 0.1 s。
+  const double t_pose = stamp + img_time_offset_;
+  if (!poseAtStamp(t_pose, T_wl_frame_)) {
+    // 插值失败 = 位姿历史里有 >0.5 s 的空洞（Super-LIO 偶发丢帧，实测 20 处）。
+    // 此时退回"最新位姿"会把视觉注入锚到最多 0.7 s 前的位姿上，实测造成 0.75 m
+    // 瞬跳；宁可丢这一帧（少一个采样），也不要发布错误时间的位姿。
+    ++stat_drop_pose_;
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                         "视觉[丢弃] 无 t_pose=%.3f 的可靠位姿（位姿空洞），跳过该帧", t_pose);
+    return;
+  }
+  double degen_sev = 0.0;
+  Eigen::Vector3d degen_u = Eigen::Vector3d::Zero();
+  if (!degeneracySignature(degen_sev, degen_u) && !degen_stale_warned_) {
+    degen_stale_warned_ = true;
+    RCLCPP_WARN(this->get_logger(),
+                "未收到 %s 退化签名（超时 %.1fs）：请给 Super-LIO 开启 "
+                "lio.observe.degeneracy_detect_en 且 degen_trans_only=1，"
+                "否则退化感知恒不触发。",
+                degen_topic_.c_str(), degen_timeout_);
+  }
+
   // 1) Patch 前端跟踪
   const std::vector<PatchObservation> obs = frontend_->process(gray, stamp);
 
@@ -494,7 +628,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   const auto t_front = std::chrono::steady_clock::now();
 
   // 4) 关键帧判定与轨迹更新
-  const Eigen::Matrix4d T_wc = T_wl_ * T_lc_;
+  const Eigen::Matrix4d T_wc = T_wl_frame_ * T_lc_;
   if (keyframe_manager_->shouldCreateKeyframe(T_wc, static_cast<int>(obs.size()), stamp)) {
     VisualKeyframe kf;
     kf.id = next_keyframe_id_++;
@@ -509,17 +643,24 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   keyframe_manager_->updateTracks(tracks);
 
   // 5) LiDAR 地图辅助 2D-3D 约束
+  const auto t_lv0 = std::chrono::steady_clock::now();
   lidar_visual_->setMapPoints(map_points_);
+  const auto t_lv1 = std::chrono::steady_clock::now();
   const auto lv_residuals = lidar_visual_->build(tracks, T_wc);
+  const auto t_lv2 = std::chrono::steady_clock::now();
   Eigen::MatrixXd H_lv;
   Eigen::VectorXd b_lv;
   double cost_lv = 0.0;
   lidar_visual_->accumulate(lv_residuals, H_lv, b_lv, cost_lv);
+  const auto t_lv3 = std::chrono::steady_clock::now();
 
   // 6) MSCKF 多帧轨迹约束
+  const auto t_ct0 = std::chrono::steady_clock::now();
   const auto constraint_tracks = keyframe_manager_->constraintTracks(
       msckf_options_.min_observations, msckf_options_.min_parallax_deg);
+  const auto t_mk0 = std::chrono::steady_clock::now();
   const MultiFrameNormalEquations msckf_eq = msckf_->build(constraint_tracks);
+  const auto t_mk1 = std::chrono::steady_clock::now();
 
   // 7) 合并视觉法方程（固定 6x6）
   Eigen::MatrixXd H_vis = Eigen::MatrixXd::Zero(6, 6);
@@ -588,7 +729,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
       if (s.stamp <= t_prev) {
         continue;
       }
-      if (s.stamp > stamp) {
+      if (s.stamp > t_pose) {
         break;
       }
       estimator_->propagate(acc_prev * imu_acc_scale_, gyro_prev, s.stamp - t_prev);
@@ -596,17 +737,17 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
       acc_prev = s.acc;
       gyro_prev = s.gyro;
     }
-    if (stamp > t_prev) {
+    if (t_pose > t_prev) {
       // 长间隔（回调被阻塞/IMU 丢包）不能用陈旧 acc 外推：dt 大 1 个量级，
       // 速度误差就大 1 个量级且再也拉不回来。超过 0.2 s 视为中断，不积分。
-      const double gap = stamp - t_prev;
+      const double gap = t_pose - t_prev;
       if (gap > 0.2) {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                              "IMU 中断 %.3f s，跳过该段传播（速度状态保持）", gap);
       } else {
         estimator_->propagate(acc_prev * imu_acc_scale_, gyro_prev, gap);
       }
-      t_prev = stamp;
+      t_prev = t_pose;
     }
     last_imu_stamp_ = t_prev;
     last_imu_acc_ = acc_prev;
@@ -614,10 +755,34 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   }
 
   // 9) LiDAR 更新（D2）：把 lio/odom 位姿当强先验注入
-  {
+  //    Trust 守卫：退化段上游解算会被带飞，lio/odom 若出现单帧大跳变，
+  //    本帧撤销激光先验（判据与 Super-LIO 一致），只保留 IMU 传播结果，
+  //    避免把跳变当作观测吃进滤波器。
+  bool lio_trusted = true;
+  if (guard_enable_ && last_trust_stamp_ > 0.0) {
+    const Eigen::Vector3d dp = T_wl_frame_.block<3, 1>(0, 3) -
+                               last_trust_T_wl_.block<3, 1>(0, 3);
+    const Eigen::Matrix3d dR = T_wl_frame_.block<3, 3>(0, 0) *
+                               last_trust_T_wl_.block<3, 3>(0, 0).transpose();
+    const double dtheta = so3Log(dR).norm();
+    if (dp.norm() > guard_lio_jump_pos_ || dtheta > guard_lio_jump_rot_) {
+      lio_trusted = false;
+      ++stat_prior_veto_;
+      RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "[Guard] lio/odom 单帧跳变 %.2f m / %.2f deg 超阈值，本帧撤销激光先验"
+          "（累计 %zu 次）",
+          dp.norm(), dtheta * 57.29577951308232, stat_prior_veto_);
+    }
+  }
+  if (guard_enable_) {
+    last_trust_T_wl_ = T_wl_frame_;
+    last_trust_stamp_ = t_pose;
+  }
+  if (lio_trusted) {
     Eigen::MatrixXd H_prior;
     Eigen::VectorXd b_prior;
-    buildLidarPrior(T_wl_, H_prior, b_prior);
+    buildLidarPrior(T_wl_frame_, H_prior, b_prior);
     estimator_->lidarUpdate(H_prior, b_prior, 0.0);
   }
 
@@ -629,7 +794,34 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     vin.cost = cost_vis;
     vin.quality = quality;
     vin.used_features = used_features;
+    vin.degen_severity = degen_sev;
+    vin.degen_dir_w = degen_u;
     estimator_->visualUpdate(vin);
+  }
+
+  // 10.5) 退化段速度守卫
+  //  完全退化时（Super-LIO n_effect=0 → cond=1e12）激光先验在退化方向被放松，
+  //  速度只剩 IMU 积分，实测 |v| 从 2.4 涨到 60 m/s。退化严重度高时给 |v| 设上限：
+  //  上限 = 健康段观测到的最大速度 × guard.vel_ratio（无健康样本时用 fallback）。
+  if (guard_enable_ && estimator_initialized_) {
+    const double vn = estimator_->filterState().state.v.norm();
+    if (degen_sev >= guard_sev_threshold_) {
+      double cap =
+          vel_ref_valid_ ? vel_ref_ * guard_vel_ratio_ : guard_vel_fallback_;
+      // 绝对上限兜底：视觉 spike 一旦混进 vel_ref，ratio 上限会跟着失守。
+      cap = std::min(cap, guard_vel_abs_cap_);
+      if (estimator_->clampSpeed(cap) > 0.0) {
+        ++stat_vel_clamp_;
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "[Guard] 退化段速度 %.2f m/s 超上限 %.2f m/s，限幅（累计 %zu 次）",
+            vn, cap, stat_vel_clamp_);
+      }
+    } else if (std::isfinite(vn) && vn <= guard_vel_abs_cap_) {
+      // 只从物理可信的速度学习参考值，超过绝对上限的样本一律不学。
+      vel_ref_ = vel_ref_valid_ ? std::max(vel_ref_, vn) : vn;
+      vel_ref_valid_ = true;
+    }
   }
 
   // 11) 延迟地图提交：状态更新后再用新位姿把本帧点云写入本地地图
@@ -662,12 +854,12 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
 
   // 12) 发布：以统一估计器的位姿为准（视觉修正后的结果）
   const auto t_update = std::chrono::steady_clock::now();
-  publishOdomAndPath(T_wl_updated, toRosStamp(stamp));
+  publishOdomAndPath(T_wl_updated, toRosStamp(t_pose));
 
-  // 12.5) 缓存修正位姿（按图像 header 时刻），供 color.use_own_odom=true 时着色插值。
+  // 12.5) 缓存修正位姿（打在 LiDAR 钟的采集时刻 t_pose），供 color.use_own_odom 着色插值。
   {
     colorizer::PoseSample own;
-    own.stamp = stamp;
+    own.stamp = t_pose;
     own.T_wl = T_wl_updated;
     own_pose_cache_.push_back(own);
     if (own_pose_cache_.size() > max_pose_samples_) {
@@ -687,17 +879,26 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   };
 
   const UnifiedEstimator::VisualDiagnostics& vd = estimator_->visualDiagnostics();
+  const auto tp = keyframe_manager_->trackPoolStats();
   RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 1000,
       "视觉帧: obs=%zu tracks=%zu lv=%zu mscfk=%d used=%d quality=%.2f | "
+      "退化 sev=%.2f dir=(%+.2f %+.2f %+.2f) | "
       "注入 λ=%.2e cap=%.2e scale=%.4f dxθ=%.4frad dxp=%.4fm σp=%.3fm σθ=%.4frad |v|=%.2fm/s | "
-      "耗时 ms: 前端=%.1f 约束=%.1f 更新=%.1f 彩色=%.1f 合计=%.1f",
+      "耗时 ms: 前端=%.1f 约束=%.1f 更新=%.1f 彩色=%.1f 合计=%.1f | "
+      "约束细分 ms: 拷贝地图=%.1f 投影建栅格=%.1f 法方程=%.1f 选轨=%.1f mscfk=%.1f | "
+      "轨迹池=%zu 观测=%zu 最长=%zu 配对=%zu | "
+      "地图点数=%zu | 守卫: 先验否决=%zu 速度限幅=%zu",
       obs.size(), constraint_tracks.size(), lv_residuals.size(), msckf_eq.used_features,
-      used_features, quality, vd.info_lambda, vd.cap_lambda, vd.scale, vd.dx_rot, vd.dx_pos,
+      used_features, quality, degen_sev, degen_u.x(), degen_u.y(), degen_u.z(),
+      vd.info_lambda, vd.cap_lambda, vd.scale, vd.dx_rot, vd.dx_pos,
       vd.sigma_pos,
       vd.sigma_rot, vd.vel_norm,
       ms(t_start, t_front), ms(t_front, t_vis), ms(t_vis, t_update),
-      ms(t_update, t_end), ms(t_start, t_end));
+      ms(t_update, t_end), ms(t_start, t_end),
+      ms(t_lv0, t_lv1), ms(t_lv1, t_lv2), ms(t_lv2, t_lv3), ms(t_ct0, t_mk0),
+      ms(t_mk0, t_mk1), tp.num_tracks, tp.total_obs, tp.max_obs, tp.pair_work,
+      map_points_.size(), stat_prior_veto_, stat_vel_clamp_);
 }
 
 void VisualBNode::runColorizer(const sensor_msgs::msg::PointCloud2& cloud_msg) {
@@ -784,6 +985,36 @@ void VisualBNode::drainPendingClouds() {
                            "彩色[丢弃] 等待图像超时: t_cloud=%.4f 最近差=%.4f 阈值=%.4f 已等 %.2fs",
                            it->t_cloud, best_dt, colorizer_options_.sync.max_offset, waited);
       it = pending_clouds_.erase(it);
+      continue;
+    }
+    ++it;
+  }
+}
+
+void VisualBNode::drainPendingVisualFrames() {
+  if (pending_visual_.empty()) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  // 本次调用内不会有新 odom 入队，最新位姿时刻取一次即可。
+  const double newest_pose_stamp = pose_cache_.empty() ? -1e18 : pose_cache_.back().stamp;
+  for (auto it = pending_visual_.begin(); it != pending_visual_.end();) {
+    const double t_pose = it->stamp + img_time_offset_;
+    if (newest_pose_stamp >= t_pose) {
+      // 先取出副本再 erase：processVisualFrame 可能改动容器，迭代器会失效。
+      const cv::Mat gray = it->gray;
+      const double stamp = it->stamp;
+      it = pending_visual_.erase(it);
+      processVisualFrame(gray, stamp);
+      continue;
+    }
+    const double waited = std::chrono::duration<double>(now - it->queued_at).count();
+    if (waited > kPendingVisualTimeoutSec) {
+      ++stat_drop_pose_;
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "视觉[丢弃] 等待位姿超时: stamp=%.4f t_pose=%.4f 已等 %.2fs",
+                           it->stamp, t_pose, waited);
+      it = pending_visual_.erase(it);
       continue;
     }
     ++it;
@@ -897,7 +1128,23 @@ void VisualBNode::buildLidarPrior(const Eigen::Matrix4d& T_wl,
   const double sr = std::max(1e-6, prior_rot_sigma_);
   const double sp = std::max(1e-6, prior_pos_sigma_);
   const Eigen::Matrix3d Hr = Eigen::Matrix3d::Identity() / (sr * sr);
-  const Eigen::Matrix3d Hp = Eigen::Matrix3d::Identity() / (sp * sp);
+  Eigen::Matrix3d Hp = Eigen::Matrix3d::Identity() / (sp * sp);
+
+  // 退化感知：沿退化方向把位置先验松开到 σ_degen，垂直方向收紧到 σ_healthy。
+  // 没有这一步，LiDAR 退化时"每帧把状态拉回漂移中的 lio/odom"会抵消视觉修正，
+  // 视觉最多把漂移速率减半（旧上限 50/50），无法真正接管。
+  double sev = 0.0;
+  Eigen::Vector3d u = Eigen::Vector3d::Zero();
+  (void)degeneracySignature(sev, u);
+  if (prior_directional_en_ && sev > 1e-6 && u.norm() > 1e-6) {
+    const Eigen::Vector3d un = u.normalized();
+    const Eigen::Matrix3d Pu = un * un.transpose();
+    const double kh = 1.0 / std::max(1e-12, prior_pos_sigma_healthy_ * prior_pos_sigma_healthy_);
+    const double kd = 1.0 / std::max(1e-12, prior_pos_sigma_degen_ * prior_pos_sigma_degen_);
+    const Eigen::Matrix3d Hp_dir =
+        kd * Pu + kh * (Eigen::Matrix3d::Identity() - Pu);
+    Hp = (1.0 - sev) * Hp + sev * Hp_dir;
+  }
 
   // 状态是 IMU 位姿：T_wi = T_wl · T_li（T_li 单位阵时 T_wi = T_wl）。
   const Eigen::Matrix4d T_wi_prior = T_wl * T_li_;
@@ -917,7 +1164,7 @@ void VisualBNode::buildLidarPrior(const Eigen::Matrix4d& T_wl,
 std::vector<FeatureTrack> VisualBNode::assembleTracks(
     const std::vector<PatchObservation>& obs, double stamp) const {
   // 本帧每条观测组装成"单观测轨迹"，跨帧合并交给 KeyframeManager::updateTracks。
-  const Eigen::Matrix4d T_wc = T_wl_ * T_lc_;
+  const Eigen::Matrix4d T_wc = T_wl_frame_ * T_lc_;
   std::vector<FeatureTrack> tracks;
   tracks.reserve(obs.size());
   for (const auto& o : obs) {

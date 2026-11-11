@@ -24,7 +24,10 @@
           0.999676, -0.0218025, 0.0131676]
     Pcl: [0.122993, 0.0398643, -0.0577101]
 
-    img_time_offset: 0.0
+    # 相机时间戳比 LiDAR/IMU 时钟晚 0.1 s：取位姿要按 stamp+0.1 查，
+    # 输出也打在这个时刻上。若为 0，整条轨迹会整体落后 LIO 0.1 s
+    # （ATE 扫描里 B 的最优 shift 会比 LIO 多 −0.1，属纯时基伪差）。
+    img_time_offset: 0.1
 
     patch.patch_size: 5
     patch.pyramid_levels: 4
@@ -70,9 +73,15 @@
     # 视觉注入：与仓库默认一致（已修好，可安全打开；收益判定见 yaml 注释）
     est.enable_visual: true
     est.visual_weight: 1.0
-    est.visual_info_ratio: 1.0
-    est.visual_rot_sigma_floor: 0.005
-    est.visual_pos_sigma_floor: 0.02
+    # 阶段2（放开信息上限）：原来 ratio=1.0 / pos_floor=0.02 让视觉最多只能
+    # 与 LiDAR 先验等权（cap = λmax(P⁻¹)），实际上视觉几乎改不动位姿。
+    # 这里放到 3 倍先验 + 5 mm 地板（退化时 10 倍 + 3 mm），仍保留绝对上限，
+    # 不会重演"一帧把协方差压到 1e-6"的塌缩。
+    est.visual_info_ratio: 3.0
+    est.visual_rot_sigma_floor: 0.002
+    est.visual_pos_sigma_floor: 0.005
+    est.visual_info_ratio_degen: 10.0
+    est.visual_pos_sigma_floor_degen: 0.003
     est.visual_pose_only: true
     est.estimate_extrinsics: false
     # 过程噪声要覆盖真实 IMU 噪声量级，否则协方差塌缩后（实测 σθ=0.0017 rad）

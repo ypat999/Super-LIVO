@@ -3,6 +3,7 @@
 #include <chrono>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -12,6 +13,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <builtin_interfaces/msg/time.hpp>
 
 #include <Eigen/Core>
@@ -83,6 +85,12 @@ class VisualBNode : public rclcpp::Node {
 
   /// 里程计回调：更新 T_wl，并累积位姿采样（彩色点云运动补偿）。
   void onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg);
+
+  /// 退化签名回调：布局 [cond6, axes, active, cond_t, evt_min, ux, uy, uz]
+  void onDegeneracy(const std_msgs::msg::Float64MultiArray::ConstSharedPtr& msg);
+
+  /// @return false 表示没有新鲜的 LIO 退化签名（此时按"不退化"处理）
+  bool degeneracySignature(double& severity, Eigen::Vector3d& dir_w) const;
 
   /// 点云回调：注入 LiDAR 地图点（世界系）供 2D-3D 约束 + 彩色点云。
   void onCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg);
@@ -188,6 +196,8 @@ class VisualBNode : public rclcpp::Node {
   Eigen::Matrix4d T_lc_{Eigen::Matrix4d::Identity()};  ///< Camera->LiDAR
   Eigen::Matrix4d T_li_{Eigen::Matrix4d::Identity()};  ///< LiDAR->IMU（用于 T_wl -> T_wi）
   Eigen::Matrix4d T_wl_{Eigen::Matrix4d::Identity()};  ///< 当前 LiDAR 位姿
+  /// 最新一条 lio/odom 自身的时刻：位姿回退到 T_wl_ 时，发布必须按这个时刻打戳。
+  double last_odom_stamp_{0.0};
   /// 图像真实采集时刻相对 header.stamp 的偏移（秒），只用于取相机位姿。
   /// 本数据集实测最优 0.1 s（与官方 avia.yaml 一致），见 A 的 offset 扫描结论。
   double img_time_offset_{0.0};
@@ -221,6 +231,32 @@ class VisualBNode : public rclcpp::Node {
   // ---- LiDAR 先验（D2）参数 ------------------------------------------------
   double prior_pos_sigma_{0.05};  ///< 位置先验标准差（米）
   double prior_rot_sigma_{0.02};  ///< 旋转先验标准差（弧度）
+  // ---- 退化感知的先验（关键改动）----------------------------------------
+  // 各向同性先验在退化场景会把状态强行拉回正在漂移的 LiDAR 位姿，
+  // 而且因为 σ 固定，视觉即使有能力也抢不过来。退化时把位置先验按方向拆开：
+  //   沿退化方向 -> σ_degen（松，允许视觉接管）
+  //   垂直退化方向 -> σ_healthy（紧，视觉不许改）
+  double prior_pos_sigma_healthy_{0.005};
+  double prior_pos_sigma_degen_{1.0};
+  bool prior_directional_en_{true};
+  // ---- 退化段守卫（Trust + 速度限幅）--------------------------------------
+  // 完全退化时（Super-LIO n_effect=0 → cond=1e12）LiDAR 先验在退化方向被放松，
+  // 速度只剩 IMU 积分，实测从 2.4 m/s 涨到 60 m/s。两道守卫都只在退化段生效。
+  //  ① Trust：上游 lio/odom 单帧大跳变时本帧不注入激光先验（同 Super-LIO 判据）；
+  //  ② 速度上限：|v| ≤ 健康段观测到的最大速度 × ratio（无健康样本时用 fallback）。
+  bool guard_enable_{true};
+  double guard_lio_jump_pos_{1.0};      ///< 单帧位置跳变阈值（m）
+  double guard_lio_jump_rot_{0.2618};    ///< 单帧姿态跳变阈值（rad，15°）
+  double guard_sev_threshold_{0.9};      ///< 触发速度守卫的退化严重度
+  double guard_vel_ratio_{1.5};          ///< 速度上限 = 健康段最大速度 × ratio
+  double guard_vel_fallback_{3.0};       ///< 无健康样本时的速度上限（m/s）
+  double guard_vel_abs_cap_{3.0};        ///< 物理绝对速度上限（m/s），防 vel_ref 被 spike 污染
+  double vel_ref_{0.0};                  ///< 健康段观测到的最大速度（m/s）
+  bool vel_ref_valid_{false};
+  Eigen::Matrix4d last_trust_T_wl_{Eigen::Matrix4d::Identity()};
+  double last_trust_stamp_{-1.0};
+  std::size_t stat_prior_veto_{0};       ///< Trust 否决激光先验的次数
+  std::size_t stat_vel_clamp_{0};        ///< 速度限幅触发次数
 
   /// IMU 样本缓存 {stamp, acc, gyro}，propagate 时取与图像最近的样本。
   struct ImuSample {
@@ -240,6 +276,23 @@ class VisualBNode : public rclcpp::Node {
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr body_cloud_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr degen_sub_;
+
+  // ---- LiDAR 退化签名（来自 Super-LIO 的观测 Hessian） ---------------------
+  // 判退化与给方向都由 Super-LIO（ros2 分支）已验证的检测负责，本节点只消费。
+  mutable std::mutex degen_mutex_;
+  std::string degen_topic_;
+  double degen_cond_t_{0.0};
+  int degen_axes_{0};
+  bool degen_active_{false};
+  Eigen::Vector3d degen_dir_w_{Eigen::Vector3d::Zero()};
+  double degen_recv_time_{-1.0};
+  bool degen_stale_warned_{false};
+  double gate_cond_lo_{10.0};
+  double gate_cond_hi_{100.0};
+  double degen_timeout_{1.0};
+  /// 本帧图像时刻的 LiDAR 位姿（插值得到），避免"打图像戳、用最新 odom"的滞后。
+  Eigen::Matrix4d T_wl_frame_{Eigen::Matrix4d::Identity()};
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr colored_cloud_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
@@ -282,6 +335,21 @@ class VisualBNode : public rclcpp::Node {
 
   /// 遍历等待图像的 dense 云：能配到图的转入 pending_color_，超时的丢弃。
   void drainPendingClouds();
+
+  // ---- 视觉帧调度 ----------------------------------------------------------
+  /// 待处理图像：/lio/odom 相对图像采集时刻约有 0.2 s 滞后（Super-LIO 单帧处理耗时
+  /// + 队列），图像回调时 t_pose 的位姿往往还没发布。若当场处理，只能退回"最新位姿"，
+  /// 视觉残差与 LiDAR 先验都用了 0.2 s 前的位姿（实测轨迹恒定滞后 0.2 s）。
+  /// 这里先排队，等位姿到齐再算。
+  struct PendingVisualFrame {
+    cv::Mat gray;
+    double stamp{0.0};  ///< 图像 header 时刻（相机钟），t_pose = stamp + img_time_offset_
+    std::chrono::steady_clock::time_point queued_at;
+  };
+  std::deque<PendingVisualFrame> pending_visual_;
+
+  /// 处理所有位姿已到齐的待定图像；超时的丢弃。
+  void drainPendingVisualFrames();
 
   /// 着色用哪条轨迹：false=/lio/odom（Super-LIO 原始），true=统一估计器修正后的 odom。
   bool color_use_own_odom_{false};

@@ -161,7 +161,13 @@ void UnifiedEstimator::visualUpdate(const VisualUpdateInput& input) {
   // 状态冻结在初值（实测自身 odom 全零、帧间位移中位 0.000）。
   VisualDiagnostics diag;
   diag.scale = 1.0;
-  if (options_.visual_info_ratio > 0.0) {
+  // 退化时按 severity 在"正常上限"与"退化上限"之间插值，让视觉真正接管。
+  const double sev = std::min(1.0, std::max(0.0, input.degen_severity));
+  const double info_ratio =
+      (1.0 - sev) * options_.visual_info_ratio + sev * options_.visual_info_ratio_degen;
+  const double pos_floor = (1.0 - sev) * options_.visual_pos_sigma_floor +
+                           sev * options_.visual_pos_sigma_floor_degen;
+  if (info_ratio > 0.0) {
     // 分块限幅：旋转块与平移块各自不超过
     //   min( κ·λmax(P⁻¹|该块), 1/σ_floor² )
     // 两个上限缺一不可：
@@ -180,13 +186,12 @@ void UnifiedEstimator::visualUpdate(const VisualUpdateInput& input) {
       lambda_pos = std::max(lambda_pos, p_inv(StateLayout::kPos + i, StateLayout::kPos + i));
     }
     const double cap_rot =
-        std::min(options_.visual_info_ratio * std::max(1e-12, lambda_rot),
+        std::min(info_ratio * std::max(1e-12, lambda_rot),
                  1.0 / std::max(1e-12, options_.visual_rot_sigma_floor *
                                            options_.visual_rot_sigma_floor));
     const double cap_pos =
-        std::min(options_.visual_info_ratio * std::max(1e-12, lambda_pos),
-                 1.0 / std::max(1e-12, options_.visual_pos_sigma_floor *
-                                           options_.visual_pos_sigma_floor));
+        std::min(info_ratio * std::max(1e-12, lambda_pos),
+                 1.0 / std::max(1e-12, pos_floor * pos_floor));
 
     double l_rot = 0.0;
     double l_pos = 0.0;
@@ -262,6 +267,19 @@ void UnifiedEstimator::injectError(const Eigen::VectorXd& dx) {
     s.T_il.block<3, 3>(0, 0) = so3Exp(rot_il) * s.T_il.block<3, 3>(0, 0);
     s.T_il.block<3, 1>(0, 3) += trans_il;
   }
+}
+
+double UnifiedEstimator::clampSpeed(double max_speed) {
+  if (!(max_speed > 0.0)) {
+    return -1.0;
+  }
+  Eigen::Vector3d& v = filter_.state.v;
+  const double vn = v.norm();
+  if (!std::isfinite(vn) || vn <= max_speed) {
+    return -1.0;
+  }
+  v *= max_speed / vn;
+  return max_speed;
 }
 
 const FilterState& UnifiedEstimator::filterState() const { return filter_; }

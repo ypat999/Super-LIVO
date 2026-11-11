@@ -23,6 +23,10 @@ struct VisualUpdateInput {
   double cost{0.0};
   double quality{0.0};  ///< 视觉质量评估（0~1）
   int used_features{0};
+  /// LiDAR 退化严重度（0~1）与世界系退化方向。退化时放宽视觉信息上限，
+  /// 让视觉真正接管 LiDAR 看不住的那个方向（先验侧由 buildLidarPrior 同步松开）。
+  double degen_severity{0.0};
+  Eigen::Vector3d degen_dir_w{Eigen::Vector3d::Zero()};
 };
 
 /// 统一状态估计器。
@@ -44,6 +48,10 @@ class UnifiedEstimator {
     double visual_info_ratio{1.0};
     double visual_rot_sigma_floor{0.005};  ///< 视觉隐含姿态精度下限（rad，≈0.3°）
     double visual_pos_sigma_floor{0.02};   ///< 视觉隐含位置精度下限（m）
+    // 退化时的上限：LiDAR 在退化方向已经不可信，此时不放开视觉权限就只能
+    // "50/50 混合"（漂移减半），无法真正接管。按 degen_severity 在两套参数间插值。
+    double visual_info_ratio_degen{5.0};
+    double visual_pos_sigma_floor_degen{0.01};
     // 视觉更新是否只允许修改 rot/pos（屏蔽速度/零偏的协方差耦合项）。
     // 必须为 true：视觉观测本质是"相对地图的位姿"，对速度没有独立信息，
     // dx 的速度分量全部来自 P 的耦合项；即便每帧限幅到 0.05 m/s，600 帧也能
@@ -88,6 +96,10 @@ class UnifiedEstimator {
   /// 用外部先验（如首帧 lio/odom 的 T_wl）初始化状态与协方差。
   /// 节点层在收到第一帧里程计后调用，避免滤波器从单位阵起步而长期"追不上"。
   void resetState(const State& state);
+
+  /// 速度守卫：把 |v| 限到 max_speed（退化段防纯 IMU 积分发散）。
+  /// 返回缩放后的速度模长；未触发（含 max_speed<=0、v 非有限）返回 -1。
+  double clampSpeed(double max_speed);
 
   /// 当前状态与协方差。
   const FilterState& filterState() const;
