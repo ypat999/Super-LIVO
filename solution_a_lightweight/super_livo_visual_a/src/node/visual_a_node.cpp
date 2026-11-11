@@ -88,6 +88,11 @@ VisualANode::VisualANode(const rclcpp::NodeOptions& options)
   body_cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       body_cloud_topic, rclcpp::SensorDataQoS(),
       std::bind(&VisualANode::onBodyCloud, this, std::placeholders::_1));
+  degen_topic_ = this->declare_parameter<std::string>("degen_topic", "lio/degeneracy");
+  degen_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
+      degen_topic_,
+      rclcpp::SensorDataQoS(),
+      std::bind(&VisualANode::onDegeneracy, this, std::placeholders::_1));
 
   // ---- 创建发布器 ---------------------------------------------------------
   colored_cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -214,6 +219,14 @@ void VisualANode::loadParameters() {
   gate_options_.high_degeneracy = this->declare_parameter<double>("gate.high_degeneracy", 0.7);
   gate_ = std::make_unique<DegeneracyGate>(gate_options_);
 
+  // 退化严重度映射：cond_t（H_tt 最大/最小特征值）在对数刻度上线性映射到 [0,1]。
+  // 本数据集实测：健康段 cond_t≈25-40，必须映射为 sev≈0，否则先验在健康段
+  // 就被无端松开（旧默认 10/100 使 cond_t=33 映射成 sev≈0.5）。
+  // 完全退化（n_effect=0，cond=1e12）由 axes/active 硬触发直接置 1，不走该映射。
+  gate_cond_lo_ = this->declare_parameter<double>("gate.cond_lo", 35.0);
+  gate_cond_hi_ = this->declare_parameter<double>("gate.cond_hi", 10000.0);
+  degen_timeout_ = this->declare_parameter<double>("gate.degen_timeout", 1.0);
+
   // ==========================================================================
   // 视觉更新 VisualUpdate
   // ==========================================================================
@@ -222,6 +235,20 @@ void VisualANode::loadParameters() {
   // LiDAR 先验信息量（贝叶斯正则），使门控权重 w 真正起作用。
   update_options_.prior_rot_sigma = this->declare_parameter<double>("update.prior_rot_sigma", 0.02);
   update_options_.prior_pos_sigma = this->declare_parameter<double>("update.prior_pos_sigma", 0.05);
+  // 退化时把位置先验做成各向异性：退化方向松开、垂直方向收紧。
+  update_options_.directional_prior_en =
+      this->declare_parameter<bool>("update.directional_prior_en", true);
+  update_options_.prior_pos_sigma_healthy =
+      this->declare_parameter<double>("update.prior_pos_sigma_healthy", 0.005);
+  update_options_.prior_pos_sigma_degen =
+      this->declare_parameter<double>("update.prior_pos_sigma_degen", 1.0);
+  // 持久偏移的衰减（健康方向 τ≈1/rate 秒）。视觉更新只在退化帧被接受，
+  // 因此偏移若只增不减，健康期就永远冻结在最后一次退化时累积的值。
+  offset_decay_en_ = this->declare_parameter<bool>("update.offset_decay_en", true);
+  offset_decay_rate_ = this->declare_parameter<double>("update.offset_decay_rate", 1.0);
+  // 状态回灌（取代"持久偏移"模式）：把每帧视觉 dx 直接写回修正轨迹采样，
+  // 之后 LIO 帧间增量挂接在修正轨迹上，约束跨帧累积且不会被原始轨迹抹掉。
+  reinject_ = this->declare_parameter<bool>("update.reinject", true);
   visual_update_ = std::make_unique<VisualUpdate>(update_options_);
 
   // ==========================================================================
@@ -320,15 +347,38 @@ void VisualANode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
   T_wl(1, 3) = pose.position.y;
   T_wl(2, 3) = pose.position.z;
   T_wl_ = T_wl;
+  last_odom_stamp_ = rclcpp::Time(msg->header.stamp).seconds();
 
   // 累积位姿采样供彩色点云运动补偿。
   colorizer::PoseSample sample;
-  sample.stamp = rclcpp::Time(msg->header.stamp).seconds();
+  sample.stamp = last_odom_stamp_;
   sample.T_wl = T_wl;
   pose_cache_.push_back(sample);
   if (pose_cache_.size() > max_pose_samples_) {
     pose_cache_.erase(pose_cache_.begin(),
                       pose_cache_.begin() + (pose_cache_.size() - max_pose_samples_));
+  }
+
+  // 状态回灌：把本条 LIO 的增量挂接到修正轨迹尾部。
+  // dw = T_lio(k) · T_lio(k-1)⁻¹（世界系左乘增量），own(k) = dw · own(k-1)。
+  // 视觉 dx 写回 own 尾采样后，下一条 LIO 增量自然继承修正。
+  if (reinject_) {
+    colorizer::PoseSample own;
+    own.stamp = last_odom_stamp_;
+    if (lio_prev_raw_valid_ && !own_pose_cache_.empty()) {
+      const Eigen::Matrix4d dw = T_wl * T_lio_prev_raw_.inverse();
+      own.T_wl = dw * own_pose_cache_.back().T_wl;
+    } else {
+      own.T_wl = T_wl;  // 首条：直接以原始 LIO 位姿作种子
+    }
+    T_lio_prev_raw_ = T_wl;
+    lio_prev_raw_valid_ = true;
+    own_pose_cache_.push_back(own);
+    if (own_pose_cache_.size() > max_pose_samples_) {
+      own_pose_cache_.erase(own_pose_cache_.begin(),
+                            own_pose_cache_.begin() +
+                                (own_pose_cache_.size() - max_pose_samples_));
+    }
   }
   // 注意：这里只更新位姿缓存，发布统一放在 processVisualFrame（图像帧），
   // 避免 path 里出现重复位姿、也保证发布的是视觉修正后的结果。
@@ -414,10 +464,36 @@ void VisualANode::processVisualFrame(const cv::Mat& gray, double stamp) {
   //    2.8 px、门控（阈值 3.0）整帧全拒的主要原因。
   const double t_capture = stamp + img_time_offset_;
   Eigen::Matrix4d T_wl_img = Eigen::Matrix4d::Identity();
-  if (!use_exposure_pose_ || !poseAtStamp(t_capture, T_wl_img)) {
-    T_wl_img = T_wl_;  // 关闭开关 / 启动初期缓存还不够，退回最新值
+  // 实际用到的位姿所对应的时刻：插值成功就是 t_capture，否则是"最新采样自身的时刻"。
+  // 发布时必须按这个时刻打戳，否则等于把旧位姿标成新时刻（隐含 0.1~0.2 s 的系统性
+  // 时间错位，直接抬高 ATE）。实测在该数据集上，A 的轨迹与 lio/odom 的最佳对齐滞后
+  // 恰为 img_time_offset_，就是这个回退路径造成的。
+  double pose_stamp = t_capture;
+  if (reinject_) {
+    // 回灌模式：基准位姿直接取修正轨迹在曝光时刻的插值，不叠加 pose_offset_。
+    if (!poseAtStampCorrected(t_capture, T_wl_img)) {
+      if (!own_pose_cache_.empty()) {
+        T_wl_img = own_pose_cache_.back().T_wl;
+        pose_stamp = own_pose_cache_.back().stamp;
+      } else {
+        T_wl_img = T_wl_;  // 启动初期尚无采样
+        if (last_odom_stamp_ > 0.0) {
+          pose_stamp = last_odom_stamp_;
+        }
+      }
+    }
+  } else if (!use_exposure_pose_ || !poseAtStamp(t_capture, T_wl_img)) {
+    T_wl_img = T_wl_;  // 关闭开关 / 启动初期缓存还不够 / 未来时刻无采样，退回最新值
+    if (last_odom_stamp_ > 0.0) {
+      pose_stamp = last_odom_stamp_;
+    }
   }
-  const Eigen::Matrix4d T_wc = T_wl_img * T_lc_;
+  // 2.1) 叠加此前视觉修正的持久偏移：T_wl_base = pose_offset_ · T_wl_lio。
+  //      没有这一步，每帧修正都会被下一条 lio/odom 覆盖，视觉永远只是"单帧探针"，
+  //      在 LiDAR 退化时完全无法把约束累积成位姿。
+  //      （回灌模式下修正已沉淀进 own_pose_cache_，不再维护持久偏移。）
+  const Eigen::Matrix4d T_wl_base = reinject_ ? T_wl_img : pose_offset_ * T_wl_img;
+  const Eigen::Matrix4d T_wc = T_wl_base * T_lc_;
 
   // 3) 深度关联：把局部地图与当前扫描喂给深度关联器
   depth_assoc_->setLocalMap(local_map_);
@@ -434,8 +510,20 @@ void VisualANode::processVisualFrame(const cv::Mat& gray, double stamp) {
   const auto t_reproj = std::chrono::steady_clock::now();
 
   // 5) 退化门控：同时评估 LiDAR 退化程度与视觉自身质量（gpt §2.3）
+  //    退化程度只用 Super-LIO 的观测 Hessian 签名（ros2 分支已有并验证过的检测，
+  //    A 侧不自建代理）。拿不到签名 => 视为不退化、不做方向性加权。
+  double degen_severity = 0.0;
+  Eigen::Vector3d degen_dir = Eigen::Vector3d::Zero();
+  if (!degeneracySignature(degen_severity, degen_dir) && !degen_stale_warned_) {
+    degen_stale_warned_ = true;
+    RCLCPP_WARN(this->get_logger(),
+                "未收到 %s 退化签名（超时 %.1fs）：请给 Super-LIO 开启 "
+                "lio.observe.degeneracy_detect_en 且 degen_trans_only=1，"
+                "否则退化门控恒不触发。",
+                degen_topic_.c_str(), degen_timeout_);
+  }
   GateInputs inputs;
-  inputs.lidar_degeneracy = lidarDegeneracyProxy();
+  inputs.lidar_degeneracy = degen_severity;
   inputs.tracked_features = static_cast<int>(track.tracked.size());
 
   // 5.1 特征空间散布度：像素坐标标准差按图像尺寸归一化（0~0.5 量级）。
@@ -525,23 +613,59 @@ void VisualANode::processVisualFrame(const cv::Mat& gray, double stamp) {
                     : 0.0;
   update_input.quality =
       std::clamp(0.5 * inlier_ratio + 0.5 / (1.0 + inputs.reprojection_rmse), 0.0, 1.0);
+  update_input.degen_dir_w = degen_dir;
+  update_input.degen_severity = degen_severity;
   const VisualUpdateOutput output = visual_update_->apply(update_input, decision);
   const auto t_update = std::chrono::steady_clock::now();
 
-  // 7) 若接受：位姿左扰动修正 T_wc，并回写 T_wl = T_wc' · T_cl
+  // 7) 若接受：位姿左扰动修正 T_wc，并把修正沉淀成持久偏移。
+  //    持久偏移让视觉在 LiDAR 退化时可以持续累积约束，而不是每帧被 lio/odom 抹掉。
+  Eigen::Matrix4d T_wl_out = T_wl_base;
   if (output.accepted) {
     const Eigen::Matrix4d T_wc_corrected = applyLeftPerturbation(T_wc, output.dx);
-    T_wl_ = T_wc_corrected * T_lc_.inverse();
+    T_wl_out = T_wc_corrected * T_lc_.inverse();
+    if (reinject_) {
+      // 回灌核心：把当帧 dx 写回修正轨迹尾部采样。之后 onOdom 的 LIO 增量
+      // 挂接在这个被修正过的位姿上，视觉约束跨帧累积、不被 lio/odom 抹掉。
+      if (!own_pose_cache_.empty() &&
+          std::abs(own_pose_cache_.back().stamp - pose_stamp) <= 0.15) {
+        own_pose_cache_.back().T_wl = T_wl_out;
+      }
+    } else {
+      const Eigen::Matrix4d T_lio_inv = T_wl_img.inverse();
+      pose_offset_ = T_wl_out * T_lio_inv;
+    }
+  }
+  // 7.1) 持久偏移的泄漏（见 decayPoseOffset）：即使本帧视觉没有被接受
+  //      （LiDAR 健康 -> weight=0 -> apply 直接返回），也要按退化程度与方向
+  //      对偏移做衰减，否则健康期偏移被永久冻结，视觉噪声被当成系统偏差带着走。
+  {
+    const double dt =
+        last_visual_stamp_ < 0.0 ? 0.0 : std::clamp(stamp - last_visual_stamp_, 0.0, 0.5);
+    last_visual_stamp_ = stamp;
+    // 回灌模式下不维护持久偏移、也不衰减：修正已沉淀进 own_pose_cache_，
+    // 再对单个采样"回拉"等于把历史帧改回 LIO 轨迹，破坏连续性。
+    if (!reinject_) {
+      decayPoseOffset(dt, degen_severity, degen_dir);
+    }
+  }
+  if (!reinject_) {
+    T_wl_ = T_wl_out;  // 回灌模式 T_wl_ 保持最新原始 lio/odom，供 onOdom 挂链接量
   }
 
-  // 8) 发布修正后里程计与轨迹
-  publishOdomAndPath(T_wl_, toRosStamp(stamp));
+  // 8) 发布修正后里程计与轨迹。时间基准：T_wl_out 对应 **实际取用的位姿时刻**
+  //    pose_stamp（插值成功即曝光时刻 t_capture；回退到最新采样时就是该采样的时刻），
+  //    必须按它打戳，不能用图像 header.stamp 也不能无条件用 t_capture。
+  publishOdomAndPath(T_wl_out, toRosStamp(pose_stamp));
   const auto t_pub = std::chrono::steady_clock::now();
 
-  // 8.5) 缓存本帧修正位姿（按图像 header 时刻），供 color.use_own_odom=true 时着色插值。
-  {
+  // 8.5) 缓存本帧修正位姿（按 pose_stamp），供 color.use_own_odom=true 时着色插值。
+  //      必须与查询时刻同一基准：poseAtStamp 是按 t_img = header.stamp + img_time_offset_
+  //      查的，若这里按别的时刻存，取到的就是错位的位姿。
+  //      回灌模式下 own_pose_cache_ 已由 onOdom 逐条 odom 维护，此处不再重复写入。
+  if (!reinject_) {
     colorizer::PoseSample own;
-    own.stamp = stamp;
+    own.stamp = pose_stamp;
     own.T_wl = T_wl_;
     own_pose_cache_.push_back(own);
     if (own_pose_cache_.size() > max_pose_samples_) {
@@ -564,14 +688,36 @@ void VisualANode::processVisualFrame(const cv::Mat& gray, double stamp) {
   // 10) 诊断日志（1 Hz 节流，便于跑 bag 时确认各模块在工作与耗时分布）
   RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 1000,
-      "视觉帧: tracked=%zu/%d spread=%.3f rmse=%.2f bias=%.2f cond=%.1f deg=%.2f mode=%d w=%.2f %s | "
+      "视觉帧: tracked=%zu/%d n=%d spread=%.3f rmse=%.2f bias=%.2f cond=%.1f deg=%.2f mode=%d w=%.2f %s | "
       "耗时 ms: 前端=%.1f 深度=%.1f 重投影=%.1f 门控=%.1f 更新=%.1f 发布=%.1f 彩色=%.1f "
       "合计=%.1f",
-      track.tracked.size(), track.detected, inputs.spatial_spread,
+      track.tracked.size(), track.detected, valid_blocks, inputs.spatial_spread,
       inputs.reprojection_rmse, bias_px, inputs.jacobian_condition, inputs.lidar_degeneracy,
       static_cast<int>(decision.mode), decision.visual_weight, decision.reason.c_str(),
       ms(t_start, t_front), ms(t_front, t_depth), ms(t_depth, t_reproj), ms(t_reproj, t_gate),
       ms(t_gate, t_update), ms(t_update, t_pub), ms(t_pub, t_end), ms(t_start, t_end));
+
+  // 10.1) 退化/回灌状态（1 Hz）：确认门控是否真的打开、视觉修正是否在累积。
+  //       沿 u 分量是关键：只有在退化法向上的修正才真正补上了 LiDAR 缺失的自由度。
+  const double dir_norm = degen_dir.norm();
+  const Eigen::Vector3d u_w =
+      dir_norm > 1e-6 ? Eigen::Vector3d(degen_dir / dir_norm) : Eigen::Vector3d::Zero();
+  const double corr_along_u = output.accepted ? 1e3 * output.dx.tail<3>().dot(u_w) : 0.0;
+  // 诊断"累积偏移"：持久偏移模式直接读 pose_offset_；
+  // 回灌模式 = 修正轨迹最新采样相对原始 LIO 最新采样的差。
+  Eigen::Matrix4d off_disp = pose_offset_;
+  if (reinject_ && !own_pose_cache_.empty() && !pose_cache_.empty()) {
+    off_disp = own_pose_cache_.back().T_wl * pose_cache_.back().T_wl.inverse();
+  }
+  const double off_along_u = 1e3 * off_disp.block<3, 1>(0, 3).dot(u_w);
+  RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "退化状态: sev=%.2f dir=(%+.2f %+.2f %+.2f) 修正=%.1fmm(沿u%+.1f) | "
+      "持久偏移=%.1fmm(沿u%+.1f) %.2f°",
+      degen_severity, degen_dir.x(), degen_dir.y(), degen_dir.z(),
+      output.accepted ? 1e3 * output.dx.tail<3>().norm() : 0.0, corr_along_u,
+      1e3 * off_disp.block<3, 1>(0, 3).norm(), off_along_u,
+      off_disp.block<3, 3>(0, 0).eulerAngles(0, 1, 2).norm() * 180.0 / M_PI);
 }
 
 void VisualANode::runColorizer(const sensor_msgs::msg::PointCloud2& cloud_msg) {
@@ -788,6 +934,23 @@ bool VisualANode::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
   colorizer::LidarPoseInterpolator interpolator(
       colorizer::LidarPoseInterpolator::Options{kPoseHistoryMaxGapSec});
   for (const auto& sample : cache) {
+    interpolator.addSample(sample);
+  }
+  return interpolator.poseAt(stamp, T_wl);
+}
+
+bool VisualANode::poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl) const {
+  // 与 poseAtStamp 同一套插值规则，但只查修正轨迹缓存 own_pose_cache_（状态回灌模式）。
+  double newest = -std::numeric_limits<double>::max();
+  for (const auto& sample : own_pose_cache_) {
+    newest = std::max(newest, sample.stamp);
+  }
+  if (own_pose_cache_.empty() || stamp > newest) {
+    return false;
+  }
+  colorizer::LidarPoseInterpolator interpolator(
+      colorizer::LidarPoseInterpolator::Options{kPoseHistoryMaxGapSec});
+  for (const auto& sample : own_pose_cache_) {
     interpolator.addSample(sample);
   }
   return interpolator.poseAt(stamp, T_wl);
@@ -1034,40 +1197,112 @@ Eigen::Matrix4d VisualANode::applyLeftPerturbation(const Eigen::Matrix4d& T,
   return T2;
 }
 
-double VisualANode::lidarDegeneracyProxy() const {
-  // 用当前扫描点的空间协方差近似退化程度：
-  //   各向同性（ratio≈1）-> 0（正常）；近乎单一平面/线（ratio≈0）-> 0.4（轻度）。
-  // 说明：这是保守代理，不追求与 Super-LIO 内部 Hessian 退化检测一致；
-  //   目的是"正常场景不误触发视觉更新"，真正退化时仍能给出非零提示。
-  if (sweep_.size() < 50) {
-    return 0.0;
+void VisualANode::decayPoseOffset(double dt, double severity,
+                                  const Eigen::Vector3d& dir_w) {
+  // ---------------------------------------------------------------------------
+  // 为什么需要它：门控在 LiDAR 健康时给出 visual_weight=0，VisualUpdate::apply
+  // 会直接返回，于是 pose_offset_ 在健康期**完全冻结**。而偏移本身是
+  //   pose_offset_ ← Exp(dx) · pose_offset_
+  // 的累乘，只增不减：退化期每帧 1~10 mm 的视觉修正会被无差别积分下去，
+  // 退化结束后仍把这段"视觉说了算的偏差"一直带着（eee_03 实测末段 243 mm，
+  // 其中沿退化法向 164 mm；同期纯 lio/odom 的 ATE 只有 133 mm）。
+  //
+  // 这里把它改成带泄漏的累积器，衰减率只用 Super-LIO 已验证的退化签名来定：
+  //   * 旋转：trans_only 检测不给旋转方向，各向同性按 α_perp 衰减；
+  //   * 平移垂直 u：LiDAR 一直看得住，按 α_perp 衰减；
+  //   * 平移沿 u：α_perp·(1-sev)，完全退化（sev=1）时不衰减，允许视觉累积。
+  // 于是"健康时回落到 LIO、只在看不住的方向长期保留视觉约束"同时成立。
+  // ---------------------------------------------------------------------------
+  if (!offset_decay_en_ || offset_decay_rate_ <= 0.0 || dt <= 0.0) {
+    return;
   }
-  Eigen::Vector3d mean = Eigen::Vector3d::Zero();
-  for (const auto& p : sweep_) {
-    mean += p;
+  const double sev = std::clamp(severity, 0.0, 1.0);
+  const double alpha_perp = offset_decay_rate_;
+  double alpha_par = alpha_perp;
+  Eigen::Vector3d u = Eigen::Vector3d::Zero();
+  if (dir_w.norm() > 1e-6) {
+    u = dir_w.normalized();
+    alpha_par = alpha_perp * (1.0 - sev);
   }
-  mean /= static_cast<double>(sweep_.size());
 
-  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-  for (const auto& p : sweep_) {
-    const Eigen::Vector3d d = p - mean;
-    cov += d * d.transpose();
-  }
-  cov /= static_cast<double>(sweep_.size());
+  const Eigen::Matrix3d R_off = pose_offset_.block<3, 3>(0, 0);
+  const Eigen::AngleAxisd aa(R_off);
+  const double ang = aa.angle();
+  const Eigen::Vector3d phi =
+      ang > 1e-9 ? Eigen::Vector3d(ang * aa.axis()) : Eigen::Vector3d::Zero();
+  Eigen::Vector3d rho = pose_offset_.block<3, 1>(0, 3);
 
-  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(cov);
-  if (solver.info() != Eigen::Success) {
-    return 0.0;
+  const double f_perp = std::exp(-alpha_perp * dt);
+  // 退化方向在上一步已经被归一化过（非单位则视为无方向）：
+  // 平移：沿 u 用 f_par，垂直 u 用 f_perp。
+  if (u.isZero(1e-9)) {
+    rho *= f_perp;
+  } else {
+    const double r_par = rho.dot(u);
+    rho = std::exp(-alpha_par * dt) * r_par * u + f_perp * (rho - r_par * u);
   }
-  const double lmax = std::max(1e-9, solver.eigenvalues()(2));
-  const double lmin = std::max(1e-12, solver.eigenvalues()(0));
-  const double ratio = lmin / lmax;  // [0,1]
 
-  // ratio < 0.01 才认为"接近退化"，并最多给到 0.4（落在 assist 区间）。
-  if (ratio >= 0.01) {
-    return 0.0;
+  pose_offset_.setIdentity();
+  pose_offset_.block<3, 3>(0, 0) = so3Exp(f_perp * phi);
+  pose_offset_.block<3, 1>(0, 3) = rho;
+}
+
+void VisualANode::onDegeneracy(
+    const std_msgs::msg::Float64MultiArray::ConstSharedPtr& msg) {
+  // 布局：[cond6, axes, active, cond_t, evt_min, ux, uy, uz]
+  if (msg->data.size() < 8) {
+    return;
   }
-  return 0.4 * (1.0 - ratio / 0.01);
+  std::lock_guard<std::mutex> lock(degen_mutex_);
+  degen_cond6_ = msg->data[0];
+  degen_axes_ = static_cast<int>(msg->data[1]);
+  degen_active_ = msg->data[2] > 0.5;
+  degen_cond_t_ = msg->data[3];
+  const Eigen::Vector3d u(msg->data[5], msg->data[6], msg->data[7]);
+  if (u.norm() > 1e-6) {
+    degen_dir_w_ = u.normalized();
+  } else {
+    degen_dir_w_.setZero();  // 无方向（非 trans_only 模式）时不能沿用上一帧
+  }
+  degen_recv_time_ = this->now().seconds();
+  if (!degen_seen_) {
+    degen_seen_ = true;
+    RCLCPP_INFO(this->get_logger(),
+                "收到退化签名: cond6=%.2f cond_t=%.2f axes=%d active=%d u=(%+.2f %+.2f %+.2f)",
+                degen_cond6_, degen_cond_t_, degen_axes_, degen_active_ ? 1 : 0,
+                degen_dir_w_.x(), degen_dir_w_.y(), degen_dir_w_.z());
+  }
+}
+
+bool VisualANode::degeneracySignature(double& severity,
+                                      Eigen::Vector3d& dir_w) const {
+  severity = 0.0;
+  dir_w.setZero();
+  std::lock_guard<std::mutex> lock(degen_mutex_);
+  if (degen_recv_time_ < 0.0 ||
+      this->now().seconds() - degen_recv_time_ > degen_timeout_) {
+    return false;  // 没有签名可用 -> 调用方按"不退化"处理
+  }
+  // cond=0 说明 Super-LIO 侧根本没跑检测（detect_en 关闭），或非 trans_only 模式
+  // （此时不产出平移块判据/方向）。两种情况都不能当"健康"用，否则退化门控静默失效。
+  if (degen_cond6_ <= 0.0 || degen_cond_t_ <= 0.0) {
+    return false;
+  }
+  dir_w = degen_dir_w_;
+  // axes/active 是 Super-LIO 自己的硬判据（跨过它的退化阈值才算），一旦触发就满权。
+  // 没触发时**不能**直接当成"健康"短路——否则门控只会在硬阈值那一刻从 0 跳到 1，
+  // 阈值敏感性实验与渐进接管都做不了。这里用 cond_t 连续映射。
+  if (degen_axes_ > 0 || degen_active_) {
+    severity = 1.0;
+    return true;
+  }
+  // cond_t 在对数刻度上映射 severity：lo 以下健康，hi 以上完全退化。
+  const double lo = std::max(1e-6, gate_cond_lo_);
+  const double hi = std::max(lo * 1.001, gate_cond_hi_);
+  const double c = std::max(lo, degen_cond_t_);
+  severity = std::log(c / lo) / std::log(hi / lo);
+  severity = std::min(1.0, std::max(0.0, severity));
+  return true;
 }
 
 }  // namespace superlivo_a

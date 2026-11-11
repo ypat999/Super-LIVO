@@ -3,6 +3,7 @@
 #include <chrono>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -11,6 +12,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <builtin_interfaces/msg/time.hpp>
 
 #include <Eigen/Core>
@@ -75,6 +77,10 @@ class VisualANode : public rclcpp::Node {
   /// 里程计回调：更新当前 T_wl，并累积位姿采样（供彩色点云运动补偿）。
   void onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg);
 
+  /// 退化签名回调：Super-LIO 每帧观测 Hessian 的退化条件数与最弱方向（世界系）。
+  /// 布局：[cond6, axes, active, cond_t, evt_min, ux, uy, uz]
+  void onDegeneracy(const std_msgs::msg::Float64MultiArray::ConstSharedPtr& msg);
+
   /// 点云回调：累积局部地图点（世界系），并保留当前扫描（供深度关联）。
   void onCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg);
 
@@ -122,6 +128,10 @@ class VisualANode : public rclcpp::Node {
   /// @return 缓存不足 / 相邻采样间隔超限 / 未来时刻无采样时返回 false
   bool poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const;
 
+  /// 同 poseAtStamp 的插值规则，但只查修正轨迹缓存 own_pose_cache_
+  /// （状态回灌 update.reinject=true 时用作视觉基准位姿）。
+  bool poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl) const;
+
   // ---- 辅助 ----------------------------------------------------------------
   /// 图像去畸变（保持输入分辨率）。
   /// 说明：bag 内的 /left_camera/image 已经是 640x512（录制时已按 scale=0.5 缩放），
@@ -140,10 +150,11 @@ class VisualANode : public rclcpp::Node {
   Eigen::Matrix4d applyLeftPerturbation(const Eigen::Matrix4d& T,
                                         const Eigen::VectorXd& dx) const;
 
-  /// 计算 LiDAR 退化代理指标（0 正常 ~ 1 严重退化）。
-  /// Super-LIO 的观测 Hessian 不对外发布，这里用当前扫描点的空间协方差近似：
-  ///   λmin/λmax 越小说明点云在某方向越"薄"（走廊/平面场景），退化程度越高。
-  double lidarDegeneracyProxy() const;
+  /// 当前退化方向（世界系单位向量）与严重度，供按方向分配视觉权限。
+  /// 数据源是 Super-LIO（ros2 分支）已验证的退化检测：degen_trans_only=1 模式下
+  /// 对观测 Hessian 平移块做特征分解，最弱特征向量即退化法向。
+  /// @return false 表示没有可用的 LIO 退化签名（超时/未开启检测）
+  bool degeneracySignature(double& severity, Eigen::Vector3d& dir_w) const;
 
   /// 把 ColoredPoint 结果打包成 sensor_msgs::PointCloud2（字段 x/y/z/rgb）并发布。
   void publishColoredCloud(const std::vector<colorizer::ColoredPoint>& points,
@@ -160,6 +171,14 @@ class VisualANode : public rclcpp::Node {
   /// 发布修正后的里程计与轨迹。
   void publishOdomAndPath(const Eigen::Matrix4d& T_wl,
                           const builtin_interfaces::msg::Time& stamp);
+
+  /// 持久偏移的"泄漏"：把 pose_offset_ 按时间做各向异性衰减（见 .cpp 说明）。
+  /// 与退化程度和方向绑定：LiDAR 看得住的方向（垂直 u、以及健康时的所有方向）
+  /// 衰减到 0，只有"沿退化法向且确实退化"时几乎不衰减（允许累积视觉约束）。
+  /// @param dt        距上次视觉帧的时间（秒）
+  /// @param severity  Super-LIO 给出的退化严重度 0~1
+  /// @param dir_w     退化法向（世界系，可为零向量表示无方向信息）
+  void decayPoseOffset(double dt, double severity, const Eigen::Vector3d& dir_w);
 
   // ---- 参数 ----------------------------------------------------------------
   /// 从参数服务器读取全部配置并初始化各算法模块。
@@ -227,6 +246,40 @@ class VisualANode : public rclcpp::Node {
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr body_cloud_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr degen_sub_;
+
+  // ---- LiDAR 退化签名（来自 Super-LIO 的观测 Hessian） ----------------------
+  // Super-LIO（ros2 分支）已有并验证过的退化检测负责"判退化 + 给方向"，
+  // 本节点只消费 lio/degeneracy，不自建代理指标。
+  mutable std::mutex degen_mutex_;
+  std::string degen_topic_;        ///< 订阅的退化签名话题
+  double degen_cond6_{0.0};
+  int degen_axes_{0};
+  bool degen_active_{false};
+  double degen_cond_t_{0.0};
+  Eigen::Vector3d degen_dir_w_{Eigen::Vector3d::Zero()};
+  double degen_recv_time_{-1.0};   ///< 本地接收时刻（秒），用于判超时
+  bool degen_stale_warned_{false}; ///< 缺签名只告警一次
+  bool degen_seen_{false};         ///< 首帧签名打印一次，便于确认链路
+  double gate_cond_lo_{10.0};      ///< cond_t 低于它视为健康（severity=0）
+  double gate_cond_hi_{100.0};     ///< cond_t 高于它视为完全退化（severity=1）
+  double degen_timeout_{1.0};      ///< 超过这么久没新签名则视为不可用
+
+  /// 视觉修正的持久偏移：T_wl_out = pose_offset_ · T_wl_lio。
+  /// 没有它，每帧修正都会被下一条 lio/odom 覆盖，视觉永远只是"单帧探针"。
+  /// 注意它是**带泄漏**的累积器：只在 LiDAR 看不住的方向上长期存在，
+  /// 否则会逐帧把视觉噪声积分成随机游走（见 decayPoseOffset）。
+  Eigen::Matrix4d pose_offset_{Eigen::Matrix4d::Identity()};
+  bool offset_decay_en_{true};      ///< 是否启用持久偏移的衰减
+  /// 状态回灌：视觉 dx 写回 own_pose_cache_ 尾部采样，LIO 帧间增量挂接在修正轨迹上，
+  /// 替代"持久偏移 pose_offset_ 左乘原始轨迹"的模式。
+  bool reinject_{false};
+  Eigen::Matrix4d T_lio_prev_raw_{
+      Eigen::Matrix4d::Identity()};  ///< 上一条原始 lio/odom（增量挂链用）
+  bool lio_prev_raw_valid_{false};
+  double offset_decay_rate_{1.0};   ///< 健康方向/旋转的衰减率（1/s，τ≈1 s）
+  double last_visual_stamp_{-1.0};  ///< 上次视觉帧时刻（算衰减 dt 用）
+  double last_odom_stamp_{-1.0};    ///< 最新一条 lio/odom 的时刻（回退取位姿时用于打戳）
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr colored_cloud_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;

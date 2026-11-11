@@ -36,6 +36,12 @@ public:
   size_t size()    const { return map_.size(); }
   void   clear()         { map_.clear(); }
 
+  /// 条目上限（防止长时间运行内存无界增长）。
+  /// 每个条目 = 12 B 键 + 20 B 观测 + 哈希开销 ≈ 60 B；3e6 条约 200 MB。
+  /// 达到上限后只更新已存在的体素，不再接纳新体素（颜色覆盖范围冻结，内存恒定）。
+  void set_max_entries(std::size_t n) { max_entries_ = n; }
+  std::size_t max_entries() const { return max_entries_; }
+
   /// 记录一帧观测：pos 世界系坐标，rgb 分量范围 [0,255]。
   /// quality <= 0 时由调用方自行过滤，此处不再检查。
   void insert(const Eigen::Vector3f& pos, const Eigen::Vector3f& rgb) {
@@ -45,7 +51,12 @@ public:
       static_cast<int32_t>(std::floor(pos.y() * inv_)),
       static_cast<int32_t>(std::floor(pos.z() * inv_))
     };
-    auto& e = map_[key];
+    auto it = map_.find(key);
+    if (it == map_.end()) {
+      if (map_.size() >= max_entries_) return;  // 硬上限：不再增长
+      it = map_.emplace(key, Entry{}).first;
+    }
+    auto& e = it->second;
     auto& r = e.rgbs[e.next];
     r[0] = clamp_u8(rgb.x());
     r[1] = clamp_u8(rgb.y());
@@ -115,6 +126,8 @@ private:
   float vs_      = 0.0f;
   float inv_     = 0.0f;
   bool  enabled_ = false;
+
+  std::size_t max_entries_ = 3000000;  // 硬上限，见 set_max_entries()
 
   std::unordered_map<Key, Entry, KeyHash> map_;
 };

@@ -24,6 +24,11 @@ struct VisualUpdateInput {
   Eigen::VectorXd b;        ///< 视觉约束信息向量
   double quality{0.0};      ///< 视觉质量评估（0~1，由门控/残差/条件数综合）
   double cost{0.0};         ///< 累加的鲁棒代价（来自 ReprojectionConstraint::accumulate）
+  /// LiDAR 退化到的世界系方向（单位向量）与严重度 0~1。
+  /// dx 的平移块就是世界系左扰动（ReprojectionConstraint 里 ∂P_C/∂ρ = -R_cw），
+  /// 与 Super-LIO 发布的 H_tt 最弱特征向量同一坐标系，可直接对齐，无需变基。
+  Eigen::Vector3d degen_dir_w{Eigen::Vector3d::Zero()};
+  double degen_severity{0.0};
 };
 
 /// 视觉更新输出：状态增量交由宿主 ESIKF 注入，本模块不直接修改状态。
@@ -49,6 +54,14 @@ class VisualUpdate {
     // 这样 w 才真正在"信 LiDAR"与"信视觉"之间插值。
     double prior_rot_sigma{0.02};  ///< LiDAR 姿态先验标准差（rad）
     double prior_pos_sigma{0.05};  ///< LiDAR 位置先验标准差（m）
+    // ---- 按方向的先验（退化场景专用）--------------------------------------
+    // 各向同性先验在退化场景有两个毛病：退化方向上它太强（视觉抢不过漂移的 LiDAR），
+    // 健康方向上它又太弱（视觉会把走廊两侧本来很好的约束也一起改掉）。
+    // 因此退化时把位置先验做成各向异性：沿退化方向松开到 σ_degen，
+    // 垂直方向收紧到 σ_healthy，让视觉"只在看不住的那个方向说话"。
+    bool directional_prior_en{true};
+    double prior_pos_sigma_healthy{0.005};  ///< 非退化方向的位置先验标准差（m）
+    double prior_pos_sigma_degen{1.0};      ///< 退化方向的位置先验标准差（m）
   };
 
   explicit VisualUpdate(const Options& options);
