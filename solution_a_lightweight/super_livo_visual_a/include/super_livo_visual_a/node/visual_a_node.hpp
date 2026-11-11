@@ -28,6 +28,7 @@
 #include "super_livo_visual_a/update/visual_update.hpp"
 #include "pointcloud_colorizer/colorizer_pipeline.hpp"
 #include "pointcloud_colorizer/voxel_color_median.hpp"
+#include "super_livo_common/degeneracy_signature.hpp"
 namespace superlivo_a {
 
 // ============================================================================
@@ -253,17 +254,13 @@ class VisualANode : public rclcpp::Node {
   // 本节点只消费 lio/degeneracy，不自建代理指标。
   mutable std::mutex degen_mutex_;
   std::string degen_topic_;        ///< 订阅的退化签名话题
-  double degen_cond6_{0.0};
-  int degen_axes_{0};
-  bool degen_active_{false};
-  double degen_cond_t_{0.0};
-  Eigen::Vector3d degen_dir_w_{Eigen::Vector3d::Zero()};
+  superlivo_common::DegeneracySignature degen_sig_;  ///< 最新签名（解析/映射见 common）
   double degen_recv_time_{-1.0};   ///< 本地接收时刻（秒），用于判超时
   bool degen_stale_warned_{false}; ///< 缺签名只告警一次
   bool degen_seen_{false};         ///< 首帧签名打印一次，便于确认链路
-  double gate_cond_lo_{10.0};      ///< cond_t 低于它视为健康（severity=0）
-  double gate_cond_hi_{100.0};     ///< cond_t 高于它视为完全退化（severity=1）
-  double degen_timeout_{1.0};      ///< 超过这么久没新签名则视为不可用
+  double gate_cond_lo_{superlivo_common::DegeneracyScale{}.cond_lo};
+  double gate_cond_hi_{superlivo_common::DegeneracyScale{}.cond_hi};
+  double degen_timeout_{superlivo_common::DegeneracyScale{}.timeout_sec};
 
   /// 视觉修正的持久偏移：T_wl_out = pose_offset_ · T_wl_lio。
   /// 没有它，每帧修正都会被下一条 lio/odom 覆盖，视觉永远只是"单帧探针"。

@@ -7,6 +7,8 @@
 // Matrix4d::inverse() 需要 LU 模块的 Inverse 求值特化，否则运行期无限递归。
 #include <Eigen/LU>
 
+#include "super_livo_common/measurement_noise.hpp"
+
 namespace superlivo_b {
 
 namespace {
@@ -199,14 +201,13 @@ std::vector<VisualResidual> LidarVisualConstraint::build(
     // 一帧就把位置协方差压塌，之后 LiDAR 先验再也拉不动（实测状态冻结在初值）。
     // 现在按"像素噪声 ⊕ 锚点三维不确定度投影"给出量级正确的 R。
     const double f_mean = 0.5 * (options_.fx + options_.fy);
-    const double anchor_pix = f_mean * options_.sigma_anchor * inv_z;
-    double variance = options_.sigma_pix * options_.sigma_pix + anchor_pix * anchor_pix;
+    double variance = superlivo_common::reprojectionVariance(
+        options_.sigma_pix, f_mean, options_.sigma_anchor, inv_z);
     if (anchor_from_grid || anchored) {
       // 栅格内最近点关联：锚点可能取到同一栅格里的另一个物理点，
       // 横向偏差最多 pixel_radius 个像素，按均匀分布折算标准差。
       // 持久锚点同样保留这份建立时刻的关联不确定度。
-      const double assoc = static_cast<double>(options_.pixel_radius) / std::sqrt(3.0);
-      variance += assoc * assoc;
+      variance += superlivo_common::associationVariance(options_.pixel_radius);
     }
 
     const Eigen::Vector2d residual(last.pixel.x() - u_pred, last.pixel.y() - v_pred);

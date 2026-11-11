@@ -52,7 +52,11 @@ solution_b_tight_coupled/
 └── README.md
 ```
 
-彩色点云模块**直接复用** [`../solution_a_lightweight/pointcloud_colorizer`](../solution_a_lightweight/pointcloud_colorizer)，不做重复实现：它与定位主干解耦，两套方案共用同一份代码。
+彩色点云模块**直接复用**独立包 [`../pointcloud_colorizer`](../pointcloud_colorizer/README.md)，不做重复实现：它与定位主干解耦，两套方案共用同一份代码。
+
+A/B 共用的纯算法（退化签名映射、各向异性先验、重投影方差模型）在
+[`../common/super_livo_common`](../common/super_livo_common/README.md)；
+改这些口径时**只需改一处**，两端同步生效。
 
 ## 4. 视觉约束的两类来源
 

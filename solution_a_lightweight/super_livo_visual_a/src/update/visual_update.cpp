@@ -5,6 +5,8 @@
 
 #include <Eigen/Cholesky>
 
+#include "super_livo_common/anisotropic_prior.hpp"
+
 namespace superlivo_a {
 
 VisualUpdate::VisualUpdate(const Options& options) : options_(options) {}
@@ -52,19 +54,11 @@ VisualUpdateOutput VisualUpdate::apply(const VisualUpdateInput& input,
 
     // 位置先验：健康场景各向同性；退化时沿退化方向松开、垂直方向收紧。
     Eigen::Matrix3d info_pos = Eigen::Matrix3d::Identity() * kp_pos;
-    const double sev = std::min(1.0, std::max(0.0, input.degen_severity));
-    if (options_.directional_prior_en && sev > 1e-6 &&
-        input.degen_dir_w.norm() > 1e-6) {
-      const Eigen::Vector3d u = input.degen_dir_w.normalized();
-      const Eigen::Matrix3d Pu = u * u.transpose();
-      const double kh = 1.0 / std::max(1e-12, options_.prior_pos_sigma_healthy *
-                                                options_.prior_pos_sigma_healthy);
-      const double kd = 1.0 / std::max(1e-12, options_.prior_pos_sigma_degen *
-                                                options_.prior_pos_sigma_degen);
-      // 沿 u：kd（弱先验，视觉可接管）；垂直 u：kh（强先验，视觉不许动）
-      const Eigen::Matrix3d info_dir =
-          kd * Pu + kh * (Eigen::Matrix3d::Identity() - Pu);
-      info_pos = (1.0 - sev) * info_pos + sev * info_dir;
+    if (options_.directional_prior_en) {
+      // A/B 共用：info = (1-sev)·base + sev·(kd·u·uᵀ + kh·(I−u·uᵀ))。
+      info_pos = superlivo_common::directionalPositionInformation(
+          info_pos, input.degen_severity, input.degen_dir_w,
+          options_.prior_pos_sigma_healthy, options_.prior_pos_sigma_degen);
     }
     for (int i = 0; i < 3; ++i) {
       for (int j = 0; j < 3; ++j) {

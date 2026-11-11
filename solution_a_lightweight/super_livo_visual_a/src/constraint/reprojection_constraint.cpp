@@ -5,6 +5,8 @@
 // Matrix4d::inverse() 需要 LU 模块的 Inverse 求值特化，否则运行期无限递归。
 #include <Eigen/LU>
 
+#include "super_livo_common/measurement_noise.hpp"
+
 namespace superlivo_a {
 
 namespace {
@@ -100,8 +102,8 @@ std::vector<VisualResidualBlock> ReprojectionConstraint::build(
     // 80 个特征叠加后位姿"精度"达毫米级，视觉会盖过 LiDAR 先验、把位姿
     // 直接拉到拟合地图上，实测表现为修正量忽大忽小、不可信。
     const double f_mean = 0.5 * (options_.fx + options_.fy);
-    const double anchor_pix = f_mean * options_.sigma_anchor * inv_z;
-    block.variance = options_.sigma_pix * options_.sigma_pix + anchor_pix * anchor_pix;
+    block.variance = superlivo_common::reprojectionVariance(
+        options_.sigma_pix, f_mean, options_.sigma_anchor, inv_z);
     block.valid = true;
     blocks.push_back(block);
   }

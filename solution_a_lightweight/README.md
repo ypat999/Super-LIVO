@@ -42,16 +42,15 @@ solution_a_lightweight/
 │   │   └── update/visual_update.hpp               # VisualUpdate：仅适配，不持有滤波器
 │   ├── src/                              # 与头文件一一对应的实现
 │   └── src/node/visual_a_node.cpp        # ROS2 接线节点（含状态回灌，见 §8）
-└── pointcloud_colorizer/                 # 彩色点云（方案 B 共用此包）
-    ├── include/pointcloud_colorizer/
-    │   ├── image_sync.hpp                # 图像 ↔ 扫描窗口时间对齐（曝光中点优先）
-    │   ├── pose_interpolation.hpp        # 每点时间戳的位姿插值（运动补偿）
-    │   ├── projection.hpp                # T_CL 变换 + 针孔投影 + 视野检查
-    │   ├── occlusion_check.hpp           # 深度缓冲遮挡 / 深度边缘检查
-    │   ├── rgb_assignment.hpp            # RGB 采样 + 颜色质量维护
-    │   └── colorizer_pipeline.hpp        # 上述步骤的编排
-    └── src/
+└── README.md
 ```
+
+彩色点云是独立包 [`../pointcloud_colorizer`](../pointcloud_colorizer/README.md)，
+与定位主干解耦、A/B 共用，本方案不再单列目录。
+
+A/B 共用的纯算法（退化签名映射、各向异性先验、重投影方差模型）在
+[`../common/super_livo_common`](../common/super_livo_common/README.md)；
+改这些口径时**只需改一处**，两端同步生效。
 
 ## 4. 关键接口约定
 
@@ -62,7 +61,7 @@ solution_a_lightweight/
 | `ReprojectionConstraint::build/accumulate` | 特征 + 深度 + `T_wc` | 残差块 / `H,b,cost` | `r = z - π(K·T_CW·P_W)` |
 | `DegeneracyGate::evaluate` | 退化度、跟踪数、分布、残差、条件数、可观测性 | `GateDecision` | 决定视觉是否/以多大权重参与 |
 | `VisualUpdate::apply` | 法方程 + 门控 | `dx` | 由 Super-LIO ESIKF 注入并更新协方差 |
-| `ColorizerPipeline::process` | 点云 + 每点时间戳 + 图像缓存 + 位姿缓存 | `ColoredPoint[]` | 视觉定位关闭时仍可用 |
+| `ColorizerPipeline::process` | 点云 + 每点时间戳 + 图像缓存 + 位姿缓存 | `ColoredPoint[]` | 视觉定位关闭时仍可用（见 [colorizer README](../pointcloud_colorizer/README.md)） |
 
 ## 5. 与 Super-LIO 的接入点
 

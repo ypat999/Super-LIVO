@@ -50,8 +50,10 @@ Super-LIO 的实验改动在 `no-de-check` / `exp/degeneracy-adaptive` 分支上
 
 | 目录 | 方案 | 内容 |
 | --- | --- | --- |
-| [solution_a_lightweight](solution_a_lightweight/README.md) | A：极致轻量化 | Super-LIO + FAST/PyrLK + 2D-3D 重投影 + 退化门控（消费 `/lio/degeneracy` 真度量）+ 状态回灌（`update.reinject`）；独立 `pointcloud_colorizer`（A/B 共用，含 1cm 体素时间中位着色抗椒盐） |
+| [solution_a_lightweight](solution_a_lightweight/README.md) | A：极致轻量化 | Super-LIO + FAST/PyrLK + 2D-3D 重投影 + 退化门控（消费 `/lio/degeneracy` 真度量）+ 状态回灌（`update.reinject`） |
 | [solution_b_tight_coupled](solution_b_tight_coupled/README.md) | B：紧耦合 | Patch 前端 + 特征生命周期/关键帧地图 + MSCKF 多帧约束 + 统一 ESIKF + 延迟地图提交；LiDAR 地图绝对锚定 + 历史锚点保持 + 退化感知先验与守卫 |
+| [pointcloud_colorizer](pointcloud_colorizer/README.md) | 共用组件 | 彩色点云独立包（A/B 共用，与定位解耦；逐点运动补偿 + 遮挡剔除 + 1cm 体素时间中位抗椒盐） |
+| [common/super_livo_common](common/super_livo_common/README.md) | 共用组件 | A/B 共用的纯算法头文件库：退化签名映射、各向异性先验、重投影测量方差（口径只改一处） |
 
 ## 与官方 FAST-LIVO2 的差异
 

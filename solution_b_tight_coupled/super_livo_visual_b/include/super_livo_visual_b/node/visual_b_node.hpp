@@ -33,6 +33,7 @@
 #include "super_livo_visual_b/state/state_layout.hpp"
 #include "pointcloud_colorizer/colorizer_pipeline.hpp"
 #include "pointcloud_colorizer/voxel_color_median.hpp"
+#include "super_livo_common/degeneracy_signature.hpp"
 
 namespace superlivo_b {
 
@@ -282,15 +283,12 @@ class VisualBNode : public rclcpp::Node {
   // 判退化与给方向都由 Super-LIO（ros2 分支）已验证的检测负责，本节点只消费。
   mutable std::mutex degen_mutex_;
   std::string degen_topic_;
-  double degen_cond_t_{0.0};
-  int degen_axes_{0};
-  bool degen_active_{false};
-  Eigen::Vector3d degen_dir_w_{Eigen::Vector3d::Zero()};
+  superlivo_common::DegeneracySignature degen_sig_;  ///< 最新签名（解析/映射见 common）
   double degen_recv_time_{-1.0};
   bool degen_stale_warned_{false};
-  double gate_cond_lo_{10.0};
-  double gate_cond_hi_{100.0};
-  double degen_timeout_{1.0};
+  double gate_cond_lo_{superlivo_common::DegeneracyScale{}.cond_lo};
+  double gate_cond_hi_{superlivo_common::DegeneracyScale{}.cond_hi};
+  double degen_timeout_{superlivo_common::DegeneracyScale{}.timeout_sec};
   /// 本帧图像时刻的 LiDAR 位姿（插值得到），避免"打图像戳、用最新 odom"的滞后。
   Eigen::Matrix4d T_wl_frame_{Eigen::Matrix4d::Identity()};
 

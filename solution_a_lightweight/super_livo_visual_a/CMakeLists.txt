@@ -17,6 +17,8 @@ find_package(geometry_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(pointcloud_colorizer REQUIRED)
+# A/B 共用算法：退化签名映射、各向异性先验、重投影方差模型（头文件库）
+find_package(super_livo_common REQUIRED)
 # 落盘彩色地图 PCD 需要 PCL io 组件（libpcl_io）
 find_package(PCL REQUIRED COMPONENTS common io)
 
@@ -32,6 +34,7 @@ add_library(${PROJECT_NAME} SHARED
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
+  ${super_livo_common_INCLUDE_DIRS}
 )
 
 target_link_libraries(${PROJECT_NAME} PUBLIC
@@ -44,6 +47,7 @@ add_executable(visual_a_node src/node/visual_a_node.cpp)
 target_include_directories(visual_a_node PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   ${PCL_INCLUDE_DIRS}
+  ${super_livo_common_INCLUDE_DIRS}
 )
 target_link_libraries(visual_a_node ${PROJECT_NAME} ${PCL_LIBRARIES})
 ament_target_dependencies(visual_a_node rclcpp sensor_msgs nav_msgs geometry_msgs cv_bridge pcl_conversions pointcloud_colorizer)
@@ -62,6 +66,6 @@ install(TARGETS ${PROJECT_NAME} visual_a_node
 )
 
 ament_export_include_directories(include)
-ament_export_dependencies(rclcpp Eigen3 OpenCV sensor_msgs nav_msgs geometry_msgs cv_bridge pcl_conversions pointcloud_colorizer)
+ament_export_dependencies(rclcpp Eigen3 OpenCV sensor_msgs nav_msgs geometry_msgs cv_bridge pcl_conversions pointcloud_colorizer super_livo_common)
 ament_export_targets(${PROJECT_NAME}Targets HAS_LIBRARY_TARGET)
 ament_package()

@@ -223,9 +223,12 @@ void VisualANode::loadParameters() {
   // 本数据集实测：健康段 cond_t≈25-40，必须映射为 sev≈0，否则先验在健康段
   // 就被无端松开（旧默认 10/100 使 cond_t=33 映射成 sev≈0.5）。
   // 完全退化（n_effect=0，cond=1e12）由 axes/active 硬触发直接置 1，不走该映射。
-  gate_cond_lo_ = this->declare_parameter<double>("gate.cond_lo", 35.0);
-  gate_cond_hi_ = this->declare_parameter<double>("gate.cond_hi", 10000.0);
-  degen_timeout_ = this->declare_parameter<double>("gate.degen_timeout", 1.0);
+  gate_cond_lo_ = this->declare_parameter<double>(
+      "gate.cond_lo", superlivo_common::DegeneracyScale{}.cond_lo);
+  gate_cond_hi_ = this->declare_parameter<double>(
+      "gate.cond_hi", superlivo_common::DegeneracyScale{}.cond_hi);
+  degen_timeout_ = this->declare_parameter<double>(
+      "gate.degen_timeout", superlivo_common::DegeneracyScale{}.timeout_sec);
 
   // ==========================================================================
   // 视觉更新 VisualUpdate
@@ -1249,28 +1252,19 @@ void VisualANode::decayPoseOffset(double dt, double severity,
 
 void VisualANode::onDegeneracy(
     const std_msgs::msg::Float64MultiArray::ConstSharedPtr& msg) {
-  // 布局：[cond6, axes, active, cond_t, evt_min, ux, uy, uz]
-  if (msg->data.size() < 8) {
-    return;
-  }
   std::lock_guard<std::mutex> lock(degen_mutex_);
-  degen_cond6_ = msg->data[0];
-  degen_axes_ = static_cast<int>(msg->data[1]);
-  degen_active_ = msg->data[2] > 0.5;
-  degen_cond_t_ = msg->data[3];
-  const Eigen::Vector3d u(msg->data[5], msg->data[6], msg->data[7]);
-  if (u.norm() > 1e-6) {
-    degen_dir_w_ = u.normalized();
-  } else {
-    degen_dir_w_.setZero();  // 无方向（非 trans_only 模式）时不能沿用上一帧
+  // 布局：[cond6, axes, active, cond_t, evt_min, ux, uy, uz]，解析见 common。
+  if (!degen_sig_.fromArray(msg->data)) {
+    return;
   }
   degen_recv_time_ = this->now().seconds();
   if (!degen_seen_) {
     degen_seen_ = true;
     RCLCPP_INFO(this->get_logger(),
                 "收到退化签名: cond6=%.2f cond_t=%.2f axes=%d active=%d u=(%+.2f %+.2f %+.2f)",
-                degen_cond6_, degen_cond_t_, degen_axes_, degen_active_ ? 1 : 0,
-                degen_dir_w_.x(), degen_dir_w_.y(), degen_dir_w_.z());
+                degen_sig_.cond6, degen_sig_.cond_t, degen_sig_.axes,
+                degen_sig_.active ? 1 : 0, degen_sig_.dir.x(), degen_sig_.dir.y(),
+                degen_sig_.dir.z());
   }
 }
 
@@ -1285,23 +1279,11 @@ bool VisualANode::degeneracySignature(double& severity,
   }
   // cond=0 说明 Super-LIO 侧根本没跑检测（detect_en 关闭），或非 trans_only 模式
   // （此时不产出平移块判据/方向）。两种情况都不能当"健康"用，否则退化门控静默失效。
-  if (degen_cond6_ <= 0.0 || degen_cond_t_ <= 0.0) {
+  if (!degen_sig_.valid()) {
     return false;
   }
-  dir_w = degen_dir_w_;
-  // axes/active 是 Super-LIO 自己的硬判据（跨过它的退化阈值才算），一旦触发就满权。
-  // 没触发时**不能**直接当成"健康"短路——否则门控只会在硬阈值那一刻从 0 跳到 1，
-  // 阈值敏感性实验与渐进接管都做不了。这里用 cond_t 连续映射。
-  if (degen_axes_ > 0 || degen_active_) {
-    severity = 1.0;
-    return true;
-  }
-  // cond_t 在对数刻度上映射 severity：lo 以下健康，hi 以上完全退化。
-  const double lo = std::max(1e-6, gate_cond_lo_);
-  const double hi = std::max(lo * 1.001, gate_cond_hi_);
-  const double c = std::max(lo, degen_cond_t_);
-  severity = std::log(c / lo) / std::log(hi / lo);
-  severity = std::min(1.0, std::max(0.0, severity));
+  dir_w = degen_sig_.dir;
+  severity = degen_sig_.severity(gate_cond_lo_, gate_cond_hi_);
   return true;
 }
 

@@ -6,7 +6,7 @@
 
 对比对象
 --------
-自研方案A   solution_a_lightweight/{pointcloud_colorizer,super_livo_visual_a}
+自研方案A   pointcloud_colorizer/ + solution_a_lightweight/super_livo_visual_a
 官方 FAST-LIVO2  third_party/FAST-LIVO2-ROS2 (+ rpg_vikit)
 
 如何把两次独立的运行对到「同一次曝光」上（本工具的核心）

@@ -16,6 +16,8 @@
 #include <pcl/point_cloud.h>
 
 #include <Eigen/Geometry>
+
+#include "super_livo_common/anisotropic_prior.hpp"
 #include <Eigen/LU>
 
 namespace superlivo_b {
@@ -178,9 +180,12 @@ void VisualBNode::loadParameters() {
   // sev 对数映射标尺（本数据集实测）：健康段 cond_t≈25-40，必须映射为 sev≈0，
   // 否则先验在健康段就被无端松开一半（旧默认 10/100 使 cond_t=33 映射成 0.5）。
   // 完全退化（n_effect=0，cond=1e12）由 axes/active 硬触发直接置 1，不走该映射。
-  gate_cond_lo_ = this->declare_parameter<double>("gate.cond_lo", 35.0);
-  gate_cond_hi_ = this->declare_parameter<double>("gate.cond_hi", 10000.0);
-  degen_timeout_ = this->declare_parameter<double>("gate.degen_timeout", 1.0);
+  gate_cond_lo_ = this->declare_parameter<double>(
+      "gate.cond_lo", superlivo_common::DegeneracyScale{}.cond_lo);
+  gate_cond_hi_ = this->declare_parameter<double>(
+      "gate.cond_hi", superlivo_common::DegeneracyScale{}.cond_hi);
+  degen_timeout_ = this->declare_parameter<double>(
+      "gate.degen_timeout", superlivo_common::DegeneracyScale{}.timeout_sec);
 
   // 退化段守卫（Trust + 速度限幅）
   guard_enable_ = this->declare_parameter<bool>("guard.enable", true);
@@ -374,19 +379,10 @@ void VisualBNode::onImage(const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
 
 void VisualBNode::onDegeneracy(
     const std_msgs::msg::Float64MultiArray::ConstSharedPtr& msg) {
-  // 布局：[cond6, axes, active, cond_t, evt_min, ux, uy, uz]
-  if (msg->data.size() < 8) {
-    return;
-  }
+  // 布局：[cond6, axes, active, cond_t, evt_min, ux, uy, uz]，解析见 common。
   std::lock_guard<std::mutex> lock(degen_mutex_);
-  degen_axes_ = static_cast<int>(msg->data[1]);
-  degen_active_ = msg->data[2] > 0.5;
-  degen_cond_t_ = msg->data[3];
-  const Eigen::Vector3d u(msg->data[5], msg->data[6], msg->data[7]);
-  if (u.norm() > 1e-6) {
-    degen_dir_w_ = u.normalized();
-  } else {
-    degen_dir_w_.setZero();  // 无方向（非 trans_only 模式）时不能沿用上一帧
+  if (!degen_sig_.fromArray(msg->data)) {
+    return;
   }
   degen_recv_time_ = this->now().seconds();
 }
@@ -401,20 +397,11 @@ bool VisualBNode::degeneracySignature(double& severity,
     return false;
   }
   // cond=0 说明 Super-LIO 侧没跑检测或不是 trans_only 模式，不能当"健康"用。
-  if (degen_cond_t_ <= 0.0) {
+  if (!degen_sig_.valid()) {
     return false;
   }
-  dir_w = degen_dir_w_;
-  // 硬判据（Super-LIO 自己的退化阈值）触发即满权；未触发时按 cond_t 连续映射，
-  // 不能用"不退化"短路，否则严重度只会在硬阈值处 0→1 跳变。
-  if (degen_axes_ > 0 || degen_active_) {
-    severity = 1.0;
-    return true;
-  }
-  const double lo = std::max(1e-6, gate_cond_lo_);
-  const double hi = std::max(lo * 1.001, gate_cond_hi_);
-  const double c = std::max(lo, degen_cond_t_);
-  severity = std::min(1.0, std::max(0.0, std::log(c / lo) / std::log(hi / lo)));
+  dir_w = degen_sig_.dir;
+  severity = degen_sig_.severity(gate_cond_lo_, gate_cond_hi_);
   return true;
 }
 
@@ -1136,14 +1123,10 @@ void VisualBNode::buildLidarPrior(const Eigen::Matrix4d& T_wl,
   double sev = 0.0;
   Eigen::Vector3d u = Eigen::Vector3d::Zero();
   (void)degeneracySignature(sev, u);
-  if (prior_directional_en_ && sev > 1e-6 && u.norm() > 1e-6) {
-    const Eigen::Vector3d un = u.normalized();
-    const Eigen::Matrix3d Pu = un * un.transpose();
-    const double kh = 1.0 / std::max(1e-12, prior_pos_sigma_healthy_ * prior_pos_sigma_healthy_);
-    const double kd = 1.0 / std::max(1e-12, prior_pos_sigma_degen_ * prior_pos_sigma_degen_);
-    const Eigen::Matrix3d Hp_dir =
-        kd * Pu + kh * (Eigen::Matrix3d::Identity() - Pu);
-    Hp = (1.0 - sev) * Hp + sev * Hp_dir;
+  if (prior_directional_en_) {
+    // 沿退化方向松开、垂直方向收紧，再按 sev 与各向同性基线插值（A/B 共用实现）。
+    Hp = superlivo_common::directionalPositionInformation(
+        Hp, sev, u, prior_pos_sigma_healthy_, prior_pos_sigma_degen_);
   }
 
   // 状态是 IMU 位姿：T_wi = T_wl · T_li（T_li 单位阵时 T_wi = T_wl）。
