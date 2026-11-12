@@ -187,3 +187,13 @@ python3 /tmp/bench/parse_bench.py slio.log fl2.log vis_a.log vis_b.log <bag时�
   官方 `avia.yaml`（`img_time_offset: 0.1`）；bag 自带 `avia_lvi.yaml`（fx≈906、
   `img_time_offset: 1200.25`）是 DeepRobotics 车载配置，误用会导致 RGB 严重错位。
   标定文件与来源注释已归档在 bag 目录 `/home/ywj/slam_data/Retail_Street/`。
+
+## 待办（后续测试）
+
+- **B2 退化分段验证**：录新长走廊退化 bag，按 §7 方法统计 `[VisRot]` 分段接受率/Δyaw，
+  验证 χ² 门控在退化段是否自动开门拉回漂移（配置 B 定版前的最后一步）。
+  过程与结论见 [B2B3-光流旋转约束实验记录](.trae/documents/B2B3-光流旋转约束实验记录.md)。
+- **彩色点云配准（颜色残差 ICP）**：Colored Point Cloud Registration Revisited，
+  Park、Zhou、Koltun，ICCV 2017。待测：在点云配准/观测环节引入颜色残差项。
+  前置条件：Mid-360 只有反射强度、无 RGB，需先接上着色链路（见 `pointcloud_colorizer`）；
+  颜色只对沿墙面等平移退化方向有补充力，**治不了 yaw 漂移**。
