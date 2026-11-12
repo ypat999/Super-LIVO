@@ -13,10 +13,6 @@
 [submodule "third_party/direct_visual_lidar_calibration"]
 	path = third_party/direct_visual_lidar_calibration
 	url = https://github.com/koide3/direct_visual_lidar_calibration.git
-[submodule "third_party/livox_camera_calib"]
-	path = third_party/livox_camera_calib
-	url = https://github.com/yeyiru/livox_camera_calib_ros2.git
-	branch = ros2
-[submodule "third_party/livox_camera_lidar_calibration"]
-	path = third_party/livox_camera_lidar_calibration
-	url = https://github.com/DGUCCL7103/Livox_Camera_LiDAR_Calibration_ROS2.git
+[submodule "third_party/FAST-Calib-ROS2"]
+	path = third_party/FAST-Calib-ROS2
+	url = https://github.com/MaroSalah02/FAST-Calib-ROS2.git
