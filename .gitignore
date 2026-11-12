@@ -219,3 +219,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 wsl.txt
+
+# colcon 构建产物（构建目录固定在仓库根目录）
+/build/
+/install/
+/log/

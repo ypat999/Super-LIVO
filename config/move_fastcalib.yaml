@@ -1,0 +1,109 @@
+/**:
+  ros__parameters:
+    common:
+      img_topic: "/left_camera/image"
+      lid_topic: "/livox/lidar"
+      imu_topic: "/livox/imu"
+      img_en: 1
+      lidar_en: 1
+      ros_driver_bug_fix: false
+      livox_msg_type: "livox_ros_driver2"
+
+    extrin_calib:
+      # FAST-Calib (FAST-Calib-ROS2, all_ros2_pc2 + img_0120.png, RMSE 7.9 mm)
+      # 语义 p_cam = Rcl * p_lidar + Pcl
+      Rcl: [-0.014614, -0.999822, -0.011946,
+             0.482153,  0.003420, -0.876081,
+             0.875965, -0.018563,  0.482017]
+      Pcl: [0.029463, -0.168116, -0.047853]
+      extrinsic_T: [0.011, 0.02329, -0.04412]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+
+    time_offset:
+      # IMU 与雷达同一设备时钟；+0.104 s 是雷达 header=扫描起始 vs IMU=即时 的语义差，不补偿。
+      imu_time_offset: 0.0
+      # median(hdr_lidar - hdr_image) 插值实测：move.bag = -204262819.0776 (std 7 ms)
+      # all.bag 实测 -204262819.0912，两 bag 一致（同一次采集会话）。
+      img_time_offset: -204262819.077561
+      exposure_time_init: 0.0
+
+    rolling_shutter:
+      enable: true
+      tr_readout: 0.01101
+      anchor_factor: 0.5
+      debug_print: false
+      td_estimate_enable: true
+      td_step_alpha: 0.1
+      td_step_cap: 0.0005
+      td_lambda: 100.0
+      td_min_jac_sq: 1.0
+
+    preprocess:
+      point_filter_num: 1
+      filter_size_surf: 0.1
+      lidar_type: 8 # 8 : Livox Mid-360 LiDAR
+      scan_line: 4
+      blind: 0.1
+
+    vio:
+      max_iterations: 5
+      outlier_threshold: 1000
+      img_point_cov: 100
+      patch_size: 8
+      patch_pyrimid_level: 4
+      normal_en: true
+      raycast_en: false
+      inverse_composition_en: false
+      exposure_estimate_en: true
+      inv_expo_cov: 0.1
+
+    imu:
+      imu_en: true
+      imu_int_frame: 50
+      acc_cov: 0.1
+      gyr_cov: 0.1
+      b_acc_cov: 0.001
+      b_gyr_cov: 0.001
+
+    lio:
+      max_iterations: 5
+      dept_err: 0.02
+      beam_err: 0.15
+      min_eigen_value: 0.005
+      voxel_size: 0.5
+      max_layer: 2
+      max_points_num: 50
+      layer_init_num: [5, 5, 5, 5, 5]
+
+    local_map:
+      map_sliding_en: false
+      half_map_size: 100
+      sliding_thresh: 8.0
+
+    uav:
+      imu_rate_odom: false
+      gravity_align_en: true
+
+    publish:
+      dense_map_en: true
+      pub_effect_point_en: false
+      pub_plane_en: false
+      pub_scan_num: 1
+      blind_rgb_points: 0.0
+
+    evo:
+      seq_name: "move_fastcalib"
+      pose_output_en: true
+
+    pcd_save:
+      pcd_save_en: true
+      type: 0
+      colmap_output_en: false
+      filter_size_pcd: 0.15
+      interval: -1
+
+    image_save:
+      img_save_en: false
+      interval: 1
