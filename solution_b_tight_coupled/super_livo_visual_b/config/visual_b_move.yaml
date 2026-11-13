@@ -1,0 +1,28 @@
+# move bag（1280x1024 bgr8 全局快门相机 + Livox CustomMsg）——方案 B 支路参数。
+# 外参 Rcl/Pcl 由 FAST-Calib 标定结果回填（标定 bag：livo_bag/all_ros2，RMSE 0.0150 m）。
+super_livo_visual_b:
+  ros__parameters:
+    image_topic: /left_camera/image
+    imu_topic: /livox/imu
+    cam_width: 1280
+    cam_height: 1024
+    cam_fx: 7.0863125924497740e+02
+    cam_fy: 7.0871513587278127e+02
+    cam_cx: 6.4449372682521789e+02
+    cam_cy: 4.9588359175254533e+02
+    cam_d: [5.4466418090825280e-02, -4.5147373415016401e-02,
+            8.5461102120314711e-06, 1.0486594840736336e-03]
+    # LiDAR -> Camera（p_cam = Rcl * P_lidar + Pcl），与方案 A 同一标定结果
+    Rcl: [-0.016608, -0.999856,  0.003566,
+           0.311618, -0.008565, -0.950169,
+           0.950063, -0.014670,  0.311715]
+    Pcl: [0.012962, 0.233348, -0.021683]
+    img_time_offset: 0.0
+    # 相机与雷达扫描存在相位差（最近邻 dt 中位 16.7ms、最大 74ms），放宽同步窗。
+    color.sync_max_offset: 0.1
+
+    # 彩色点云落盘：<save_dir>/super_livo_visual_b_colored.pcd
+    pcd:
+      save_dir: "/home/ywj/slam_data/output/move_b"
+      save_interval_sec: 30.0
+      max_points: 20000000

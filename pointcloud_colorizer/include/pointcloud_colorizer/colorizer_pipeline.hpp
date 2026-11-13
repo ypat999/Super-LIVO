@@ -37,6 +37,10 @@ class ColorizerPipeline {
     ImageSync::Options sync;
     OcclusionChecker::Options occlusion;
     RgbAssigner::Options rgb;
+    /// 位姿插值允许的最大相邻采样间隔（秒）。与 sync.max_offset（图像同步窗口）
+    /// 是两件不同的事：/lio/odom 通常 10 Hz，用图像窗口反过来限制位姿间隔会让
+    /// 所有点都因"采样间隔过大"被跳过（全部 quality=0）。
+    double pose_max_gap{0.5};
   };
 
   explicit ColorizerPipeline(const Options& options);

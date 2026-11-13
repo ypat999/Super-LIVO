@@ -1,0 +1,65 @@
+# move bag（Livox Mid-360 CustomMsg @10Hz + 内置 IMU @200Hz + 1280x1024 全局快门相机，77.4 s 走动建图）
+# 供 visual_a_app / visual_b_app 共用（Super-LIO 主干参数，键名必须用 lio.* 扁平结构，
+# 与 ROSWrapper::LoadParamFromRos 一致；app.* 由 app 在 wrapper 节点上声明）。
+# 用法：
+#   ros2 run super_livo_visual_a visual_a_app --ros-args \
+#     --params-file <本文件> --params-file visual_a_move.yaml
+super_lio:
+  ros__parameters:
+    # ---------------- ROS 话题 ----------------
+    lio.ros.lidar_topic: "/livox/lidar"
+    lio.ros.imu_topic: "/livox/imu"
+    # 回放场景保持 best_effort（bag 记录 QoS 与之一致，reliable 订阅会静默丢消息）
+    lio.ros.imu_qos_reliable: false
+    lio.ros.lidar_qos_reliable: false
+
+    # ---------------- 传感器 ----------------
+    lio.sensor.lidar_type: 1          # 1 = LIVOX（livox_ros_driver2/CustomMsg）
+    lio.sensor.imu_type: 1            # 1 = 内置 IMU（Mid-360）
+    lio.sensor.blind: 0.4
+    lio.sensor.maxrange: 70.0
+    lio.sensor.filter_rate: 3
+    lio.sensor.enable_downsample: true
+    lio.sensor.voxel_fliter_size: 0.1  # 室内走动建图，落盘彩色点云要细一点
+    lio.sensor.gravity_norm: 9.8066
+    lio.sensor.imu_na: 0.1
+    lio.sensor.imu_ng: 0.1
+    lio.sensor.imu_nba: 0.0001
+    lio.sensor.imu_nbg: 0.0001
+
+    # ---------------- 外参 ----------------
+    # LiDAR->IMU（Mid-360 实测值，同 room b3 配置口径）
+    lio.extrinsic.lidar_imu: [-0.011, -0.02329, 0.04412,
+                               1.0, 0.0, 0.0,
+                               0.0, 1.0, 0.0,
+                               0.0, 0.0, 1.0]
+
+    # ---------------- 地图（LIO 基线落盘默认关，彩色点云由视觉支路保存） ----------------
+    lio.map.save_map: false
+    lio.map.if_filter: false
+    lio.map.ds_size: 0.1
+    lio.map.save_interval: -1
+    lio.map.save_map_dir: "/home/ywj/slam_data/output/move_lio"
+    lio.map.pcd_prefix: "move"
+
+    # ---------------- 输出 ----------------
+    lio.output.map: true              # /lio/cloud_world（世界系稀疏图）
+    lio.output.map_body: true
+    lio.output.dense: false
+    lio.output.dense_body: true       # /lio/cloud_body_dense（A/B 彩色支路的输入）
+    lio.output.pub_step: 1            # 必须 >=1（默认 0 会让 Output() 除零崩溃）
+    lio.output.odom_cov_en: false
+
+    # 退化检测（A/B 视觉门控依赖 lio/degeneracy 签名话题）
+    lio.observe.degeneracy_detect_en: true
+    lio.observe.degen_trans_only: 1   # int 类型
+
+    # 迭代 ESKF（必须显式写：ROSWrapper 声明默认值是 0 / false，
+    # max_iterations=0 会让观测更新循环一次都不执行 ⇒ 雷达零约束、纯 IMU 漂移）
+    lio.kf.kf_max_iterations: 4
+    lio.kf.kf_align_gravity: true
+
+    # ---- visual_b_app 专用开关（A 只用 embed_visual）----
+    app.embed_visual: true            # 同进程创建视觉支路
+    app.visual_inject: true           # B：视觉约束经 ExternalObserve 写回 ESKF
+    app.visual_inject_max_dt: 0.5

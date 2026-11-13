@@ -36,7 +36,7 @@ std::vector<ColoredPoint> ColorizerPipeline::process(
   }
 
   // ---- 第 1 步：构造逐点位姿插值器 -----------------------------------------
-  LidarPoseInterpolator interpolator(LidarPoseInterpolator::Options{options_.sync.max_offset * 2.5});
+  LidarPoseInterpolator interpolator(LidarPoseInterpolator::Options{options_.pose_max_gap});
   for (const auto& pose : poses) {
     interpolator.addSample(pose);
   }
