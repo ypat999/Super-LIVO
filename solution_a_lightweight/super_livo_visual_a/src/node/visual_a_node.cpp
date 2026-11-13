@@ -1289,14 +1289,6 @@ bool VisualANode::degeneracySignature(double& severity,
 
 }  // namespace superlivo_a
 
-// ----------------------------------------------------------------------------
-// 入口：标准 ROS2 节点 main（spin 直至 SIGINT）。
-// 若后续需要与 Super-LIO 组合到同一进程，可改为 rclcpp_components 可组合节点。
-// ----------------------------------------------------------------------------
-int main(int argc, char** argv) {
-  rclcpp::init(argc, argv);
-  auto node = std::make_shared<superlivo_a::VisualANode>();
-  rclcpp::spin(node);
-  rclcpp::shutdown();
-  return 0;
-}
+// 入口 main 已拆到 visual_a_node_main.cpp：
+// 节点实现本身需要被两个可执行文件复用（对话题版 visual_a_node 与
+// 同进程版 visual_a_app），留在实现文件里会产生重复 main 定义。

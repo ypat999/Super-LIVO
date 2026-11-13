@@ -1,0 +1,23 @@
+# 自采 room bag（Livox Mid-360 + 1280x800 彩色相机）的相机参数覆盖项。
+# 用法：
+#   ros2 run super_livo_visual_a visual_a_node --ros-args \
+#     --params-file $(ros2 pkg prefix super_livo_visual_a)/share/super_livo_visual_a/config/visual_a_room.yaml
+# 说明：本包默认值对应 avia + OAK（640x512、img_time_offset=0.1），
+#   直接用于 room bag 会因内参/外参不匹配导致 0 点着色。
+super_livo_visual_a:
+  ros__parameters:
+    image_topic: /camera/color/image_raw
+    cam_width: 1280
+    cam_height: 800
+    cam_fx: 611.5093994140625
+    cam_fy: 611.7654418945312
+    cam_cx: 639.8602905273438
+    cam_cy: 397.16888427734375
+    cam_d: [-0.030312, 0.032308, -0.0000744, -0.0003438]
+    # Camera -> LiDAR（P_lidar = Rcl * P_cam + Pcl）
+    Rcl: [-0.01947422, 0.0024993, 0.999807236,
+          -0.999337825, -0.030789816, -0.019388109,
+          0.030735424, -0.999522756, 0.003097253]
+    Pcl: [0.060776872, 0.026349007, -0.069456793]
+    # room bag 的 lidar 帧头即帧末，图像曝光中点与点云同时刻，无需偏移
+    img_time_offset: 0.0

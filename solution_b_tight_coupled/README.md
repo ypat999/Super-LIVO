@@ -76,6 +76,43 @@ IMU 传播 → LiDAR 更新 → 更新几何地图 → 视觉跟踪
 
 注意：视觉更新会改变当前位姿，**不能用更新前位姿插点**。`MapCommitScheduler` 负责把提交推迟到更新完成后重新计算变换。
 
+### 5.1 约束写回 Super-LIO ESKF（`visual_b_app`）
+
+`super_lio` 在这里只作为公共库（`super_lio::lio`）。`visual_b_app` 是同进程可执行：
+Super-LIO 主干 + B 视觉支路，视觉约束通过 `super_lio` 暴露的通用扩展点写回 18 维 ESKF，
+不经过任何话题。
+
+```
+图像回调 → UnifiedEstimator::visualUpdate
+        → 记录本帧等效法方程（6×6 相机位姿 H、b）
+        → ConstraintBridge（单槽信箱，跨线程，mutex）
+        → SuperLIO::ExternalObserve()（每帧 LiDAR 更新之后、建图/输出之前）
+        → eskf()->UpdateObserveFull(H18, r, R)
+```
+
+映射细节：
+
+| 环节 | 处理 |
+| --- | --- |
+| 白化 | `H = L Lᵀ`（LLT），取 `J_w = Lᵀ`、`R_w = I`，避免把信息矩阵当雅可比用 |
+| 残差符号 | `r = −L⁻¹b`：B 内部 `b` 是"预测−观测"，ESKF 的 `r` 约定为"观测−预测" |
+| 扰动系 | B 的相机扰动是世界系左扰动 ξ，ESKF 是机体系右扰动 δ，`ξ = R_wi·δ`，故 H 旋转块右乘当前 `R_wi` |
+| 状态列序 | `H18` 为 6×18，只填 rot(0-2) / pos(3-5)，其余列（v/bg/ba/g）为 0 |
+| 时间门控 | `app.visual_inject_max_dt`（默认 0.2 s）：视觉帧与当前 ESKF 时刻差超限则丢弃并计 `过期` |
+
+两个开关：
+
+- `app.embed_visual`：是否同进程创建 B 视觉支路（false 时退化为纯 LIO）；
+- `app.visual_inject`：是否把视觉约束注入 ESKF（false 时 B 视觉仍跑，但 `/lio/odom`
+  与纯 LIO 逐位一致，可用于回归对比）。
+
+自采 room bag（160 s）实测：`push=1103 / 生效=1073 / 过期=6 / 被拒=0`，`/lio/odom` 1594 帧
+`nan=0`、最大帧间位移 0.1232 m（纯 LIO 基线 0.1233 m）；全程与纯 LIO 最大差
+`|dp|=3.9 cm`、`|dq|=4.7e-03`，末帧位置差约 4.6 cm。
+
+已知限制：B 的约束由自身状态构造（靠 `/lio/odom` 同步），与 ESKF 长期运行可能缓慢分叉；
+若需长期一致，应让 B 直接引用 ESKF 状态而非复制位姿。
+
 ## 6. ROS2 接口（实际接入，NTU 配置 `config/visual_b_ntu.yaml`）
 
 | Topic | 类型 | 方向 | 说明 |

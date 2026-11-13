@@ -15,6 +15,7 @@
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
 
+#include <Eigen/Cholesky>
 #include <Eigen/Geometry>
 
 #include "super_livo_common/anisotropic_prior.hpp"
@@ -784,6 +785,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     vin.degen_severity = degen_sev;
     vin.degen_dir_w = degen_u;
     estimator_->visualUpdate(vin);
+    publishVisualConstraint(t_pose);
   }
 
   // 10.5) 退化段速度守卫
@@ -886,6 +888,48 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
       ms(t_lv0, t_lv1), ms(t_lv1, t_lv2), ms(t_lv2, t_lv3), ms(t_ct0, t_mk0),
       ms(t_mk0, t_mk1), tp.num_tracks, tp.total_obs, tp.max_obs, tp.pair_work,
       map_points_.size(), stat_prior_veto_, stat_vel_clamp_);
+}
+
+void VisualBNode::publishVisualConstraint(double stamp) {
+  if (!bridge_) {
+    return;
+  }
+  const auto& applied = estimator_->appliedVisual();
+  if (!applied.valid || applied.H.rows() != 6 || applied.H.cols() != 6 ||
+      applied.b.size() != 6) {
+    return;
+  }
+  if (!applied.H.allFinite() || !applied.b.allFinite()) {
+    return;
+  }
+
+  // 白化：H = Σ w Jᵀ R⁻¹ J 为信息矩阵，令 H = L Lᵀ，则 J_w = Lᵀ、观测噪声 R_w = I。
+  Eigen::LLT<Eigen::MatrixXd> llt(applied.H);
+  if (llt.info() != Eigen::Success) {
+    return;
+  }
+  const Eigen::MatrixXd L = llt.matrixL();  // 下三角
+  const Eigen::MatrixXd JwT = L;            // J_wᵀ
+  // B 的 b = JᵀR⁻¹(预测-观测)，本滤波器 Update 的 r 约定是 (观测-预测)，故取负。
+  const Eigen::VectorXd r6 = -(L.triangularView<Eigen::Lower>().solve(applied.b));
+  if (!r6.allFinite()) {
+    return;
+  }
+
+  // 世界系左扰动 ξ -> ESKF 机体系右扰动 δ：ξ = R_wi · δ，旋转块右乘当前姿态。
+  const Eigen::Matrix3d R_wi = estimator_->filterState().state.R;
+  Eigen::MatrixXd H18 = Eigen::MatrixXd::Zero(6, 18);
+  H18.block<3, 3>(0, 0) = JwT.block<3, 3>(0, 0) * R_wi;
+  H18.block<3, 3>(0, 3) = JwT.block<3, 3>(0, 3);
+  H18.block<3, 3>(3, 0) = JwT.block<3, 3>(3, 0) * R_wi;
+  H18.block<3, 3>(3, 3) = JwT.block<3, 3>(3, 3);
+
+  VisualObs obs;
+  obs.stamp = stamp;
+  obs.H = std::move(H18);
+  obs.r = r6;
+  obs.R = Eigen::MatrixXd::Identity(6, 6);
+  bridge_->push(std::move(obs));
 }
 
 void VisualBNode::runColorizer(const sensor_msgs::msg::PointCloud2& cloud_msg) {
@@ -1391,13 +1435,6 @@ Eigen::Matrix4d VisualBNode::applyLeftPerturbation(const Eigen::Matrix4d& T,
 
 }  // namespace superlivo_b
 
-// ----------------------------------------------------------------------------
-// 入口：标准 ROS2 节点 main。
-// ----------------------------------------------------------------------------
-int main(int argc, char** argv) {
-  rclcpp::init(argc, argv);
-  auto node = std::make_shared<superlivo_b::VisualBNode>();
-  rclcpp::spin(node);
-  rclcpp::shutdown();
-  return 0;
-}
+// 入口 main 已拆到 visual_b_node_main.cpp：
+// 节点实现本身需要被两个可执行文件复用（对话题版 visual_b_node 与
+// 同进程版 visual_b_app），留在实现文件里会产生重复 main 定义。

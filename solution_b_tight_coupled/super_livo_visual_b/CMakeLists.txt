@@ -21,6 +21,8 @@ find_package(pointcloud_colorizer REQUIRED)
 find_package(super_livo_common REQUIRED)
 # 落盘彩色地图 PCD 需要 PCL io 组件（libpcl_io）
 find_package(PCL REQUIRED COMPONENTS common io)
+# 公共代码库 Super-LIO：本包只"引用"其资源（库级链接，不做话题级回灌）
+find_package(super_lio REQUIRED)
 
 # ---- 方案 B 算法库 ---------------------------------------------------------
 add_library(${PROJECT_NAME} SHARED
@@ -47,7 +49,7 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
 )
 
 # ---- 方案 B ROS2 节点 ------------------------------------------------------
-add_executable(visual_b_node src/node/visual_b_node.cpp)
+add_executable(visual_b_node src/node/visual_b_node_main.cpp src/node/visual_b_node.cpp)
 target_include_directories(visual_b_node PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   ${PCL_INCLUDE_DIRS}
@@ -56,11 +58,23 @@ target_include_directories(visual_b_node PRIVATE
 target_link_libraries(visual_b_node ${PROJECT_NAME} ${PCL_LIBRARIES})
 ament_target_dependencies(visual_b_node rclcpp sensor_msgs nav_msgs geometry_msgs cv_bridge pcl_conversions pointcloud_colorizer)
 
+# ---- 方案 B 独立可执行入口 -------------------------------------------------
+# 同一进程内运行 Super-LIO 主干（super_lio::lio）与方案 B 视觉支路，
+# 约束写回通过继承 SuperLIO 的 ExternalObserve() 在代码级完成。
+add_executable(visual_b_app src/app/visual_b_app.cpp src/node/visual_b_node.cpp)
+target_include_directories(visual_b_app PRIVATE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  ${PCL_INCLUDE_DIRS}
+  ${super_livo_common_INCLUDE_DIRS}
+)
+target_link_libraries(visual_b_app ${PROJECT_NAME} ${PCL_LIBRARIES} super_lio::lio)
+ament_target_dependencies(visual_b_app rclcpp sensor_msgs nav_msgs geometry_msgs cv_bridge pcl_conversions pointcloud_colorizer)
+
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME}
 )
-install(TARGETS ${PROJECT_NAME} visual_b_node
+install(TARGETS ${PROJECT_NAME} visual_b_node visual_b_app
   EXPORT ${PROJECT_NAME}Targets
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib

@@ -22,6 +22,7 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
+#include "super_livo_visual_b/bridge/constraint_bridge.hpp"
 #include "super_livo_visual_b/constraint/lidar_visual_constraint.hpp"
 #include "super_livo_visual_b/constraint/msckf_constraint.hpp"
 #include "super_livo_visual_b/constraint/photometric_constraint.hpp"
@@ -79,7 +80,16 @@ class VisualBNode : public rclcpp::Node {
   /// 退出时把累积的彩色地图再落盘一次（运行中用定时器周期保存）。
   ~VisualBNode() override;
 
+  /// 可选：把每帧视觉法方程等价桥接到 Super-LIO 的 ESKF（同进程代码级注入）。
+  /// 未设置时节点行为与原先完全一致，只维护自身的统一估计器。
+  void setConstraintBridge(const std::shared_ptr<ConstraintBridge>& bridge) { bridge_ = bridge; }
+
  private:
+  /// 把"本帧实际施加的视觉法方程"转换成 ESKF 的 18 维观测并投递到桥。
+  /// 约定：B 的法方程参数是世界系左扰动 ξ，ESKF 的旋转误差是机体系右扰动 δ，
+  /// 二者满足 ξ = R_wi · δ，因此旋转块需要右乘当前姿态。
+  void publishVisualConstraint(double stamp);
+
   // ---- 订阅回调 ------------------------------------------------------------
   /// 图像回调：去畸变 -> 灰度 -> 驱动一帧主流程。
   void onImage(const sensor_msgs::msg::Image::ConstSharedPtr& msg);
@@ -295,6 +305,9 @@ class VisualBNode : public rclcpp::Node {
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr colored_cloud_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+
+  // ---- 视觉约束桥接（-> Super-LIO ESKF）------------------------------------
+  std::shared_ptr<ConstraintBridge> bridge_;  ///< 为空时不做任何注入
 
   // ---- 运行状态 ------------------------------------------------------------
   bool params_loaded_{false};

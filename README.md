@@ -58,6 +58,22 @@ OOM 的问题，详见「关键实验结论」。其余子模块保持上游原�
 | [pointcloud_colorizer](pointcloud_colorizer/README.md) | 共用组件 | 彩色点云独立包（A/B 共用，与定位解耦；逐点运动补偿 + 遮挡剔除 + 1cm 体素时间中位抗椒盐） |
 | [common/super_livo_common](common/super_livo_common/README.md) | 共用组件 | A/B 共用的纯算法头文件库：退化签名映射、各向异性先验、重投影测量方差（口径只改一处） |
 
+### 公共库与独立可执行
+
+`third_party/Super-LIO` 的 `super_lio` 只作为**公共代码库**被引用
+（`find_package(super_lio REQUIRED)` + `super_lio::lio`），A/B 各自是完整、独立可执行的方案：
+
+| 可执行 | 所属 | 内容 |
+| --- | --- | --- |
+| `super_lio_node` | `third_party/Super-LIO` | 纯 LIO 基线，不含任何视觉代码 |
+| `visual_a_app` | `solution_a_lightweight` | 同进程：Super-LIO 主干 + 方案 A 视觉支路 |
+| `visual_b_app` | `solution_b_tight_coupled` | 同进程：Super-LIO 主干 + 方案 B 视觉支路 + 视觉约束写回 ESKF |
+
+`super_lio` 对下游只暴露两个与视觉无关的通用扩展点，默认路径逐位不变：
+
+- `virtual void ExternalObserve()`：每帧 LiDAR 更新（含信任域裁决）之后、建图与输出之前的空钩子；
+- `ESKF::UpdateObserveFull(H, r, R)`：任意维观测更新（H 列序为 18 维误差状态）。
+
 ## 与官方 FAST-LIVO2 的差异
 
 先说定位：A/B **不是从 FAST-LIVO2 改出来的**，而是挂在 Super-LIO 外部的视觉节点；官方

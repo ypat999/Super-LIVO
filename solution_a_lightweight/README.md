@@ -65,9 +65,22 @@ A/B 共用的纯算法（退化签名映射、各向异性先验、重投影方�
 
 ## 5. 与 Super-LIO 的接入点
 
+`super_lio` 只当**公共库**用：`find_package(super_lio REQUIRED)` + 链接 `super_lio::lio`，
+不复制、不改 Super-LIO 源码。方案 A 自己是完整可执行 `visual_a_app`（同进程内
+Super-LIO 主干 + 视觉支路），与纯 LIO 的 `super_lio_node` 互不影响。
+
 - 传播 / LiDAR 更新 / 地图：`third_party/Super-LIO/src/super_lio/include/lio/ESKF.h`、`super_lio.h`、`include/OctVoxMap/OctVoxMap.hpp`，**保持不改**。
 - 视觉更新：在 LiDAR 更新之后、地图插入之前插入一次可选更新；`VisualUpdate` 只返回增量，由宿主注入。
 - 地图插入顺序按原逻辑执行，方案 A 不引入延迟提交（该问题在方案 B 处理）。
+
+视觉约束写回 ESKF 只有两种合法形态，两者都在同一进程内完成：
+
+| 形态 | 用法 | 当前状态 |
+| --- | --- | --- |
+| 状态回灌 | 视觉增量只更新 A 自己的修正轨迹缓存，LIO 侧不动 | A 采用（§8.2 `update.reinject`） |
+| 代码级注入 | `SuperLIO::ExternalObserve()` → `ESKF::UpdateObserveFull(H, r, R)` | A 未启用，B 已实现（见 [B README §5.1](../solution_b_tight_coupled/README.md)） |
+
+不通过话题把位姿"灌回" LIO：那是外部回灌，会破坏 LIO 自己的观测更新语义。
 
 ## 6. ROS2 接口（实际接入，NTU 配置 `config/visual_a_ntu.yaml`）
 

@@ -109,6 +109,15 @@ class UnifiedEstimator {
   /// 最近一次视觉更新的诊断量。
   const VisualDiagnostics& visualDiagnostics() const { return vis_diag_; }
 
+  /// 最近一次视觉更新实际施加的法方程（6×6 H、6×1 b）。
+  /// 已包含 quality 权重与信息量上限缩放，可直接等价地写回 Super-LIO 的 ESKF。
+  struct AppliedVisualConstraint {
+    bool valid{false};
+    Eigen::MatrixXd H;  ///< 6x6，相机位姿（世界系左扰动）
+    Eigen::VectorXd b;  ///< 6x1
+  };
+  const AppliedVisualConstraint& appliedVisual() const { return applied_; }
+
  private:
   /// 信息形式更新：P^-1 <- P^-1 + w·H，dx = -P_new·w·b。
   /// max_* > 0 时按各块上限对 dx 做整体等比限幅（发散防线）。
@@ -129,6 +138,7 @@ class UnifiedEstimator {
   Options options_;
   FilterState filter_;
   VisualDiagnostics vis_diag_;
+  AppliedVisualConstraint applied_;
 };
 
 }  // namespace superlivo_b

@@ -106,6 +106,7 @@ void UnifiedEstimator::lidarUpdate(const Eigen::MatrixXd& H, const Eigen::Vector
 }
 
 void UnifiedEstimator::visualUpdate(const VisualUpdateInput& input) {
+  applied_.valid = false;
   if (!options_.enable_visual) {
     return;
   }
@@ -220,6 +221,12 @@ void UnifiedEstimator::visualUpdate(const VisualUpdateInput& input) {
       b *= scale;
     }
   }
+
+  // 记录本帧等效法方程（6 维相机位姿，含 info-cap 缩放与 weight），
+  // 供桥接等价写回 Super-LIO 的 ESKF（H 在统一状态里是 30x30，这里只留位姿块）。
+  applied_.valid = true;
+  applied_.H = (weight * diag.scale) * H_cam;
+  applied_.b = (weight * diag.scale) * input.b;
 
   // 步长限幅：单帧视觉修正不超过 0.5°/0.02 m（旋转/平移）。
   // 这是发散的最后防线：即使残差/Jacobian 有系统性错误，也不可能把状态一步甩飞。
