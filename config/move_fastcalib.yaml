@@ -1,0 +1,126 @@
+/**:
+  ros__parameters:
+    common:
+      img_topic: "/left_camera/image"
+      lid_topic: "/livox/lidar"
+      imu_topic: "/livox/imu"
+      img_en: 1
+      lidar_en: 1
+      ros_driver_bug_fix: false
+      livox_msg_type: "livox_ros_driver2"
+
+    extrin_calib:
+      # FAST-Calib (FAST-Calib-ROS2, all_ros2_pc2 + img_0120.png, RMSE 7.9 mm)
+      # 语义 p_cam = Rcl * p_lidar + Pcl
+      Rcl: [-0.014614, -0.999822, -0.011946,
+             0.482153,  0.003420, -0.876081,
+             0.875965, -0.018563,  0.482017]
+      Pcl: [0.029463, -0.168116, -0.047853]
+      extrinsic_T: [0.011, 0.02329, -0.04412]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+
+    camera:
+      # vikit 的 PinholeCamera 只做针孔投影，不使用 cam_d0..d3；而 FAST-Calib
+      # 求 Rcl/Pcl 时是先把图像去畸变（cv::undistort）、再用纯针孔 K 投影。
+      # 因此图像入 VIO 前必须按同一套畸变模型去畸变，否则投影位置与原始畸变图
+      # 不一致（全场中位 6 px、最大 11 px 偏移），表现为标定板中心尚可、墙面与
+      # 门框边缘明显着色错位。
+      undistort_en: true
+      dist_coeffs: [0.054466418090825280, -0.045147373415016401,
+                    0.0000085461102120314711, 0.0010486594840736336]
+
+    time_offset:
+      # IMU 与雷达同一设备时钟；+0.104 s 是雷达 header=扫描起始 vs IMU=即时 的语义差，不补偿。
+      imu_time_offset: 0.0
+      # 两路时钟基准不同：图像 header 用主机时钟，IMU/雷达 header 用设备时钟。
+      # 用 IMU（header=采样瞬时，无累积延迟）标定设备-主机差：
+      #   move.bag: median(rec - hdr_imu) = 204262818.9974
+      #   all.bag : median(rec - hdr_imu) = 204262819.0116
+      # 雷达的 rec-hdr 比 IMU 大 ~0.104 s，是 header=扫描起始造成的延迟，不能用来定偏移。
+      img_time_offset: -204262818.9974
+      exposure_time_init: 0.0
+
+    rolling_shutter:
+      # 相机为 MV-CB013-A0UC-S：1/2" CMOS 全局快门，1280x1024，4.8um 像元。
+      # 全局快门整帧同时曝光，不存在自上而下的逐行读出时差；若仍按 11.01 ms
+      # 行读出时间给每个特征点加时间位移，等于向 VIO 注入与像点高度相关的假运动。
+      # 因此必须关闭 RS 补偿与 td 在线估计。
+      enable: false
+      tr_readout: 0.0
+      anchor_factor: 0.5
+      debug_print: false
+      td_estimate_enable: false
+      td_step_alpha: 0.1
+      td_step_cap: 0.0005
+      td_lambda: 100.0
+      td_min_jac_sq: 1.0
+
+    preprocess:
+      point_filter_num: 1
+      filter_size_surf: 0.1
+      lidar_type: 8 # 8 : Livox Mid-360 LiDAR
+      scan_line: 4
+      blind: 0.1
+
+    vio:
+      max_iterations: 5
+      outlier_threshold: 100
+      img_point_cov: 100
+      patch_size: 8
+      patch_pyrimid_level: 4
+      normal_en: true
+      raycast_en: false
+      inverse_composition_en: false
+      exposure_estimate_en: true
+      inv_expo_cov: 0.1
+
+    imu:
+      imu_en: true
+      imu_int_frame: 50
+      acc_cov: 0.1
+      gyr_cov: 0.1
+      b_acc_cov: 0.001
+      b_gyr_cov: 0.001
+
+    lio:
+      max_iterations: 5
+      dept_err: 0.02
+      beam_err: 0.15
+      min_eigen_value: 0.005
+      voxel_size: 0.5
+      max_layer: 2
+      max_points_num: 50
+      layer_init_num: [5, 5, 5, 5, 5]
+
+    local_map:
+      map_sliding_en: false
+      half_map_size: 100
+      sliding_thresh: 8.0
+
+    uav:
+      imu_rate_odom: false
+      gravity_align_en: true
+
+    publish:
+      dense_map_en: true
+      pub_effect_point_en: false
+      pub_plane_en: false
+      pub_scan_num: 1
+      blind_rgb_points: 0.0
+
+    evo:
+      seq_name: "move_fastcalib_gs"
+      pose_output_en: true
+
+    pcd_save:
+      pcd_save_en: true
+      type: 0
+      colmap_output_en: false
+      filter_size_pcd: 0.15
+      interval: -1
+
+    image_save:
+      img_save_en: false
+      interval: 1
