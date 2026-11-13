@@ -18,7 +18,7 @@ git submodule update --init --recursive
 | `third_party/basalt` | https://github.com/VladyslavUsenko/basalt.git | master | `0f3b2b5` |
 | `third_party/rpg_svo_pro_open` | https://github.com/uzh-rpg/rpg_svo_pro_open.git | master | `ca371f3` |
 | `third_party/direct_visual_lidar_calibration` | https://github.com/koide3/direct_visual_lidar_calibration.git | main | `02a0dc0` |
-| `third_party/FAST-Calib-ROS2` | https://github.com/MaroSalah02/FAST-Calib-ROS2.git（**无 fork，改动只在本地**） | 本地 `local/mv-cb013` | `1973f15`（未推送，递归克隆后需自行 fork 并 cherry-pick） |
+| `third_party/FAST-Calib-ROS2` | https://github.com/ypat999/FAST-Calib-ROS2.git（fork 自 MaroSalah02/FAST-Calib-ROS2） | main | `bb1e748` |
 
 说明：后两个为相机-雷达外参标定工具（ROS2 版）。Super-LIO 与 FAST-LIVO2-ROS2 为自有 fork：
 Super-LIO 的实验改动在 `no-de-check` / `exp/degeneracy-adaptive` 分支上推进（beam_err/dept_err

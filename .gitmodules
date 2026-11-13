@@ -15,4 +15,4 @@
 	url = https://github.com/koide3/direct_visual_lidar_calibration.git
 [submodule "third_party/FAST-Calib-ROS2"]
 	path = third_party/FAST-Calib-ROS2
-	url = https://github.com/MaroSalah02/FAST-Calib-ROS2.git
+	url = https://github.com/ypat999/FAST-Calib-ROS2.git
