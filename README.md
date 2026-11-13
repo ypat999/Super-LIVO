@@ -13,21 +13,25 @@ git submodule update --init --recursive
 
 | 路径 | 上游仓库 | 分支 | 固定提交 |
 | --- | --- | --- | --- |
-| `third_party/FAST-LIVO2-ROS2` | https://github.com/ypat999/FAST-LIVO2-ROS2.git（fork 自 U-AMC/FAST-LIVO2-ROS2） | main | `b9f931f` |
+| `third_party/FAST-LIVO2-ROS2` | https://github.com/ypat999/FAST-LIVO2-ROS2.git（fork 自 U-AMC/FAST-LIVO2-ROS2） | main | `cc47106` |
 | `third_party/Super-LIO` | https://github.com/ypat999/Super-LIO.git | ros2 → no-de-check → exp/degeneracy-adaptive | `326ed21`（工作区检出 `67c0acd`） |
 | `third_party/basalt` | https://github.com/VladyslavUsenko/basalt.git | master | `0f3b2b5` |
 | `third_party/rpg_svo_pro_open` | https://github.com/uzh-rpg/rpg_svo_pro_open.git | master | `ca371f3` |
 | `third_party/direct_visual_lidar_calibration` | https://github.com/koide3/direct_visual_lidar_calibration.git | main | `02a0dc0` |
-| `third_party/FAST-Calib-ROS2` | https://github.com/MaroSalah02/FAST-Calib-ROS2.git | main | `9fc278d` |
+| `third_party/FAST-Calib-ROS2` | https://github.com/MaroSalah02/FAST-Calib-ROS2.git（**无 fork，改动只在本地**） | 本地 `local/mv-cb013` | `1973f15`（未推送，递归克隆后需自行 fork 并 cherry-pick） |
 
 说明：后两个为相机-雷达外参标定工具（ROS2 版）。Super-LIO 与 FAST-LIVO2-ROS2 为自有 fork：
 Super-LIO 的实验改动在 `no-de-check` / `exp/degeneracy-adaptive` 分支上推进（beam_err/dept_err
 距离自适应方差、K=8 拟合邻域、平面残差软降权等）；FAST-LIVO2-ROS2 的 fork 在上游 `a09599a`
-之上有两批改动：
+之上有三批改动：
 ① `ae28b0c` 修三处功能缺陷——`blind_sqr` 分支未赋值、MID360 话题订阅缺失、发布 odom 的时间戳
 改用 lidar 帧时刻（原为系统时间，评测时会被 evo 判成时间轴错位）；
 ② `b9f931f` 加**滚动淘汰视觉地图点**（`pruneVisualMap`），解决视觉地图随时间线性增长导致长序列
-OOM 的问题，详见「关键实验结论」。其余子模块保持上游原始代码。
+OOM 的问题，详见「关键实验结论」；
+③ `cc47106` 加**图像入 VIO 前去畸变**（参数 `camera.undistort_en` / `camera.dist_coeffs`）：
+vikit PinholeCamera 只做针孔投影（`cam_d0..d3` 读取但不使用），而 FAST-Calib 求 Rcl/Pcl 是
+"先 cv::undistort、再纯针孔 K 投影"，直接拿针孔模型投影原始畸变图在中部差约 9 px、边缘反向
+约差 7 px，表现为墙面/门框边缘着色错位。其余子模块保持上游原始代码。
 
 ## 相机-雷达外参标定流程
 
@@ -42,6 +46,10 @@ OOM 的问题，详见「关键实验结论」。其余子模块保持上游原�
    用环境结构与纹理，**无需标定板也无需初值**。
 
 标定结果写回 SLAM 配置外参，用彩色点云与图像边缘对齐验证（根目录 preview 图流程）。
+
+本机相机（海康 MV-CB013，1280x1024 全局快门）的实测内参与畸变系数归档在
+[`config/camera_intrinsic.yaml`](config/camera_intrinsic.yaml)：`qr_params.yaml` 的内参、
+`config/move_fastcalib.yaml` 的 `camera.dist_coeffs` 均出自该文件（同一标定结果）。
 
 注意：`direct_visual_lidar_calibration` 自带子模块（iridescence 等），需
 `git submodule update --init --recursive` 递归拉取后才能编译。
@@ -183,6 +191,10 @@ python3 /tmp/bench/parse_bench.py slio.log fl2.log vis_a.log vis_b.log <bag时�
 - **自采 2026-10-30 bag**：三种跑法（Super-LIO / FAST-LIVO2 纯 LIO / LIVO）均存在约 17° yaw
   漂移重影，源于 IMU 陀螺零偏（gz≈−0.42°/s）+ 回环未纠正，属数据侧问题；诊断见
   [fastlivo2_bag_yaw_drift_report.html](fastlivo2_bag_yaw_drift_report.html)。
+- **自采 2026-11 move bag（点云上方漂浮"幽灵层"）**：根因是 **bag 内相机话题断流 2.62 s**
+  撞上 `sync_packages` 无降级等待——主线程停摆期间视觉更新用过期关联，生成整片漂浮层。
+  曾尝试"VIO 更新位移护栏"（`vio.pos_jump_thresh`），实验证伪：整 bag 0 次触发、幽灵层不变，
+  临时代码已全部移除。**结论：数据侧问题，只能重录；别再从算法层修这个 bag。**
 - **Retail_Street（HKU 公开数据集）**：必须用官方标定 `camera_pinhole.yaml`（fx≈1293.6）+
   官方 `avia.yaml`（`img_time_offset: 0.1`）；bag 自带 `avia_lvi.yaml`（fx≈906、
   `img_time_offset: 1200.25`）是 DeepRobotics 车载配置，误用会导致 RGB 严重错位。
