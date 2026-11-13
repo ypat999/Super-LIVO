@@ -15,7 +15,7 @@ super_livo_visual_b:
     # LiDAR -> Camera（p_cam = Rcl * P_lidar + Pcl），与方案 A 同一标定结果
     # FAST-Calib 远端标定（all_ros2_pc2 + img_0120.png，RMSE 7.9 mm）
     # holefix：按真实板面法向重解 4 孔心（板厚 15mm 前表面 +1° 扇区最小半径），
-    # 孔心重投影 1.17px(mean)/1.69px(max)，优于 FAST-Calib 原输出 5.83px。
+    # 孔心重投影 1.17px(mean)/1.69px(max)，比 remote7.9 的 1.37px 略优。
     Rcl: [-0.018262, -0.999803, -0.007833,
            0.469345, -0.001655, -0.883013,
            0.882826, -0.019802,  0.469283]

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  FastDDS：只保留 SHM 传输，彻底不建 UDP socket。
+  原因：本机 .wslconfig 为 networkingMode=Mirrored，guest 内的 UDP（含 127.0.0.1）
+  都要经宿主网络驱动栈；FAST-LIVO2 那轮用 CycloneDDS（纯 UDP）+ 原图 republish
+  （1600x1200x3 = 5.76 MB/帧 ≈ 4400 个分片数据报），整轮约 70 GB / 1.6e9 个数据报
+  压在该栈上，触发驱动层内存无法释放。SHM-only 后同机进程间数据走 /dev/shm，
+  发现（SPDP/EDP）也在 SHM 段内，网络栈零参与。
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>shm_only</transport_id>
+        <type>SHM</type>
+        <maxMessageSize>16777216</maxMessageSize>
+        <segment_size>536870912</segment_size>
+        <port_queue_capacity>1024</port_queue_capacity>
+        <healthy_check_timeout_ms>1000</healthy_check_timeout_ms>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="shm_only_participant" is_default_profile="true">
+      <rtps>
+        <useBuiltinTransports>false</useBuiltinTransports>
+        <userTransports>
+          <transport_id>shm_only</transport_id>
+        </userTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

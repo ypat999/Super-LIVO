@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  CycloneDDS：全部 DDS 流量锁在 lo/127.0.0.1，禁组播，SPDP 走单播 Peer。
+  目的：WSL2 下 guest 内经 eth0(vNIC) 的 UDP 会走宿主驱动层网络栈，大量
+  分片数据报（本仓最重的 1600x1200 原图 republish，一帧 ~5.8 MB -> ~4400 个
+  数据报）会在该层累积出不释放的内存；绑 lo 后数据报只在 guest 内核内环路，
+  完全不接触 vNIC。
+  注：ROS_LOCALHOST_ONLY=1 会失败，是因为它把接口设为 lo 却仍要求组播发现
+  （"interface lo is not multicast-capable"）；这里显式关组播 + 单播 Peer 绕开。
+-->
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain Id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="lo" priority="default" multicast="default"/>
+      </Interfaces>
+      <AllowMulticast>false</AllowMulticast>
+      <DontRoute>true</DontRoute>
+    </General>
+    <Discovery>
+      <MaxAutoParticipantIndex>120</MaxAutoParticipantIndex>
+      <SpdpInterval>500ms</SpdpInterval>
+      <Peers>
+        <Peer address="127.0.0.1"/>
+      </Peers>
+    </Discovery>
+    <Internal>
+      <SocketReceiveBufferSize min="1MB" max="32MB"/>
+      <DefragReliableMaxSamples>512</DefragReliableMaxSamples>
+      <DefragUnreliableMaxSamples>512</DefragUnreliableMaxSamples>
+    </Internal>
+  </Domain>
+</CycloneDDS>
