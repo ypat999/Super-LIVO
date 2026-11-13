@@ -18,10 +18,9 @@ git submodule update --init --recursive
 | `third_party/basalt` | https://github.com/VladyslavUsenko/basalt.git | master | `0f3b2b5` |
 | `third_party/rpg_svo_pro_open` | https://github.com/uzh-rpg/rpg_svo_pro_open.git | master | `ca371f3` |
 | `third_party/direct_visual_lidar_calibration` | https://github.com/koide3/direct_visual_lidar_calibration.git | main | `02a0dc0` |
-| `third_party/livox_camera_calib` | https://github.com/yeyiru/livox_camera_calib_ros2.git | ros2 | `fb0dd4c` |
-| `third_party/livox_camera_lidar_calibration` | https://github.com/DGUCCL7103/Livox_Camera_LiDAR_Calibration_ROS2.git | main | `cdb7f73` |
+| `third_party/FAST-Calib-ROS2` | https://github.com/MaroSalah02/FAST-Calib-ROS2.git | main | `9fc278d` |
 
-说明：后三个为相机-雷达外参标定工具（ROS2 版）。Super-LIO 与 FAST-LIVO2-ROS2 为自有 fork：
+说明：后两个为相机-雷达外参标定工具（ROS2 版）。Super-LIO 与 FAST-LIVO2-ROS2 为自有 fork：
 Super-LIO 的实验改动在 `no-de-check` / `exp/degeneracy-adaptive` 分支上推进（beam_err/dept_err
 距离自适应方差、K=8 拟合邻域、平面残差软降权等）；FAST-LIVO2-ROS2 的 fork 在上游 `a09599a`
 之上有两批改动：
@@ -32,16 +31,17 @@ OOM 的问题，详见「关键实验结论」。其余子模块保持上游原�
 
 ## 相机-雷达外参标定流程
 
-三个标定子模块按"板子初标 + 大场景精修"两步使用（标定板轻微弯曲不影响最终精度，
-精修环节不依赖板子）：
+两个标定子模块，分别对应"标定板"与"无目标"两条路线：
 
-1. **初标**：`livox_camera_lidar_calibration`（棋盘角点法）获取大致外参；
-2. **精修**（二选一）：
-   - `livox_camera_calib`：Livox 非重复扫描专用，场景边缘像素级点对线对齐，
-     支持多场景联合优化，带 rough calibration 兜底坏初值；
-   - `direct_visual_lidar_calibration`：全自动直接视觉-雷达配准，**无需初值**，
-     板子弯曲严重时可直接用它跳过初标；
-3. 精修结果写回 SLAM 配置外参，用彩色点云与图像边缘对齐验证（根目录 preview 图流程）。
+1. **标定板**：`FAST-Calib-ROS2` —— 目标板为四 ArUco + 四圆孔（板型基于
+   `velo2cam_calibration`），图像侧检 ArUco 角点、雷达侧检圆孔中心，PnP 求外参，
+   **不需要初值**，单场景即可出结果，多场景联合可进一步提升精度。
+   参数在 `third_party/FAST-Calib-ROS2/config/qr_params.yaml`（内参 + 板尺寸 +
+   距离滤波范围）。
+2. **无目标**：`direct_visual_lidar_calibration` —— 全自动直接视觉-雷达配准，
+   用环境结构与纹理，**无需标定板也无需初值**。
+
+标定结果写回 SLAM 配置外参，用彩色点云与图像边缘对齐验证（根目录 preview 图流程）。
 
 注意：`direct_visual_lidar_calibration` 自带子模块（iridescence 等），需
 `git submodule update --init --recursive` 递归拉取后才能编译。
