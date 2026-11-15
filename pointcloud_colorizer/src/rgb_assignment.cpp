@@ -62,6 +62,40 @@ bool RgbAssigner::assign(const cv::Mat& bgr,
     r = sample(x, y, 2);
   }
 
+  // 邻域均值（可选）：以中心色为基准，剔除跨颜色边缘的像素后再平均，
+  // 降低"落点偏移几像素 → 取到相邻表面"的坏点比例。
+  if (options_.patch_radius > 0) {
+    const int rad = options_.patch_radius;
+    const int cx = static_cast<int>(std::lround(u));
+    const int cy = static_cast<int>(std::lround(v));
+    float sb = 0.0F;
+    float sg = 0.0F;
+    float sr = 0.0F;
+    int n = 0;
+    for (int dy = -rad; dy <= rad; ++dy) {
+      const int y = cy + dy;
+      if (y < 0 || y >= height) continue;
+      for (int dx = -rad; dx <= rad; ++dx) {
+        const int x = cx + dx;
+        if (x < 0 || x >= width) continue;
+        const float pb = sample(x, y, 0);
+        const float pg = sample(x, y, 1);
+        const float pr = sample(x, y, 2);
+        const float dev = std::max({std::fabs(pb - b), std::fabs(pg - g), std::fabs(pr - r)});
+        if (dev > options_.patch_color_tol) continue;
+        sb += pb;
+        sg += pg;
+        sr += pr;
+        ++n;
+      }
+    }
+    if (n > 0) {
+      b = sb / static_cast<float>(n);
+      g = sg / static_cast<float>(n);
+      r = sr / static_cast<float>(n);
+    }
+  }
+
   // OpenCV 的图像通道顺序是 BGR，这里转成 RGB 写入点云。
   point.rgb = Eigen::Vector3f(std::min(r, 255.0F), std::min(g, 255.0F), std::min(b, 255.0F));
   point.quality = quality;

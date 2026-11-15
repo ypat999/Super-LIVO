@@ -28,6 +28,12 @@ class RgbAssigner {
     bool bilinear{true};          ///< true=双线性插值；false=最近邻
     bool keep_best_quality{true}; ///< true=仅当新质量更高才覆盖（保留最佳颜色）
     float min_quality{0.2F};      ///< 低于该质量的颜色观测直接丢弃
+
+    /// 邻域均值取样：>0 时在 (2r+1)^2 窗口内取均值，用于抑制"投影落点偏几像素
+    /// 就取到相邻表面颜色"造成的重尾色差。默认 0 = 只取插值后的单点，保持旧行为。
+    int patch_radius{0};
+    /// 邻域均值时，与中心色任一通道差超过该值的像素不参与（跨颜色边缘剔除）。
+    float patch_color_tol{20.0F};
   };
 
   explicit RgbAssigner(const Options& options);

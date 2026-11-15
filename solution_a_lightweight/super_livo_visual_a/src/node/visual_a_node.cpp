@@ -85,8 +85,10 @@ VisualANode::VisualANode(const rclcpp::NodeOptions& options)
   cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       cloud_topic, rclcpp::SensorDataQoS(),
       std::bind(&VisualANode::onCloud, this, std::placeholders::_1));
+  // body 云发布端 QoS 不统一：Super-LIO 是 best_effort（lio/cloud_body_dense），FL2 是 reliable。
+  // 订阅端只能取更宽松的 best_effort，否则与 Super-LIO 发布端 RELIABILITY 不兼容，整段收不到云。
   body_cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      body_cloud_topic, rclcpp::SensorDataQoS(),
+      body_cloud_topic, rclcpp::QoS(rclcpp::KeepLast(50)).best_effort(),
       std::bind(&VisualANode::onBodyCloud, this, std::placeholders::_1));
   degen_topic_ = this->declare_parameter<std::string>("degen_topic", "lio/degeneracy");
   degen_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
@@ -273,7 +275,24 @@ void VisualANode::loadParameters() {
   colorizer_options_.rgb.bilinear = this->declare_parameter<bool>("color.bilinear", true);
   colorizer_options_.rgb.keep_best_quality = this->declare_parameter<bool>("color.keep_best_quality", true);
   colorizer_options_.rgb.min_quality = this->declare_parameter<float>("color.min_quality", 0.2F);
+  // 邻域均值取样（默认关闭）：抑制投影落点偏差取到相邻表面颜色。
+  colorizer_options_.rgb.patch_radius = this->declare_parameter<int>("color.patch_radius", 0);
+  colorizer_options_.rgb.patch_color_tol =
+      this->declare_parameter<float>("color.patch_color_tol", 20.0F);
   colorizer_ = std::make_unique<colorizer::ColorizerPipeline>(colorizer_options_);
+
+  // 相机位姿源（官方口径）：publish_frame_world 用 LIO 位姿把点云变到世界系，
+  // 相机位姿却取 VIO 光度修正后的 T_f_w_。两者不是同一条轨迹：只喂 LIO 位姿会让
+  // 投影整体带一个残余姿态误差（实测色差约翻 7 倍）。留空表示与 odom_topic 同源。
+  const std::string cam_odom_topic =
+      this->declare_parameter<std::string>("color.cam_odom_topic", "");
+  if (!cam_odom_topic.empty()) {
+    cam_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+        cam_odom_topic, rclcpp::SensorDataQoS(),
+        std::bind(&VisualANode::onCamOdom, this, std::placeholders::_1));
+    RCLCPP_INFO(this->get_logger(),
+                "相机位姿源: %s（点云世界变换仍用 odom_topic）", cam_odom_topic.c_str());
+  }
 
   // ==========================================================================
   // 彩色地图落盘（把跑完的彩色点云输出为 PCD）
@@ -388,6 +407,32 @@ void VisualANode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
 
   // 新采样到齐后重试待着色帧：图像采集时刻 t_img = t_cloud + img_time_offset，
   // 通常要等到这一帧 odom 发布后才能插值出位姿。
+  if (!pending_color_.empty()) {
+    drainPendingColorization();
+  }
+}
+
+void VisualANode::onCamOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
+  const auto& pose = msg->pose.pose;
+  Eigen::Quaterniond q(pose.orientation.w, pose.orientation.x,
+                       pose.orientation.y, pose.orientation.z);
+  if (q.norm() < 1e-9) {
+    return;
+  }
+  q.normalize();
+  colorizer::PoseSample sample;
+  sample.stamp = rclcpp::Time(msg->header.stamp).seconds();
+  sample.T_wl = Eigen::Matrix4d::Identity();
+  sample.T_wl.block<3, 3>(0, 0) = q.toRotationMatrix();
+  sample.T_wl(0, 3) = pose.position.x;
+  sample.T_wl(1, 3) = pose.position.y;
+  sample.T_wl(2, 3) = pose.position.z;
+  cam_pose_cache_.push_back(sample);
+  if (cam_pose_cache_.size() > max_pose_samples_) {
+    cam_pose_cache_.erase(cam_pose_cache_.begin(),
+                          cam_pose_cache_.begin() +
+                              (cam_pose_cache_.size() - max_pose_samples_));
+  }
   if (!pending_color_.empty()) {
     drainPendingColorization();
   }
@@ -795,14 +840,17 @@ void VisualANode::runColorizer(const sensor_msgs::msg::PointCloud2& cloud_msg) {
 void VisualANode::drainPendingClouds() {
   const auto now = std::chrono::steady_clock::now();
   for (auto it = pending_clouds_.begin(); it != pending_clouds_.end();) {
-    // 显式配对：按 header.stamp（不是 t_img）与 t_cloud 的差值挑最接近的一帧图像。
+    // 官方口径配对：img_time_buffer 存的是 header + img_time_offset，官方按"该值
+    // 最接近 LIO 时刻（= t_cloud）"取图，即图像真实采集时刻要与点云同刻。
+    // 所以这里比较 |header + img_time_offset - t_cloud|，而不是 |header - t_cloud|。
     const colorizer::TimedImage* chosen = nullptr;
     double best_dt = std::numeric_limits<double>::max();
     for (const auto& image : image_cache_) {
       if (!image.valid || image.image.empty()) {
         continue;
       }
-      const double dt = std::abs(image.arrival_stamp - it->t_cloud);
+      const double dt =
+          std::abs(image.arrival_stamp + img_time_offset_ - it->t_cloud);
       if (dt < best_dt) {
         best_dt = dt;
         chosen = &image;
@@ -868,9 +916,12 @@ bool VisualANode::colorizeFrame(const PendingColorFrame& frame) {
   // 两个时刻的位姿都必须由缓存插值得到，任一失败就稍后重试，绝不静默退回最新位姿。
   Eigen::Matrix4d T_wl_cloud = Eigen::Matrix4d::Identity();
   Eigen::Matrix4d T_wl_img = Eigen::Matrix4d::Identity();
-  if (!poseAtStamp(t_cloud, T_wl_cloud) || !poseAtStamp(t_img, T_wl_img)) {
+  if (!poseAtStamp(t_cloud, T_wl_cloud) || !camPoseAtStamp(t_img, T_wl_img)) {
     return false;
   }
+
+  // 官方口径：点云世界系变换用 LIO 位姿（pose_cache_，见下面的 pose_cache_ 入参），
+  // 相机位姿用 color.cam_odom_topic（VIO 光度修正后的位姿）。
 
   // 统一时间基准：相机位姿取 t_img，点云世界系变换取 t_cloud（由 point_stamps 决定）。
   colorizer::ColorizerPipeline::Options options = colorizer_options_;
@@ -881,8 +932,11 @@ bool VisualANode::colorizeFrame(const PendingColorFrame& frame) {
   // 是否在同步窗口内；位姿已经由 options.T_cl 固定为 t_img 时刻，不再依赖图像时间）。
   colorizer::TimedImage image;
   image.image = frame.image;
-  image.exposure_mid_stamp = frame.t_pair;
-  image.arrival_stamp = frame.t_pair;
+  // 这里必须填"图像真实采集时刻"t_img（≈ t_cloud），而不是 header（t_pair = t_img - offset）。
+  // 流水线用它对 point_stamps（全部 = t_cloud）做同步窗口检查（最大 0.05 s）：
+  // 填 header 会差 0.1 s 直接被判不同步 → 整帧返回空（表现为"0/0 点上色"）。
+  image.exposure_mid_stamp = frame.t_img;
+  image.arrival_stamp = frame.t_img;
   image.valid = true;
   std::vector<colorizer::TimedImage> images_for_frame{std::move(image)};
   std::vector<double> point_stamps(frame.points_lidar.size(), t_cloud);
@@ -937,6 +991,25 @@ bool VisualANode::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
   colorizer::LidarPoseInterpolator interpolator(
       colorizer::LidarPoseInterpolator::Options{kPoseHistoryMaxGapSec});
   for (const auto& sample : cache) {
+    interpolator.addSample(sample);
+  }
+  return interpolator.poseAt(stamp, T_wl);
+}
+
+bool VisualANode::camPoseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
+  if (cam_pose_cache_.empty()) {
+    return poseAtStamp(stamp, T_wl);  // 未配置独立相机位姿源：沿用旧行为
+  }
+  double newest = -std::numeric_limits<double>::max();
+  for (const auto& sample : cam_pose_cache_) {
+    newest = std::max(newest, sample.stamp);
+  }
+  if (stamp > newest) {
+    return false;  // 未来时刻：由调用方延后重试
+  }
+  colorizer::LidarPoseInterpolator interpolator(
+      colorizer::LidarPoseInterpolator::Options{kPoseHistoryMaxGapSec});
+  for (const auto& sample : cam_pose_cache_) {
     interpolator.addSample(sample);
   }
   return interpolator.poseAt(stamp, T_wl);

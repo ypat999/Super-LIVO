@@ -29,10 +29,10 @@
           0.999962, 0.00619598, -0.0060598]
     Pcl: [0.0194384, 0.104689, -0.0251952]
 
-    # 图像真实采集时刻 = header.stamp + img_time_offset（秒），**只用于取相机位姿**，
-    # 不参与图像-点云配对（配对用 header.stamp，实测差 < 7 ms）。
-    # 取值依据同方案 A：官方轨迹重放做 0~0.15 s 扫描，1 cm 体素颜色标准差在 0.10 s 处
-    # 取极小值，且与官方 avia.yaml 的 0.1 一致。
+    # 图像真实采集时刻 = header.stamp + img_time_offset（秒）。
+    # 官方 publish_frame_world 的口径：img_time_buffer 存 header + offset，取最接近
+    # LIO 时刻（= 点云 header）的那一帧；本节点按同一口径配对并取相机位姿。
+    # 官方 avia.yaml 同为 0.1；本数据集实测 header 比点云早 0.0998 s。
     img_time_offset: 0.1
 
     # ========================================================================
@@ -161,6 +161,10 @@
     color.bilinear: true
     color.keep_best_quality: true
     color.min_quality: 0.2
+    # 相机位姿源（官方口径）。留空 = 与 odom_topic 同源（旧行为）；
+    # 接官方 FAST-LIVO2 时填 /vio/odom_lidar：点云世界变换仍用 odom_topic 的
+    # LIO 位姿，相机位姿改用 VIO 光度修正后的位姿。
+    color.cam_odom_topic: ""
 
     # ========================================================================
     # 彩色地图落盘（把跑完的彩色点云输出为 PCD）
@@ -170,3 +174,7 @@
     pcd.save_dir: "/home/ywj/slam_data/pcd"
     pcd.save_interval_sec: 30.0
     pcd.max_points: 20000000
+    # 官方 publish_frame_world 不做任何颜色融合，逐帧逐点保留原始采样。
+    # 1cm 体素时间中位回填会把同体素内所有点写成同一颜色（1cm 体素内色标准差
+    # 5.42 → 0.00，平色体素 100%），平均色 MAE 不变但纹理被抹平 → 显式关闭。
+    pcd.median_voxel_size: 0.0

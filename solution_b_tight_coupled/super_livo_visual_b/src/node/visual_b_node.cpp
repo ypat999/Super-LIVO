@@ -47,6 +47,25 @@ constexpr double kPendingCloudTimeoutSec = 1.0;
 /// 标准重力幅值（m/s²），用于把加计归一化到 m/s²（对齐官方 G_m_s2）。
 constexpr double kGravityNorm = 9.81;
 
+/// 在给定位姿缓存上按时刻插值；查询时刻晚于最新采样时返回 false
+/// （插值器会拿最后一个采样顶替，等于把不同时刻的位姿当成同一时刻）。
+bool poseFromSamples(const std::vector<colorizer::PoseSample>& cache, double stamp,
+                     Eigen::Matrix4d& T_wl) {
+  double newest = -std::numeric_limits<double>::max();
+  for (const auto& sample : cache) {
+    newest = std::max(newest, sample.stamp);
+  }
+  if (stamp > newest) {
+    return false;
+  }
+  colorizer::LidarPoseInterpolator interp(
+      colorizer::LidarPoseInterpolator::Options{kPoseHistoryMaxGapSec});
+  for (const auto& sample : cache) {
+    interp.addSample(sample);
+  }
+  return interp.poseAt(stamp, T_wl);
+}
+
 /// double 秒 -> ROS 时间戳。
 builtin_interfaces::msg::Time toRosStamp(double sec) {
   builtin_interfaces::msg::Time stamp;
@@ -91,17 +110,32 @@ VisualBNode::VisualBNode(const rclcpp::NodeOptions& options)
   const std::string imu_topic = this->declare_parameter<std::string>("imu_topic", "/livox/imu");
 
   // ---- 创建订阅器 ---------------------------------------------------------
-  image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-      image_topic, rclcpp::SensorDataQoS(),
-      std::bind(&VisualBNode::onImage, this, std::placeholders::_1));
+  // 图像订阅 QoS 默认沿用 SensorDataQoS（best_effort，与相机驱动一致）。
+  // image.qos_reliable=true 时改成 reliable/depth 10，与 Rosbag2 回放端一致：
+  // 单线程 executor 被密集点云回调占住时，best_effort 读者会被静默丢样且不恢复
+  // （实测 own 模式整段 0 帧图像，而 reliable 读者同期稳定收到），reliable 则有背压。
+  const bool image_qos_reliable =
+      this->declare_parameter<bool>("image.qos_reliable", false);
+  if (image_qos_reliable) {
+    image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+        image_topic, rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
+        std::bind(&VisualBNode::onImage, this, std::placeholders::_1));
+  } else {
+    image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+        image_topic, rclcpp::SensorDataQoS(),
+        std::bind(&VisualBNode::onImage, this, std::placeholders::_1));
+  }
   odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
       odom_topic, rclcpp::SensorDataQoS(),
       std::bind(&VisualBNode::onOdom, this, std::placeholders::_1));
   cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       cloud_topic, rclcpp::SensorDataQoS(),
       std::bind(&VisualBNode::onCloud, this, std::placeholders::_1));
+  // body 云发布端 QoS 不统一：FL2 是 reliable，Super-LIO 的 lio/cloud_body_dense 是 best_effort。
+  // 订阅端取更宽松的 best_effort 才能同时兼容两者；用 reliable 订阅 best_effort 发布端时
+  // 两端 QoS 不兼容，DDS 直接不投递（实测只有一条 "offering incompatible QoS" 警告，整段 0 帧）。
   body_cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      body_cloud_topic, rclcpp::SensorDataQoS(),
+      body_cloud_topic, rclcpp::QoS(rclcpp::KeepLast(50)).best_effort(),
       std::bind(&VisualBNode::onBodyCloud, this, std::placeholders::_1));
   imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
       imu_topic, rclcpp::SensorDataQoS(),
@@ -313,6 +347,18 @@ void VisualBNode::loadParameters() {
   colorizer_options_.rgb.keep_best_quality = this->declare_parameter<bool>("color.keep_best_quality", true);
   colorizer_options_.rgb.min_quality = this->declare_parameter<float>("color.min_quality", 0.2F);
 
+  // 相机位姿源（官方口径）：点云世界变换用 LIO 位姿，相机位姿用 VIO 光度修正后的位姿。
+  // 留空表示与 odom_topic 同源（旧行为）。
+  const std::string cam_odom_topic =
+      this->declare_parameter<std::string>("color.cam_odom_topic", "");
+  if (!cam_odom_topic.empty()) {
+    cam_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+        cam_odom_topic, rclcpp::SensorDataQoS(),
+        std::bind(&VisualBNode::onCamOdom, this, std::placeholders::_1));
+    RCLCPP_INFO(this->get_logger(),
+                "相机位姿源: %s（点云世界变换仍用 odom_topic）", cam_odom_topic.c_str());
+  }
+
   // ---- 彩色地图落盘（把跑完的彩色点云输出为 PCD） ------------------------
   pcd_save_dir_ = this->declare_parameter<std::string>("pcd.save_dir", "/home/ywj/slam_data/pcd");
   pcd_save_interval_sec_ = this->declare_parameter<double>("pcd.save_interval_sec", 30.0);
@@ -493,6 +539,32 @@ void VisualBNode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
   }
 }
 
+void VisualBNode::onCamOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
+  const auto& pose = msg->pose.pose;
+  Eigen::Quaterniond q(pose.orientation.w, pose.orientation.x,
+                       pose.orientation.y, pose.orientation.z);
+  if (q.norm() < 1e-9) {
+    return;
+  }
+  q.normalize();
+  colorizer::PoseSample sample;
+  sample.stamp = rclcpp::Time(msg->header.stamp).seconds();
+  sample.T_wl = Eigen::Matrix4d::Identity();
+  sample.T_wl.block<3, 3>(0, 0) = q.toRotationMatrix();
+  sample.T_wl(0, 3) = pose.position.x;
+  sample.T_wl(1, 3) = pose.position.y;
+  sample.T_wl(2, 3) = pose.position.z;
+  cam_pose_cache_.push_back(sample);
+  if (cam_pose_cache_.size() > max_pose_samples_) {
+    cam_pose_cache_.erase(cam_pose_cache_.begin(),
+                          cam_pose_cache_.begin() +
+                              (cam_pose_cache_.size() - max_pose_samples_));
+  }
+  if (!pending_color_.empty()) {
+    drainPendingColorization();
+  }
+}
+
 void VisualBNode::onCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
   // lio/cloud_world：世界系点，直接作为 2D-3D 约束的地图点来源。
   pcl::PointCloud<pcl::PointXYZI> cloud;
@@ -569,7 +641,11 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   //    真正的采集时刻在 LiDAR 钟上是 stamp + img_time_offset_。
   //    取位姿、发布 odom 都必须用这个时刻，否则整条轨迹恒落后 LIO 0.1 s。
   const double t_pose = stamp + img_time_offset_;
-  if (!poseAtStamp(t_pose, T_wl_frame_)) {
+  // 这里必须固定用 /lio/odom（pose_cache_），不能用 poseAtStamp：后者在
+  // color.use_own_odom=true 时查 own_pose_cache_，而 own_pose_cache_ 只在本函数
+  // 末尾（估计器更新后）才写入，两者构成循环依赖 —— own 模式下首帧永远等不到位姿，
+  // 视觉帧 0 条、own 缓存恒空，着色全部"等待位姿超时"，最终 0 点产物。
+  if (!poseFromSamples(pose_cache_, t_pose, T_wl_frame_)) {
     // 插值失败 = 位姿历史里有 >0.5 s 的空洞（Super-LIO 偶发丢帧，实测 20 处）。
     // 此时退回"最新位姿"会把视觉注入锚到最多 0.7 s 前的位姿上，实测造成 0.75 m
     // 瞬跳；宁可丢这一帧（少一个采样），也不要发布错误时间的位姿。
@@ -986,7 +1062,10 @@ void VisualBNode::drainPendingClouds() {
       if (!image.valid || image.image.empty()) {
         continue;
       }
-      const double dt = std::abs(image.arrival_stamp - it->t_cloud);
+      // 官方口径配对：img_time_buffer 存 header + img_time_offset，官方按"该值最接近
+      // LIO 时刻（= t_cloud）"取图，即图像真实采集时刻与点云同刻。
+      // 所以比较 |header + img_time_offset - t_cloud|，而不是 |header - t_cloud|。
+      const double dt = std::abs(image.arrival_stamp + img_time_offset_ - it->t_cloud);
       if (dt < best_dt) {
         best_dt = dt;
         chosen = &image;
@@ -1078,7 +1157,7 @@ bool VisualBNode::colorizeFrame(const PendingColorFrame& frame) {
   const double t_img = frame.t_img;
 
   Eigen::Matrix4d T_wl_img = Eigen::Matrix4d::Identity();
-  if (!poseAtStamp(t_img, T_wl_img)) {
+  if (!camPoseAtStamp(t_img, T_wl_img)) {
     return false;  // 未来时刻的位姿还没发布，稍后重试
   }
 
@@ -1089,8 +1168,11 @@ bool VisualBNode::colorizeFrame(const PendingColorFrame& frame) {
   // 只把选中的图像交给流水线，时间戳按"配对时刻"给出（流水线只用它判断同步窗口）。
   colorizer::TimedImage image;
   image.image = frame.image;
-  image.exposure_mid_stamp = frame.t_pair;
-  image.arrival_stamp = frame.t_pair;
+  // 必须填"图像真实采集时刻"t_img（≈ t_cloud），而不是 header（t_pair = t_img - offset）：
+  // 流水线用它和 point_stamps（全部 = t_cloud）做同步窗口检查（0.05 s），
+  // 填 header 会差 0.1 s 被判不同步，整帧返回空（"0/0 点上色"）。
+  image.exposure_mid_stamp = frame.t_img;
+  image.arrival_stamp = frame.t_img;
   image.valid = true;
   std::vector<colorizer::TimedImage> images_for_frame{std::move(image)};
   std::vector<double> point_stamps(frame.points_lidar.size(), t_cloud);
@@ -1127,22 +1209,14 @@ bool VisualBNode::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
   // 查询时刻晚于最新采样时必须拒绝：插值器会直接用最后一个采样顶替，
   // 那等于把 t_img 的位姿退化成 t_cloud 的位姿，offset 就白加了。
   // 轨迹源由 color.use_own_odom 决定：默认 /lio/odom；true 时用统一估计器修正位姿。
-  const std::vector<colorizer::PoseSample>& cache =
-      color_use_own_odom_ ? own_pose_cache_ : pose_cache_;
-  double newest = -std::numeric_limits<double>::max();
-  for (const auto& sample : cache) {
-    newest = std::max(newest, sample.stamp);
-  }
-  if (stamp > newest) {
-    return false;
-  }
+  return poseFromSamples(color_use_own_odom_ ? own_pose_cache_ : pose_cache_, stamp, T_wl);
+}
 
-  colorizer::LidarPoseInterpolator interp(
-      colorizer::LidarPoseInterpolator::Options{kPoseHistoryMaxGapSec});
-  for (const auto& sample : cache) {
-    interp.addSample(sample);
+bool VisualBNode::camPoseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
+  if (cam_pose_cache_.empty()) {
+    return poseAtStamp(stamp, T_wl);  // 未配置独立相机位姿源：沿用旧行为
   }
-  return interp.poseAt(stamp, T_wl);
+  return poseFromSamples(cam_pose_cache_, stamp, T_wl);
 }
 
 void VisualBNode::buildLidarPrior(const Eigen::Matrix4d& T_wl,

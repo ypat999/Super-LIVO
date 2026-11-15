@@ -78,6 +78,10 @@ class VisualANode : public rclcpp::Node {
   /// 里程计回调：更新当前 T_wl，并累积位姿采样（供彩色点云运动补偿）。
   void onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg);
 
+  /// 相机位姿回调（color.cam_odom_topic，官方口径下是 VIO 修正后的 LiDAR 位姿）。
+  /// 只累积到 cam_pose_cache_，仅用于给图像取相机位姿，不参与点云世界变换。
+  void onCamOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg);
+
   /// 退化签名回调：Super-LIO 每帧观测 Hessian 的退化条件数与最弱方向（世界系）。
   /// 布局：[cond6, axes, active, cond_t, evt_min, ux, uy, uz]
   void onDegeneracy(const std_msgs::msg::Float64MultiArray::ConstSharedPtr& msg);
@@ -132,6 +136,11 @@ class VisualANode : public rclcpp::Node {
   /// 同 poseAtStamp 的插值规则，但只查修正轨迹缓存 own_pose_cache_
   /// （状态回灌 update.reinject=true 时用作视觉基准位姿）。
   bool poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl) const;
+
+  /// 相机位姿插值。官方 publish_frame_world 的口径是"点云世界变换用 LIO 位姿，
+  /// 相机位姿用 VIO 光度修正后的位姿"，两者不是同一路轨迹。配置了
+  /// color.cam_odom_topic 时用该话题的采样，否则退化为 poseAtStamp（同一路位姿）。
+  bool camPoseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const;
 
   // ---- 辅助 ----------------------------------------------------------------
   /// 图像去畸变（保持输入分辨率）。
@@ -221,6 +230,8 @@ class VisualANode : public rclcpp::Node {
   std::vector<colorizer::TimedImage> image_cache_;
   /// 位姿采样缓存（T_wl），供彩色点云逐点运动补偿。
   std::vector<colorizer::PoseSample> pose_cache_;
+  /// 相机位姿采样缓存（color.cam_odom_topic）。为空表示与 pose_cache_ 同源。
+  std::vector<colorizer::PoseSample> cam_pose_cache_;
   /// LiDAR 局部地图点（世界系），由 lio/cloud_world 累积。
   std::vector<Eigen::Vector3d> local_map_;
   /// 当前扫描点（世界系），局部地图稀疏时的兜底。
@@ -245,6 +256,7 @@ class VisualANode : public rclcpp::Node {
   // ---- 订阅器 / 发布器 -----------------------------------------------------
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr cam_odom_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr body_cloud_sub_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr degen_sub_;

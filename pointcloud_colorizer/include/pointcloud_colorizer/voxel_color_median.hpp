@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <unordered_map>
 
 #include <Eigen/Core>
@@ -21,6 +22,11 @@ namespace colorizer {
 class VoxelColorMedian {
 public:
   // K = 最近观测帧数（偶数），中位数 = 第 K/2 与第 K/2+1 排序元素的均值。
+  // 5cm 体素平均色 MAE 实测：K=6 → 5.91；K=3 → 6.14；K=24 → 6.13，K=6 已饱和。
+  // 但该指标看不见纹理损失：回填会把同体素内所有点写成同一颜色，
+  // 1cm 体素内色标准差从 5.42 掉到 0.00（平色体素 100%），官方参考为 5.66。
+  // 抹平纹理是肉眼"发糊/不实"的主因，故生产配置已关闭（pcd.median_voxel_size=0.0），
+  // 本类保留为可选后处理。
   static constexpr int K = 6;
 
   VoxelColorMedian() = default;
@@ -36,9 +42,11 @@ public:
   size_t size()    const { return map_.size(); }
   void   clear()         { map_.clear(); }
 
-  /// 条目上限（防止长时间运行内存无界增长）。
+  /// 条目上限（可选，用于限制长时间运行的内存）。
   /// 每个条目 = 12 B 键 + 20 B 观测 + 哈希开销 ≈ 60 B；3e6 条约 200 MB。
-  /// 达到上限后只更新已存在的体素，不再接纳新体素（颜色覆盖范围冻结，内存恒定）。
+  /// 达到上限后只更新已存在的体素，不再接纳新体素（颜色覆盖范围冻结）。
+  /// 默认不限制：Retail_Street 整段约 9.6e6 个 1 cm 体素（≈570 MB），
+  /// 3e6 在上半段就饱和，之后新出现的体素永远拿不到颜色。
   void set_max_entries(std::size_t n) { max_entries_ = n; }
   std::size_t max_entries() const { return max_entries_; }
 
@@ -127,7 +135,7 @@ private:
   float inv_     = 0.0f;
   bool  enabled_ = false;
 
-  std::size_t max_entries_ = 3000000;  // 硬上限，见 set_max_entries()
+  std::size_t max_entries_ = std::numeric_limits<std::size_t>::max();  // 默认不限制
 
   std::unordered_map<Key, Entry, KeyHash> map_;
 };

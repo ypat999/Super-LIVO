@@ -1,5 +1,118 @@
 # Super-LIVO
-Integrate Super-LIO and SVO under FAST-LIVO2 framework
+
+[![ROS2 Humble](https://img.shields.io/badge/ROS2-Humble-blue.svg)](https://docs.ros.org/en/humble/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+基于 ROS2 Humble 的 LiDAR–视觉–惯性里程计（LIVO）研究仓库：以 Super-LIO 为定位主干，外挂两条视觉纠正支路（**A 轻量 / B 紧耦合**），官方 FAST-LIVO2 作为"同问题、不同解法"的对照系。
+
+## 项目简介
+
+核心问题只有一个：**当 LiDAR 几何约束退化（长走廊、无特征空间）时，视觉约束能不能、以及以多大算力代价把位姿拉回来。**
+
+- 主干不改滤波器结构、不改地图结构：视觉以观测的形式注入 Super-LIO 的 ESIKF（方案 A 走退化门控 + 状态回灌，方案 B 走统一 ESIKF + MSCKF 多帧约束 + 跨代绝对锚点）。
+- 退化度量不自造：两条支路都只消费 Super-LIO 的 `/lio/degeneracy` 真度量。
+- 附带与定位解耦的**彩色点云**组件，用于外参精度与同步质量的目视核验。
+
+**硬件**：Livox Avia / Mid-360 + 全局快门相机 + 集成 IMU；实机平台 RK3588S（A76 大核 4–7）。
+**评测数据**：NTU VIRAL `eee_03`、RTK-SLAM Dataset（全站仪 <1 cm 真值）、HKU Retail_Street、自采 bag。
+
+## Highlights
+
+- **两套方案均已实现并接入 ROS2 节点**：A 视觉合计 21.9 ms/帧（RK3588 单大核），B 具备独立短期运动估计能力（Patch 前端 + MSCKF）。
+- **退化对抗有重复实验支撑**（NTU 走廊裁剪 ×8 次单跑）：方案 B 8/8 次不劣于同 bag LIO，终点误差跨跑散布从 LIO 的 55× 压到 15×（均值 −73% / 中位数 −50%）。
+- **完整相机-雷达外参标定链路**：标定板（FAST-Calib-ROS2，自有 fork）与无目标（direct_visual_lidar_calibration）两条路线，含板面法向退化等真实问题的修正记录（孔心重投影 5.83 → 1.17 px）。
+- **评测与测速工具链**：官方协议 ATE（`tools/odom_vs_gt.py`）、三层点云偏差（`tools/rtk_pcdev.py`）、RK3588 绑核公平测速（[speed_test.md](speed_test.md)）。
+- **踩坑全部写在文档里**：FAST-LIVO2 长序列 OOM 的成因与修复、测速公平性口径、数据集标定误用等，见「关键实验结论」。
+
+## 更新日志
+
+- **2026-11**：标定板法向退化修正（holefix）重标 A/B 外参，四孔重投影 5.83 → 1.17 px；FAST-Calib-ROS2 改动推入自有 fork（`bb1e748`）。见「相机-雷达外参标定流程」。
+- **2026-11**：官方 FAST-LIVO2 长序列 OOM 修复（视觉地图点滚动淘汰，fork `b9f931f`），本机 23 GB 内存跑满 99.3% 数据时长。
+- **2026-11**：方案 B 退化对抗 8 次重复实验定版；选轨 O(n²) 耗时修复（单帧最坏 422 → 2.1 ms）。
+
+## Quick Start（环境与构建）
+
+环境：Ubuntu 22.04 + ROS2 Humble（x86 开发机与 RK3588S 实机同一套构建流程）。
+
+```bash
+# 1. 系统依赖（新机器一次性）
+sudo apt install -y ros-humble-desktop ros-humble-cv-bridge ros-humble-image-transport \
+  ros-humble-pcl-ros ros-humble-tf2-ros libeigen3-dev libpcl-dev libopencv-dev \
+  libboost-all-dev libgoogle-glog-dev libgflags-dev libyaml-cpp-dev
+
+# 2. 递归克隆（依赖以 submodule 固定在 third_party/ 下）
+git clone --recursive https://github.com/ypat999/Super-LIVO.git
+cd Super-LIVO
+
+# 3. 构建 LIO 核（super_lio 既是纯 LIO 基线，也是对下游暴露的库）
+source /opt/ros/humble/setup.bash
+cd third_party/Super-LIO
+colcon build --packages-select super_lio --cmake-args -DCMAKE_BUILD_TYPE=Release
+cd ../..
+
+# 4. 构建公共库、着色组件与 A/B 两套方案
+source third_party/Super-LIO/install/setup.bash
+colcon build --packages-select super_livo_common pointcloud_colorizer \
+  super_livo_visual_a super_livo_visual_b --cmake-args -DCMAKE_BUILD_TYPE=Release
+```
+
+- **必须 Release 构建**：Debug 下着色耗时从 4~5 ms 劣化到几十 ms。
+- `direct_visual_lidar_calibration` 自带子模块（iridescence 等），需 `git submodule update --init --recursive` 递归拉取后才能编译。
+- bag 回放、绑核测速、评测命令与已知坑见 [freqcmd.txt](freqcmd.txt)；两套方案的算法细节见 [solution_a_lightweight](solution_a_lightweight/README.md) / [solution_b_tight_coupled](solution_b_tight_coupled/README.md) 的 README。
+
+## 方案目录
+
+设计说明见 [gpt双方案设计.md](gpt双方案设计.md)。两套方案**均已实现算法并接入 ROS2 节点**，
+在 NTU VIRAL `eee_03` 上完成评测：
+
+| 目录 | 方案 | 内容 |
+| --- | --- | --- |
+| [solution_a_lightweight](solution_a_lightweight/README.md) | A：极致轻量化 | Super-LIO + FAST/PyrLK + 2D-3D 重投影 + 退化门控（消费 `/lio/degeneracy` 真度量）+ 状态回灌（`update.reinject`） |
+| [solution_b_tight_coupled](solution_b_tight_coupled/README.md) | B：紧耦合 | Patch 前端 + 特征生命周期/关键帧地图 + MSCKF 多帧约束 + 统一 ESIKF + 延迟地图提交；LiDAR 地图绝对锚定 + 历史锚点保持 + 退化感知先验与守卫 |
+| [pointcloud_colorizer](pointcloud_colorizer/README.md) | 共用组件 | 彩色点云独立包（A/B 共用，与定位解耦；逐点运动补偿 + 遮挡剔除 + 1cm 体素时间中位抗椒盐） |
+| [common/super_livo_common](common/super_livo_common/README.md) | 共用组件 | A/B 共用的纯算法头文件库：退化签名映射、各向异性先验、重投影测量方差（口径只改一处） |
+
+### 公共库与独立可执行
+
+`third_party/Super-LIO` 的 `super_lio` 只作为**公共代码库**被引用
+（`find_package(super_lio REQUIRED)` + `super_lio::lio`），A/B 各自是完整、独立可执行的方案：
+
+| 可执行 | 所属 | 内容 |
+| --- | --- | --- |
+| `super_lio_node` | `third_party/Super-LIO` | 纯 LIO 基线，不含任何视觉代码 |
+| `visual_a_app` | `solution_a_lightweight` | 同进程：Super-LIO 主干 + 方案 A 视觉支路 |
+| `visual_b_app` | `solution_b_tight_coupled` | 同进程：Super-LIO 主干 + 方案 B 视觉支路 + 视觉约束写回 ESIKF |
+
+`super_lio` 对下游只暴露两个与视觉无关的通用扩展点，默认路径逐位不变：
+
+- `virtual void ExternalObserve()`：每帧 LiDAR 更新（含信任域裁决）之后、建图与输出之前的空钩子；
+- `ESKF::UpdateObserveFull(H, r, R)`：任意维观测更新（H 列序为 18 维误差状态）。
+
+## 与官方 FAST-LIVO2 的差异
+
+先说定位：A/B **不是从 FAST-LIVO2 改出来的**，而是挂在 Super-LIO 外部的视觉节点；官方
+FAST-LIVO2 在这里是"同问题、不同解法"的对照系。三者的核心分歧不在估计器（都跑 ESIKF），
+而在**视觉观测怎么构造、以谁为锚点**：
+
+| 维度 | 官方 FAST-LIVO2 | 方案 A（轻量） | 方案 B（紧耦合） |
+| --- | --- | --- | --- |
+| 基座 | 自带 LIO+VIO 一体的 ESIKF | Super-LIO（复用其 ESIKF） | Super-LIO（复用其 ESIKF） |
+| 视觉观测形式 | LiDAR 地图点投影到图像，取 **patch 光度误差**（直接法） | 角点（FAST + PyrLK）+ LiDAR 深度关联，**2D-3D 重投影误差**（几何法） | 同 A 的几何法，另加 **MSCKF 多帧零空间约束** |
+| 视觉锚点来源 | 全局 LiDAR 地图点（地图漂了锚点就漂） | 全局 LiDAR 地图点（同 FL2，深度来自地图） | 地图点 **+ 健康期建立的持久锚点**（跨代绝对锚定，`anchors_` 只在成功观测时刷新 last_seen） |
+| 是否依赖全局地图 | 是 | 是 | 部分否（MSCKF 用多帧位姿三角化，不依赖地图） |
+| 退化处理 | 无显式退化检测，持续融合 | 消费 `/lio/degeneracy`，退化时才注入 + 状态回灌（`update.reinject`） | 消费 `/lio/degeneracy`，cond/sev 映射成先验注入强度，另加先验否决/速度限幅守卫 |
+| 先验信息上限 | 无显式上限 | 有 | 有（`visual_info_ratio` 常态 3× / 退化 10×）+ σ 地板，防止一帧压塌协方差 |
+| 视觉计算量（RK3588 单大核） | LIO 71 + VIO 28 ≈ 99 ms/帧 | 视觉合计 21.9 ms（std 4.7） | 视觉合计 41.8 ms（std 27.2，修复前口径，见下） |
+| 真值精度（NTU eee_03 ATE） | **0.028 m**（最强） | 未单列（对位姿几乎无纠正力） | 见 §9.4，退化段方向稳定 |
+
+一句话概括：
+
+- **FL2 把视觉当"地图的稠密光度校正"**——精度天花板最高，代价是计算最重、且对 LiDAR 地图
+  退化没有专门的对抗手段（地图一漂，光度残差就跟着错）。
+- **A 把视觉当"退化时的稀疏几何补充"**——代价最小，但走廊段可用重投影约束太少
+  （实测 n=0~33），对位姿几乎无纠正力。
+- **B 把视觉当"不依赖地图的多帧几何约束 + 跨代绝对锚点"**——纠正力最强且方向稳定，
+  代价是计算最重、实时性临界。
 
 ## 子模块（third_party）
 
@@ -86,60 +199,6 @@ A 0.122→0.118、B 0.123→0.119），6–9 m 处两点集图像位移 2–6 px
 
 注意：`direct_visual_lidar_calibration` 自带子模块（iridescence 等），需
 `git submodule update --init --recursive` 递归拉取后才能编译。
-
-## 方案目录
-
-设计说明见 [gpt双方案设计.md](gpt双方案设计.md)。两套方案**均已实现算法并接入 ROS2 节点**，
-在 NTU VIRAL `eee_03` 上完成评测：
-
-| 目录 | 方案 | 内容 |
-| --- | --- | --- |
-| [solution_a_lightweight](solution_a_lightweight/README.md) | A：极致轻量化 | Super-LIO + FAST/PyrLK + 2D-3D 重投影 + 退化门控（消费 `/lio/degeneracy` 真度量）+ 状态回灌（`update.reinject`） |
-| [solution_b_tight_coupled](solution_b_tight_coupled/README.md) | B：紧耦合 | Patch 前端 + 特征生命周期/关键帧地图 + MSCKF 多帧约束 + 统一 ESIKF + 延迟地图提交；LiDAR 地图绝对锚定 + 历史锚点保持 + 退化感知先验与守卫 |
-| [pointcloud_colorizer](pointcloud_colorizer/README.md) | 共用组件 | 彩色点云独立包（A/B 共用，与定位解耦；逐点运动补偿 + 遮挡剔除 + 1cm 体素时间中位抗椒盐） |
-| [common/super_livo_common](common/super_livo_common/README.md) | 共用组件 | A/B 共用的纯算法头文件库：退化签名映射、各向异性先验、重投影测量方差（口径只改一处） |
-
-### 公共库与独立可执行
-
-`third_party/Super-LIO` 的 `super_lio` 只作为**公共代码库**被引用
-（`find_package(super_lio REQUIRED)` + `super_lio::lio`），A/B 各自是完整、独立可执行的方案：
-
-| 可执行 | 所属 | 内容 |
-| --- | --- | --- |
-| `super_lio_node` | `third_party/Super-LIO` | 纯 LIO 基线，不含任何视觉代码 |
-| `visual_a_app` | `solution_a_lightweight` | 同进程：Super-LIO 主干 + 方案 A 视觉支路 |
-| `visual_b_app` | `solution_b_tight_coupled` | 同进程：Super-LIO 主干 + 方案 B 视觉支路 + 视觉约束写回 ESKF |
-
-`super_lio` 对下游只暴露两个与视觉无关的通用扩展点，默认路径逐位不变：
-
-- `virtual void ExternalObserve()`：每帧 LiDAR 更新（含信任域裁决）之后、建图与输出之前的空钩子；
-- `ESKF::UpdateObserveFull(H, r, R)`：任意维观测更新（H 列序为 18 维误差状态）。
-
-## 与官方 FAST-LIVO2 的差异
-
-先说定位：A/B **不是从 FAST-LIVO2 改出来的**，而是挂在 Super-LIO 外部的视觉节点；官方
-FAST-LIVO2 在这里是"同问题、不同解法"的对照系。三者的核心分歧不在估计器（都跑 ESIKF），
-而在**视觉观测怎么构造、以谁为锚点**：
-
-| 维度 | 官方 FAST-LIVO2 | 方案 A（轻量） | 方案 B（紧耦合） |
-| --- | --- | --- | --- |
-| 基座 | 自带 LIO+VIO 一体的 ESIKF | Super-LIO（复用其 ESIKF） | Super-LIO（复用其 ESIKF） |
-| 视觉观测形式 | LiDAR 地图点投影到图像，取 **patch 光度误差**（直接法） | 角点（FAST + PyrLK）+ LiDAR 深度关联，**2D-3D 重投影误差**（几何法） | 同 A 的几何法，另加 **MSCKF 多帧零空间约束** |
-| 视觉锚点来源 | 全局 LiDAR 地图点（地图漂了锚点就漂） | 全局 LiDAR 地图点（同 FL2，深度来自地图） | 地图点 **+ 健康期建立的持久锚点**（跨代绝对锚定，`anchors_` 只在成功观测时刷新 last_seen） |
-| 是否依赖全局地图 | 是 | 是 | 部分否（MSCKF 用多帧位姿三角化，不依赖地图） |
-| 退化处理 | 无显式退化检测，持续融合 | 消费 `/lio/degeneracy`，退化时才注入 + 状态回灌（`update.reinject`） | 消费 `/lio/degeneracy`，cond/sev 映射成先验注入强度，另加先验否决/速度限幅守卫 |
-| 先验信息上限 | 无显式上限 | 有 | 有（`visual_info_ratio` 常态 3× / 退化 10×）+ σ 地板，防止一帧压塌协方差 |
-| 视觉计算量（RK3588 单大核） | LIO 71 + VIO 28 ≈ 99 ms/帧 | 视觉合计 21.9 ms（std 4.7） | 视觉合计 41.8 ms（std 27.2，修复前口径，见下） |
-| 真值精度（NTU eee_03 ATE） | **0.028 m**（最强） | 未单列（对位姿几乎无纠正力） | 见 §9.4，退化段方向稳定 |
-
-一句话概括：
-
-- **FL2 把视觉当"地图的稠密光度校正"**——精度天花板最高，代价是计算最重、且对 LiDAR 地图
-  退化没有专门的对抗手段（地图一漂，光度残差就跟着错）。
-- **A 把视觉当"退化时的稀疏几何补充"**——代价最小，但走廊段可用重投影约束太少
-  （实测 n=0~33），对位姿几乎无纠正力。
-- **B 把视觉当"不依赖地图的多帧几何约束 + 跨代绝对锚点"**——纠正力最强且方向稳定，
-  代价是计算最重、实时性临界。
 
 ## RK3588 实机对比测试（怎么测才算公平）
 
@@ -254,7 +313,22 @@ python3 /tmp/bench/parse_bench.py slio.log fl2.log vis_a.log vis_b.log <bag时�
 - **B2 退化分段验证**：录新长走廊退化 bag，按 §7 方法统计 `[VisRot]` 分段接受率/Δyaw，
   验证 χ² 门控在退化段是否自动开门拉回漂移（配置 B 定版前的最后一步）。
   过程与结论见 [B2B3-光流旋转约束实验记录](.trae/documents/B2B3-光流旋转约束实验记录.md)。
-- **彩色点云配准（颜色残差 ICP）**：Colored Point Cloud Registration Revisited，
+- **彩色点云配准（颜色残差 ICP）**：Colored Point Cloud Registration Revisited,
   Park、Zhou、Koltun，ICCV 2017。待测：在点云配准/观测环节引入颜色残差项。
   前置条件：Mid-360 只有反射强度、无 RGB，需先接上着色链路（见 `pointcloud_colorizer`）；
   颜色只对沿墙面等平移退化方向有补充力，**治不了 yaw 漂移**。
+
+## 致谢
+
+本仓库建立并参考于以下开源工作（各子模块固定提交见上表）：
+
+- [Super-LIO](https://github.com/ypat999/Super-LIO)：LIO 主干（自有 fork，实验改动在 `no-de-check` / `exp/degeneracy-adaptive` 分支）；
+- [FAST-LIVO2](https://github.com/hku-mars/FAST-LIVO2) 及其 ROS2 移植 [FAST-LIVO2-ROS2](https://github.com/U-AMC/FAST-LIVO2-ROS2)：对照系统；
+- [rpg_svo_pro_open](https://github.com/uzh-rpg/rpg_svo_pro_open)、[basalt](https://github.com/VladyslavUsenko/basalt)：视觉前端与特征生命周期管理的参考来源；
+- [FAST-Calib](https://github.com/xuankuzcr/FAST-Calib) 及其 ROS2 移植 [FAST-Calib-ROS2](https://github.com/MaroSalah02/FAST-Calib-ROS2)：标定板外参（自有 fork 含 CustomMsg CDR 解析与板面法向先验改动）；
+- [direct_visual_lidar_calibration](https://github.com/koide3/direct_visual_lidar_calibration)：无目标外参；
+- [velo2cam_calibration](https://github.com/beltransen/velo2cam_calibration)：标定板板型来源。
+
+## License
+
+本仓库代码以 [MIT License](LICENSE) 开源；`third_party/` 各子模块遵循其上游原始许可证。
