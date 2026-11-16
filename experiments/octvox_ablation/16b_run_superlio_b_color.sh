@@ -43,6 +43,10 @@ fi
 # 图像订阅用 reliable（与 rosbag2 回放端一致）。默认的 SensorDataQoS(best_effort)
 # 在本机单线程 executor 下会被密集点云回调饿死，整段收不到图像（实测 0 帧）。
 COLOR_EXTRA+=(-p image.qos_reliable:=true)
+# 归因消融用：从环境注入额外的 -p（空格分隔的完整 token，如
+# EXTRA_COLOR='-p color.own_res_max_pos:=0.1 -p color.own_res_max_rot:=0.0087'）。
+# shellcheck disable=SC2206
+COLOR_EXTRA+=(${EXTRA_COLOR:-})
 
 run_one() {
   tag=$1        # lio | own

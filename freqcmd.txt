@@ -1,20 +1,26 @@
-# freqcmd.txt — Super-LIVO 换机/换环境常用命令（测速用）
-# 适用：Ubuntu 20.04/22.04 + ROS2 Humble，Livox Avia + 集成 IMU + 相机（Retail_Street 数据集同款）
-# 换环境时只需改下面的路径变量，其余命令原样可用。
+# freqcmd.txt — Super-LIVO 换机/换环境常用命令（标定 / 跑批 / 测速）
+# 适用：Ubuntu 20.04/22.04 + ROS2 Humble，Livox Avia + 集成 IMU + 相机（MV-CB013，1280x1024）
+# 换环境只需改 §0 的路径变量，其余命令原样可用。最近核对：2026-11-16（外参复标定 + move 三臂跑批）
 
 # ============================================================
 # 0. 路径与环境变量（按需修改）
 # ============================================================
 export REPO=~/git/Super-LIVO                                  # 本仓库
 export DATA=~/slam_data                                       # bag 与结果根目录
-export BAG=$DATA/Retail_Street                                # ROS2 sqlite3 bag（135.47s，/livox/lidar /livox/imu /left_camera/image 640x512 rgb8）
-export DOG_WS=~/dog_slam/LIO-SAM_MID360_ROS2_PKG/ros2         # FAST-LIO2/Point-LIO fork 工作区
-export PL_WS=~/slam_data/pl_ros2_ws                           # 开源 Point-LIO ROS2 移植（SMBU）
+export BAG=$DATA/Retail_Street                                # 公开数据集（135.47s，/left_camera/image 640x512）
+export MOVE_CLK=$DATA/livo_bag/move_livoxclk                  # 自采 move：图像 header 已改写为 Livox 时钟（A/B 用）
+export MOVE_RAW=$DATA/livo_bag/move_ros2                      # 自采 move：图像保留主机时钟（FL2 用，靠 img_time_offset）
+export CALIB_BAG=$DATA/livo_bag/all_ros2                      # 外参标定 bag（静态全段累积，8,260,032 点）
+export CALIB_IMG=$DATA/calib_local/img_0120.png               # 与标定 bag 同姿态的单帧图
+export LIO_WS=~/dog_slam/LIO-SAM_MID360_ROS2_PKG/ros2         # FAST-LIO2/Point-LIO fork 工作区
+export DOG_WS=~/git/3d_dog_navi_ros2                          # livox_ros_driver2 的 fastrtps typesupport（FL2 必需）
+export PL_WS=$DATA/pl_ros2_ws                                 # 开源 Point-LIO ROS2 移植（SMBU）
 export FL2_WS=~/fastlivo2_ws                                  # 官方 FAST-LIVO2 ROS2 移植
 
 # ROS2 通信（WSL/单机必设，否则发现不了节点/丢消息）
 export ROS_LOCALHOST_ONLY=1
 export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+export ROS_DOMAIN_ID=78                                       # 节点 / bag / 录制脚本必须一致
 
 # ============================================================
 # 1. 系统依赖（新机器一次性）
@@ -26,27 +32,31 @@ sudo apt install -y ros-humble-desktop ros-humble-cv-bridge ros-humble-image-tra
 # 注: /usr/bin/time 来自 time 包（测峰值内存用）；WSL 下全部 headless 跑即可（脚本均不带 rviz）
 
 # ============================================================
-# 2. 构建（在各自工作区根目录）
+# 2. 构建（在各自工作区根目录，统一 Release）
 # ============================================================
 # 2.1 Super-LIO（LIO 核）
 source /opt/ros/humble/setup.bash
-source ~/git/3d_dog_navi_ros2/install/setup.bash 2>/dev/null || true   # Super-LIO 依赖的 dog 工作区，换机可缺省
+source $DOG_WS/install/setup.bash 2>/dev/null || true
 cd $REPO/third_party/Super-LIO && colcon build --packages-select super_lio --cmake-args -DCMAKE_BUILD_TYPE=Release
 
-# 2.2 方案A/B 着色（仓库根工作区）
+# 2.2 公共包 + 方案A/B（仓库根工作区）
 cd $REPO && source third_party/Super-LIO/install/setup.bash && \
-colcon build --packages-select pointcloud_colorizer super_livo_visual_a super_livo_visual_b \
+colcon build --packages-select super_livo_common pointcloud_colorizer super_livo_visual_a super_livo_visual_b \
   --cmake-args -DCMAKE_BUILD_TYPE=Release
 # ⚠️ 必须 Release：Debug 下着色耗时从 4~5ms 劣化到几十 ms（见 HANDOVER 2026-11-08）
 
-# 2.3 开源 Point-LIO ROS2（SMBU 移植，对比基线用）
-cd $PL_WS && colcon build --packages-select point_lio
+# 2.3 相机-雷达标定（FAST-Calib-ROS2，自有 fork）
+cd $REPO && source third_party/Super-LIO/install/setup.bash && \
+colcon build --packages-select fast_calib --cmake-args -DCMAKE_BUILD_TYPE=Release
 
 # 2.4 官方 FAST-LIVO2（ROS2 移植，参考轨迹/测速对照）
 cd $FL2_WS && colcon build --packages-select fast_livo
 
+# 2.5 开源 Point-LIO ROS2（SMBU 移植，对比基线用）
+cd $PL_WS && colcon build --packages-select point_lio
+
 # ============================================================
-# 3. 主链路完整跑（Super-LIO + 方案A 上色，输出彩色 PCD）
+# 3. 旧两进程链路（Super-LIO + 方案A 上色，Retail_Street；现推荐 §4 单进程 app）
 # ============================================================
 source /opt/ros/humble/setup.bash
 source $REPO/third_party/Super-LIO/install/setup.bash
@@ -66,41 +76,134 @@ pkill -x super_lio_node; pkill -x visual_a_node
 grep -a "彩色地图已保存" /tmp/vis.log | tail -1
 
 # ============================================================
-# 4. 测速（核心：实时率 = 处理总耗时 / bag 时长 135.47s）
+# 4. move 跑批（三臂：A / B / FL2）
 # ============================================================
-# 4.1 整体墙钟 + 峰值内存（对单个节点）
+# 共用地基：WSL 的 127.0.0.1 UDP 单播路由会让 DDS 只剩多播发现（见 §8），每次跑批前清掉
+ip route del 127.0.0.1 via 169.254.73.152 dev loopback0 table 127 2>/dev/null
+# 建议把 §0 的 ROS_* 导出后再跑；A/B 与 FL2 不要同时跑（同 domain + 同时占 CPU）
+
+# --- 4.1 方案A / 方案B（单进程 app：super_lio + 视觉支路，输入 move_livoxclk）---
+source /opt/ros/humble/setup.bash
+source $REPO/install/setup.bash
+OUT=$DATA/output/move_b                                   # A 换成 move_a
+ros2 run super_livo_visual_b visual_b_app --ros-args \
+  --params-file $REPO/common/super_livo_common/config/lio_move.yaml \
+  --params-file $REPO/solution_b_tight_coupled/super_livo_visual_b/config/visual_b_move.yaml \
+  > /tmp/move_b.log 2>&1 &
+SL=$!
+sleep 5
+python3 $REPO/third_party/Super-LIO/exp/odom_recorder.py --out $OUT/odom.csv --topic /lio/odom > /tmp/rec_b.log 2>&1 &
+REC=$!
+sleep 2
+ros2 bag play $MOVE_CLK --rate 1.0 --disable-keyboard-controls < /dev/null > /tmp/play_b.log 2>&1
+sleep 3; kill -TERM $REC; sleep 2; kill -INT $SL              # SIGINT 触发彩色地图落盘
+for i in $(seq 1 20); do kill -0 $SL 2>/dev/null || break; sleep 2; done; kill -9 $SL 2>/dev/null
+grep -a "彩色统计\|彩色地图已保存" /tmp/move_b.log | tail -2
+# 方案A 只把两处换掉：super_livo_visual_a / visual_a_app 与 visual_a_move.yaml，输出 $DATA/output/move_a
+
+# --- 4.2 FL2（输入 move_ros2；必须先把相机内参并入主参数文件）---
+source /opt/ros/humble/setup.bash
+source $DOG_WS/install/setup.bash          # 提供 livox_ros_driver2 的 fastrtps typesupport（顺序不能反）
+source $FL2_WS/install/setup.bash
+# 把 qr_params.yaml 的 fx/fy/cx/cy/k1/k2/p1/p2 写成 cam_* 字段并合并进 move_fastcalib.yaml
+# （同 experiments/octvox_ablation/07a_wrap_official_cfg.py 的做法，输出 /tmp/fl2_move_cfg.yaml）
+python3 ~/tmp/wrap_move_cfg.py $REPO/config/move_fastcalib.yaml /tmp/fl2_move_cfg.yaml \
+  $REPO/third_party/FAST-Calib-ROS2/config/qr_params.yaml
+OUT=$DATA/output/move_fl2
+ros2 run fast_livo fastlivo_mapping --ros-args --params-file /tmp/fl2_move_cfg.yaml > /tmp/move_fl2.log 2>&1 &
+sleep 8
+python3 $REPO/third_party/Super-LIO/exp/odom_recorder.py --out $OUT/odom.csv --topic /aft_mapped_to_init > /tmp/rec_fl2.log 2>&1 &
+REC=$!
+sleep 3
+ros2 bag play $MOVE_RAW --rate 1.0 --disable-keyboard-controls < /dev/null > /tmp/play_fl2.log 2>&1
+sleep 3; kill -TERM $REC; sleep 2
+pkill -INT -f fastlivo_mapping; for i in $(seq 1 80); do pgrep -f fastlivo_mapping >/dev/null || break; sleep 1; done
+cp $REPO/third_party/FAST-LIVO2-ROS2/Log/pcd/*.pcd $OUT/ 2>/dev/null   # all_raw / all_downsampled
+
+# ============================================================
+# 5. 相机-雷达外参标定（FAST-Calib：静态累积点云 + 单帧图）
+# ============================================================
+# 5.1 改 $REPO/third_party/FAST-Calib-ROS2/config/qr_params.yaml：
+#     bag_path:    $CALIB_BAG      （整段累积，不做运动补偿 → bag 必须全程静止）
+#     image_path:  $CALIB_IMG      （与 bag 同姿态）
+#     bag_paths / image_paths 不要写成空列表 []（会抛 InvalidParameterValueException）；缺省或注释掉即回退单 bag
+# 5.2 跑（节点内部名是 mono_qr_pattern，yaml 顶层是 fast_calib，必须重映射才读得到参数）
+source /opt/ros/humble/setup.bash && source $REPO/install/setup.bash
+ros2 run fast_calib fast_calib --ros-args \
+  --params-file $REPO/third_party/FAST-Calib-ROS2/config/qr_params.yaml -r __node:=fast_calib
+# 或 ros2 launch fast_calib calib_launch.py rviz:=false   （launch 已把节点改名为 fast_calib）
+# 终端输出最终 R/T 与 RMSE；本轮 all_ros2 + img_0120：RMSE 7.9 mm、四孔重投影 1.00/1.62 px（去畸变像素）
+# 5.3 外参落到三份配置（必须一致）：
+#     solution_a_lightweight/super_livo_visual_a/config/visual_a_move.yaml
+#     solution_b_tight_coupled/super_livo_visual_b/config/visual_b_move.yaml
+#     config/move_fastcalib.yaml
+
+# ============================================================
+# 6. 测速（核心：实时率 = 处理总耗时 / bag 时长 135.47s）
+# ============================================================
+# 6.1 整体墙钟 + 峰值内存（对单个节点）
 /usr/bin/time -v ros2 run fast_livo fastlivo_mapping --ros-args --params-file $CFG > node.log 2>&1
 # 结果看 "Elapsed (wall clock)" 与 "Maximum resident set size"
 
-# 4.2 各系统帧内处理耗时（日志自带，单位 s/帧）
+# 6.2 各系统帧内处理耗时（日志自带，单位 s/帧）
 grep -a "Total Processing Time" node.log | tail            # FAST-LIVO2 / Super-LIO 系
 grep -a "耗时\|ms" /tmp/vis.log | tail                     # 方案A：深度/门控/着色分项
+grep -a "彩色统计" /tmp/move_b.log | tail                  # 方案A/B：调用次数 / 着色帧 / 丢弃原因
 # 判据：单帧处理耗时 < 帧周期（lidar 10Hz → 100ms）即实时；累加/均值除以帧数得平均。
 
-# 4.3 对照跑（同 bag 同参数）
+# 6.3 对照跑（同 bag 同参数）
 # 官方 FAST-LIVO2：bash $REPO/experiments/octvox_ablation/07_run_fastlivo2.sh
 # FAST-LIO2 / Point-LIO(dog_slam fork) + 方案A上色：bash .../11_run_colored_lio_bench.sh
 # 开源 Point-LIO(ROS2 SMBU) + 方案A上色：bash .../13_run_colored_pointlio_smbu.sh
 
 # ============================================================
-# 5. 结果核验（点数/跨度/彩色）
+# 7. 结果核验（点数 / 跨度 / 轨迹 / 彩色）
 # ============================================================
-python3 - <<'EOF'
-# 简单 PCD 头核验；完整脚本见 tools/
-import struct, sys
+# 7.1 PCD 头
+python3 - "$DATA/output/move_b/super_livo_visual_b_colored.pcd" <<'EOF'
+import sys
 for p in sys.argv[1:]:
-    f=open(p,'rb'); head=[f.readline().decode().strip() for _ in range(12)]
+    f = open(p, 'rb')
+    head = [f.readline().decode().strip() for _ in range(12)]
     print(p, [h for h in head if h.startswith(('FIELDS','WIDTH','HEIGHT','POINTS','DATA'))])
 EOF
 
+# 7.2 轨迹（odom.csv 列：t_ns,x,y,z,qx,qy,qz,qw,vx,vy,vz）
+python3 - "$DATA/output/move_b/odom.csv" <<'EOF'
+import csv, math, sys
+rows = [r for r in list(csv.reader(open(sys.argv[1])))[1:] if len(r) >= 4]
+p = [(float(r[1]), float(r[2]), float(r[3])) for r in rows]
+t = [float(r[0]) for r in rows]
+print('n=%d span=%.1fs path=%.3fm closed_loop=%.3fm' % (
+    len(p), (t[-1]-t[0])*1e-9,
+    sum(math.dist(p[i], p[i-1]) for i in range(1, len(p))), math.dist(p[0], p[-1])))
+EOF
+# 2026-11-16 基线（move，同一新外参）：A 739 帧 / 9.554 m / 闭环 0.029 m；B 739 帧 / 9.557 m / 0.024 m；
+# FL2 691 帧 / 10.834 m / 0.344 m（其 t≈17 s 有 0.59 m 跳变，与 bag 图像 2.63 s 空洞同窗）。详见 exp_records §38。
+
 # ============================================================
-# 6. 已知坑（换环境大概率踩）
+# 8. 已知坑（换环境大概率踩）
 # ============================================================
+# - WSL 127.0.0.1 UDP 单播不通（最坑）：ip rule 的 ipproto udp lookup 127 命中 table 127 里的
+#   `127.0.0.1 via 169.254.73.152 dev loopback0`，单播被送进不通的 localhost 转发代理，表现为
+#   `ros2 node list` 空、订阅端零数据、只有 SPDP 多播发包。修复（root）：
+#   ip route del 127.0.0.1 via 169.254.73.152 dev loopback0 table 127
 # - ros2 bag play 后台运行必须 --disable-keyboard-controls + < /dev/null，否则提前退出（实测只播 30s）
-# - WSL/单机 DDS：ROS_LOCALHOST_ONLY=1 + FASTDDS_BUILTIN_TRANSPORTS=UDPv4，否则订阅不到
-# - visual_a 落盘在 SIGINT 后 ~50s，别提前 pkill 掉
+# - WSL/单机 DDS：ROS_LOCALHOST_ONLY=1 + FASTDDS_BUILTIN_TRANSPORTS=UDPv4 + 统一 ROS_DOMAIN_ID
+# - 视觉节点落盘在 SIGINT 后 ~50s（彩色地图），别提前 pkill 掉；FL2 的 PCD 在
+#   third_party/FAST-LIVO2-ROS2/Log/pcd/，SIGINT 后要等进程退完再拷（退出时可能 segfault，PCD 已完整落盘）
+# - FL2 启动报 "Type support not from this implementation ... liblivox_ros_driver2__rosidl_typesupport_fastrtps_cpp.so"：
+#   先 source $DOG_WS/install/setup.bash，再 source $FL2_WS/install/setup.bash（顺序不能反）
 # - 编译务必 -DCMAKE_BUILD_TYPE=Release（Debug 着色慢一个数量级）
-# - bag 消息 stamp 是设备时钟域（2000 年纪元），与录制时间差 ~717580s，各传感器一致，不影响同步
-# - 相机内参：Retail_Street 用 1280x1024 全分辨率内参 fx=1293.56944 fy=1293.3155 cx=626.91359 cy=522.799224，
-#   bag 实际 640x512，靠 scale=0.5（FAST-LIVO2 系）/scale=2.0（Point-line 系）折算
+# - FAST-Calib：节点名 mono_qr_pattern vs yaml 顶层 fast_calib → 不加 -r __node:=fast_calib 会静默用默认参数；
+#   bag 必须静止、整段累积；qr_params.yaml 的 bag_paths/image_paths 不能写成空列表 []
+# - 时间基准：bag 消息 stamp 是设备时钟域（2000 年纪元），各传感器一致，不影响同步；但自采 move 的两版 bag
+#   图像时钟不同——move_livoxclk 已改写为 Livox 时钟（A/B 用），move_ros2 保留主机时钟
+#   （FL2 靠 img_time_offset: -204262818.9974 对齐）
+# - 内参分两套：Retail_Street 用 1280x1024 全分辨率 fx=1293.56944 fy=1293.3155 cx=626.91359 cy=522.799224，
+#   bag 实际 640x512，靠 scale=0.5（FAST-LIVO2 系）/scale=2.0（Point-line 系）折算；
+#   自采数据（MV-CB013，1280x1024 原图）：fx=708.631259 fy=708.715136 cx=644.493727 cy=495.883592，
+#   k1=0.05446642 k2=-0.04514737 p1=8.546e-06 p2=1.0487e-03，见 $REPO/config/camera_intrinsic.yaml
 # - 官方 FAST-LIVO2 的 parameter_blackboard 在部分环境不可达：用 07a_wrap_official_cfg.py 把内参并入主参数文件
+# - move bag 本身有图像空洞：/left_camera/image 缺 14.87–17.51 s（2.63 s）与 70.47–71.20 s（0.73 s），
+#   imu/lidar 连续；FL2 在该窗口尾部出现 0.59 m 瞬态跳变（A/B 无），排查中

@@ -18,15 +18,16 @@
 
 ## Highlights
 
-- **两套方案均已实现并接入 ROS2 节点**：A 视觉合计 21.9 ms/帧（RK3588 单大核），B 具备独立短期运动估计能力（Patch 前端 + MSCKF）。
+- **两套方案均已实现并接入 ROS2 节点**：A 视觉合计 21.9 ms/帧（RK3588 单大核），B 具备独立短期运动估计能力（Patch 金字塔 LK 前端 + MSCKF）。
 - **退化对抗有重复实验支撑**（NTU 走廊裁剪 ×8 次单跑）：方案 B 8/8 次不劣于同 bag LIO，终点误差跨跑散布从 LIO 的 55× 压到 15×（均值 −73% / 中位数 −50%）。
-- **完整相机-雷达外参标定链路**：标定板（FAST-Calib-ROS2，自有 fork）与无目标（direct_visual_lidar_calibration）两条路线，含板面法向退化等真实问题的修正记录（孔心重投影 5.83 → 1.17 px）。
+- **完整相机-雷达外参标定链路**：标定板（FAST-Calib-ROS2，自有 fork）与无目标（direct_visual_lidar_calibration）两条路线，含板面法向退化等真实问题的修正记录（孔心重投影 5.83 → 1.00 px）。
 - **评测与测速工具链**：官方协议 ATE（`tools/odom_vs_gt.py`）、三层点云偏差（`tools/rtk_pcdev.py`）、RK3588 绑核公平测速（[speed_test.md](speed_test.md)）。
 - **踩坑全部写在文档里**：FAST-LIVO2 长序列 OOM 的成因与修复、测速公平性口径、数据集标定误用等，见「关键实验结论」。
 
 ## 更新日志
 
-- **2026-11**：标定板法向退化修正（holefix）重标 A/B 外参，四孔重投影 5.83 → 1.17 px；FAST-Calib-ROS2 改动推入自有 fork（`bb1e748`）。见「相机-雷达外参标定流程」。
+- **2026-11**：方案 B 前端与位姿链路加固：Patch 跟踪由单层 SSD 改**金字塔 LK**（Retail_Street 大位移下视觉相对旋转偏 1.5–2° 的问题消除）；`b_own` 速度观测 / 守卫 / 10 Hz 同频三层修复，彩色点云 634 万 → **1711 万点**；新增旋转后处理通道（默认关，eee_01 上 0.1 s 区间旋转 RMS 0.281° → 0.257°，偏航略退化）。见 [方案 B README](solution_b_tight_coupled/README.md#97-patch-前端单层-ssd--金字塔-lk)。
+- **2026-11**：标定板法向退化修正（holefix）重标 A/B 外参，四孔重投影 5.83 → 1.00 px（2026-11-16 用 all bag 全量点云 + 同步后的标定参数复标定：FAST-Calib RMSE 7.9 mm、holefix 1.00/1.62 px）；FAST-Calib-ROS2 改动推入自有 fork（`bb1e748`、`8963f32`）。见「相机-雷达外参标定流程」。
 - **2026-11**：官方 FAST-LIVO2 长序列 OOM 修复（视觉地图点滚动淘汰，fork `b9f931f`），本机 23 GB 内存跑满 99.3% 数据时长。
 - **2026-11**：方案 B 退化对抗 8 次重复实验定版；选轨 O(n²) 耗时修复（单帧最坏 422 → 2.1 ms）。
 
@@ -68,7 +69,7 @@ colcon build --packages-select super_livo_common pointcloud_colorizer \
 | 目录 | 方案 | 内容 |
 | --- | --- | --- |
 | [solution_a_lightweight](solution_a_lightweight/README.md) | A：极致轻量化 | Super-LIO + FAST/PyrLK + 2D-3D 重投影 + 退化门控（消费 `/lio/degeneracy` 真度量）+ 状态回灌（`update.reinject`） |
-| [solution_b_tight_coupled](solution_b_tight_coupled/README.md) | B：紧耦合 | Patch 前端 + 特征生命周期/关键帧地图 + MSCKF 多帧约束 + 统一 ESIKF + 延迟地图提交；LiDAR 地图绝对锚定 + 历史锚点保持 + 退化感知先验与守卫 |
+| [solution_b_tight_coupled](solution_b_tight_coupled/README.md) | B：紧耦合 | Patch 前端（金字塔 LK）+ 特征生命周期/关键帧地图 + MSCKF 多帧约束 + 统一 ESIKF + 延迟地图提交；LiDAR 地图绝对锚定 + 历史锚点保持 + 退化感知先验与守卫 |
 | [pointcloud_colorizer](pointcloud_colorizer/README.md) | 共用组件 | 彩色点云独立包（A/B 共用，与定位解耦；逐点运动补偿 + 遮挡剔除 + 1cm 体素时间中位抗椒盐） |
 | [common/super_livo_common](common/super_livo_common/README.md) | 共用组件 | A/B 共用的纯算法头文件库：退化签名映射、各向异性先验、重投影测量方差（口径只改一处） |
 
@@ -102,7 +103,7 @@ FAST-LIVO2 在这里是"同问题、不同解法"的对照系。三者的核心�
 | 是否依赖全局地图 | 是 | 是 | 部分否（MSCKF 用多帧位姿三角化，不依赖地图） |
 | 退化处理 | 无显式退化检测，持续融合 | 消费 `/lio/degeneracy`，退化时才注入 + 状态回灌（`update.reinject`） | 消费 `/lio/degeneracy`，cond/sev 映射成先验注入强度，另加先验否决/速度限幅守卫 |
 | 先验信息上限 | 无显式上限 | 有 | 有（`visual_info_ratio` 常态 3× / 退化 10×）+ σ 地板，防止一帧压塌协方差 |
-| 视觉计算量（RK3588 单大核） | LIO 71 + VIO 28 ≈ 99 ms/帧 | 视觉合计 21.9 ms（std 4.7） | 视觉合计 41.8 ms（std 27.2，修复前口径，见下） |
+| 视觉计算量（RK3588 单大核） | LIO 71 + VIO 28 ≈ 99 ms/帧 | 视觉合计 21.9 ms（std 4.7） | 视觉合计 41.8 ms（std 27.2，Patch 前端改 LK 前口径，未重测） |
 | 真值精度（NTU eee_03 ATE） | **0.028 m**（最强） | 未单列（对位姿几乎无纠正力） | 见 §9.4，退化段方向稳定 |
 
 一句话概括：
@@ -182,21 +183,25 @@ vikit PinholeCamera 只做针孔投影（`cam_d0..d3` 读取但不使用），�
   短边 398.1/394.9（名义 400）mm，面内残差 1.9/2.0/4.2/4.2 mm；
 - 180° 歧义用重力方向消解（雷达 +z=上 → 相机 −y）。
 
-新外参（已写入 A/B 的 `*_move.yaml`）：
+新外参（2026-11-16 复标定定稿，已写入 A/B 的 `*_move.yaml` 与 `config/move_fastcalib.yaml`）：
 
 ```
-Rcl = [-0.018262, -0.999803, -0.007833,
-        0.469345, -0.001655, -0.883013,
-        0.882826, -0.019802,  0.469283]
-Pcl = [0.028643, -0.142351, -0.026469]
+Rcl = [-0.016751, -0.999859, -0.001174,
+        0.458555, -0.006640, -0.888641,
+        0.888508, -0.015424,  0.458601]
+Pcl = [0.016642, -0.113077, -0.037398]
 ```
 
-四孔重投影 1.17 px(mean)/1.69 px(max)，优于 FAST-Calib 原始输出 5.83/7.02 px 与
-中间变体 1.37/2.27 px。与中间变体相差 0.89°/33 mm，在 2 m 观测距离处只差 0.2 px，**即 1.3 m 板在 2 m 距离下无法分辨**，因此用 move bag
-跑 A/B 两版彩色点云做远场目视核验：天花俯视与白灯条掩码几乎一致（白灯条占比
-A 0.122→0.118、B 0.123→0.119），6–9 m 处两点集图像位移 2–6 px，无可见劣化。
-结论：取 `holefix`（物理推导自洽且残差略优）；两版差值与标定噪声同量级，若需更严格
-的远场判别，需把标定板放到 ≥8 m。
+2026-11-16 用同步后的标定参数（FAST-Calib-ROS2 `8963f32`：MV-CB013 内参 / 板型 / 距离门限全精度）
+在 `all_ros2` 全段累积点云（8,260,032 点）+ `img_0120.png` 上复标定：FAST-Calib 直出 RMSE **7.9 mm**，
+其外参与原 remote7.9 逐位一致；再用上述 holefix 链（真实板面 RANSAC + 前表面 + ±1° 扇区最小半径 + 圆拟合
++ 2D Kabsch + 重力消歧）重解，得上面这版。四孔重投影（帧 120，去畸变像素）：
+FAST-Calib 直出 1.26/2.17 px、旧 holefix 1.25/1.65 px、**新 holefix 1.00/1.62 px** ⇒ 取新 holefix。
+
+新旧两版差 0.63°/33 mm，在 2 m 观测距离处仍不足 1 px，**1.3 m 板在 2 m 下无法分辨**；用 move bag
+分别在 5–15 m 场景做边缘距离场评分（Canny + DT，边缘点来自单帧雷达非平面点）：#592 旧 15.78 / 新 16.41 px、
+#296 旧 2.98 / 新 3.07 px（均值 5.89 vs 5.72），**远场边缘指标对两版不可分辨**（差值 <1 px，本底 3–16 px）。
+结论：取新 `holefix`（标定板残差最优，物理推导自洽），远场若需更严格判别须把板放到 ≥8 m。
 
 注意：`direct_visual_lidar_calibration` 自带子模块（iridescence 等），需
 `git submodule update --init --recursive` 递归拉取后才能编译。
