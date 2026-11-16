@@ -35,6 +35,8 @@ add_library(${PROJECT_NAME} SHARED
   src/constraint/photometric_constraint.cpp
   src/estimator/unified_estimator.cpp
   src/estimator/map_commit_scheduler.cpp
+  src/estimator/rotation_refiner.cpp
+  src/estimator/rotation_estimator.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PUBLIC

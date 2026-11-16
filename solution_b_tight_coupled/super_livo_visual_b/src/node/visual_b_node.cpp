@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 
@@ -16,6 +18,7 @@
 #include <pcl/point_cloud.h>
 
 #include <Eigen/Cholesky>
+#include <Eigen/Eigenvalues>
 #include <Eigen/Geometry>
 
 #include "super_livo_common/anisotropic_prior.hpp"
@@ -46,6 +49,17 @@ constexpr double kPendingCloudTimeoutSec = 1.0;
 
 /// 标准重力幅值（m/s²），用于把加计归一化到 m/s²（对齐官方 G_m_s2）。
 constexpr double kGravityNorm = 9.81;
+
+/// W3 视觉本征噪声（相机系，rad²）：§36.12 的实测协方差（350–500 s 段，跨段复用）。
+/// 主轴 σ = [0.0235, 0.0278, 0.0567]°，floor 0.02°；与 §36.14 离线回放的
+/// Cw_body = A_cam·R_CL 逐项同源，保证接线后可与离线 0.0540° 对齐。
+Eigen::Matrix3d visualNoiseW3() {
+  Eigen::Matrix3d S;
+  S << 2.230418678636757e-07, -1.510679266130551e-07, 6.753803354649112e-08,
+      -1.510679266130551e-07, 9.07086570961247e-07, -1.6356947135164733e-07,
+      6.753803354649112e-08, -1.6356947135164733e-07, 2.5483994908395086e-07;
+  return S;
+}
 
 /// 在给定位姿缓存上按时刻插值；查询时刻晚于最新采样时返回 false
 /// （插值器会拿最后一个采样顶替，等于把不同时刻的位姿当成同一时刻）。
@@ -153,6 +167,9 @@ VisualBNode::VisualBNode(const rclcpp::NodeOptions& options)
       "super_livo_visual_b/odom", rclcpp::SensorDataQoS());
   path_pub_ = this->create_publisher<nav_msgs::msg::Path>(
       "super_livo_visual_b/path", rclcpp::SensorDataQoS());
+  // 旋转精修通道（默认不发布内容；rot_refine.enable=false 时该话题无数据）。
+  odom_rot_refined_pub_ = this->create_publisher<nav_msgs::msg::Odometry>(
+      "super_livo_visual_b/odom_rot_refined", rclcpp::SensorDataQoS());
 
   loadParameters();
 
@@ -205,6 +222,7 @@ void VisualBNode::loadParameters() {
   // LiDAR 先验强度（D2）：先验越小越"信任" lio/odom，视觉修正越弱。
   prior_pos_sigma_ = this->declare_parameter<double>("lv.prior_pos_sigma", 0.05);
   prior_rot_sigma_ = this->declare_parameter<double>("lv.prior_rot_sigma", 0.02);
+  prior_vel_sigma_ = this->declare_parameter<double>("lv.prior_vel_sigma", 0.25);
   // 退化感知先验：退化方向松开、垂直方向收紧（详见头文件注释）
   prior_directional_en_ =
       this->declare_parameter<bool>("lv.prior_directional_en", true);
@@ -336,6 +354,9 @@ void VisualBNode::loadParameters() {
   colorizer_options_.intrinsics = intrinsics_;
   // 着色轨迹源：默认 false=/lio/odom；true=统一估计器修正后的位姿（own_pose_cache_）。
   color_use_own_odom_ = this->declare_parameter<bool>("color.use_own_odom", false);
+  // own 轨迹信任域（见 pushOwnPoseSample / 12.5）：残差超过上限按上限截断。
+  own_res_max_pos_ = this->declare_parameter<double>("color.own_res_max_pos", 0.5);
+  own_res_max_rot_ = this->declare_parameter<double>("color.own_res_max_rot", 0.035);
   // T_cl 在实现中的语义是 T_cw（作用于世界系点），逐帧变化，见 runColorizer。
   colorizer_options_.T_cl = Eigen::Matrix4d::Identity();
   colorizer_options_.sync.max_offset = this->declare_parameter<double>("color.sync_max_offset", 0.15);
@@ -366,6 +387,92 @@ void VisualBNode::loadParameters() {
       this->declare_parameter<int>("pcd.max_points", 20000000));
   median_map_.set_voxel_size(
       static_cast<float>(this->declare_parameter<double>("pcd.median_voxel_size", 0.01)));
+
+  // ---- E2 诊断落盘 --------------------------------------------------------
+  // 默认关闭；打开后只多写两个 CSV，不改变估计器输入输出。
+  e2_dump_enable_ = this->declare_parameter<bool>("e2.dump_enable", false);
+  e2_dump_dir_ = this->declare_parameter<std::string>("e2.dump_dir", "");
+  if (e2_dump_enable_ && !e2_dump_dir_.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(e2_dump_dir_, ec);
+    if (ec) {
+      RCLCPP_ERROR(this->get_logger(), "无法创建 E2 输出目录 %s: %s",
+                   e2_dump_dir_.c_str(), ec.message().c_str());
+    } else {
+      const std::filesystem::path dir(e2_dump_dir_);
+      e2_pose_ofs_.open((dir / "e2_pose.csv").string());
+      e2_obs_ofs_.open((dir / "e2_obs.csv").string());
+      RCLCPP_INFO(this->get_logger(), "E2 落盘开启: %s", e2_dump_dir_.c_str());
+    }
+  }
+
+  // ---- 旋转后处理（P0-F RotationRefiner 移植，默认关）---------------------
+  // 只做"旋转后处理"：R' = Exp(u)·R_lio，位置原样透传；不触碰 ESKF 状态与地图。
+  rot_refine_enable_ = this->declare_parameter<bool>("rot_refine.enable", false);
+  // 像素对门限默认 40：与 §36.14 离线回放一致（估计器内部另有 min_inl=25 的内点门）。
+  rot_estimator_options_.min_inl =
+      this->declare_parameter<int>("rot_refine.min_pairs", 40);
+  rot_noise_mode_ = this->declare_parameter<std::string>("rot_refine.noise_mode", "w3");
+  rot_estimator_options_.seed_px =
+      this->declare_parameter<double>("rot_refine.seed_px", rot_estimator_options_.seed_px);
+  rot_estimator_options_.f_scale =
+      this->declare_parameter<double>("rot_refine.f_scale", rot_estimator_options_.f_scale);
+  rot_estimator_options_.rounds =
+      this->declare_parameter<int>("rot_refine.rounds", rot_estimator_options_.rounds);
+  rot_refine_options_.window =
+      this->declare_parameter<int>("rot_refine.window", rot_refine_options_.window);
+  rot_refine_options_.sigma_prior_deg = this->declare_parameter<double>(
+      "rot_refine.sigma_prior_deg", rot_refine_options_.sigma_prior_deg);
+  rot_refine_options_.sigma_accel_deg = this->declare_parameter<double>(
+      "rot_refine.sigma_accel_deg", rot_refine_options_.sigma_accel_deg);
+  rot_refine_options_.clip_deg =
+      this->declare_parameter<double>("rot_refine.clip_deg", rot_refine_options_.clip_deg);
+  rot_refine_options_.slew_factor = this->declare_parameter<double>(
+      "rot_refine.slew_factor", rot_refine_options_.slew_factor);
+  rot_refine_options_.huber_c =
+      this->declare_parameter<double>("rot_refine.huber_c", rot_refine_options_.huber_c);
+  rot_refine_options_.irls_rounds =
+      this->declare_parameter<int>("rot_refine.irls_rounds", rot_refine_options_.irls_rounds);
+  rot_refine_options_.max_iters =
+      this->declare_parameter<int>("rot_refine.max_iters", rot_refine_options_.max_iters);
+  rot_refine_options_.enable_bounds =
+      this->declare_parameter<bool>("rot_refine.enable_bounds", rot_refine_options_.enable_bounds);
+  const std::string rot_dump_csv =
+      this->declare_parameter<std::string>("rot_refine.dump_csv", "");
+
+  // 相机外参（Camera->LiDAR）：旋转必须投影到 SO(3) 后再用于 log/exp。
+  R_bc_ = Eigen::Quaterniond(T_lc_.block<3, 3>(0, 0)).normalized().toRotationMatrix();
+  t_bc_ = T_lc_.block<3, 1>(0, 3);
+  // 估计器内参必须与 PatchTracker 完全同口径（NTU 752x480，非默认值）。
+  rot_estimator_options_.fx = intrinsics_.fx;
+  rot_estimator_options_.fy = intrinsics_.fy;
+  rot_estimator_options_.cx = intrinsics_.cx;
+  rot_estimator_options_.cy = intrinsics_.cy;
+
+  if (rot_refine_enable_) {
+    rot_estimator_ = std::make_unique<RotationEstimator>(rot_estimator_options_);
+    rot_refiner_ = std::make_unique<RotationRefiner>(rot_refine_options_);
+    if (!rot_dump_csv.empty()) {
+      const std::filesystem::path csv(rot_dump_csv);
+      std::error_code ec;
+      if (!csv.parent_path().empty()) {
+        std::filesystem::create_directories(csv.parent_path(), ec);
+      }
+      rot_refine_ofs_.open(csv.string());
+      if (!rot_refine_ofs_.is_open()) {
+        RCLCPP_ERROR(this->get_logger(), "无法写入旋转精修诊断 CSV: %s",
+                     rot_dump_csv.c_str());
+      } else {
+        rot_refine_ofs_ << "stamp,t_pose,n_pairs,n_inl,t_norm,th_deg,"
+                           "rvx,rvy,rvz,ux,uy,uz,sgx,sgy,sgz,px_med,px_p90,d_med,usable\n";
+      }
+    }
+    RCLCPP_INFO(this->get_logger(),
+                "旋转精修开启: window=%d σp=%.2f° σa=%.2f° clip=%.2f° bounds=%d",
+                rot_refine_options_.window, rot_refine_options_.sigma_prior_deg,
+                rot_refine_options_.sigma_accel_deg, rot_refine_options_.clip_deg,
+                static_cast<int>(rot_refine_options_.enable_bounds));
+  }
 
   params_loaded_ = true;
 }
@@ -475,6 +582,15 @@ void VisualBNode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
   if (pose_cache_.size() > max_pose_samples_) {
     pose_cache_.erase(pose_cache_.begin(),
                       pose_cache_.begin() + (pose_cache_.size() - max_pose_samples_));
+  }
+
+  // own 着色轨迹与 /lio/odom 同频落缓存（残差零阶保持）。
+  // 只在视觉锚点写 own_pose_cache_ 是不够的：本数据集相机 1 Hz ⇒ 锚点间隔 1 s，
+  // 而 poseFromSamples 会拒绝相邻采样间隔 >0.5 s 的查询（kPoseHistoryMaxGapSec），
+  // 10 Hz 的点云因此基本查不到 own 位姿 —— 要么"位姿空洞"、要么等下一个锚点时
+  // 已超时/挤爆待着色队列，实测每 10 帧云只有约 1 帧能上色。
+  if (color_use_own_odom_ && own_anchor_t_ >= 0.0) {
+    pushOwnPoseSample(sample.stamp, sample.T_wl);
   }
 
   // 用首帧里程计初始化统一状态（否则滤波器从单位阵起步，长期追不上真实轨迹）。
@@ -650,6 +766,8 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     // 此时退回"最新位姿"会把视觉注入锚到最多 0.7 s 前的位姿上，实测造成 0.75 m
     // 瞬跳；宁可丢这一帧（少一个采样），也不要发布错误时间的位姿。
     ++stat_drop_pose_;
+    // 丢帧后上一帧不再是"相邻帧"，必须切断配对，避免跨位姿空洞算区间旋转。
+    rot_prev_.valid = false;
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                          "视觉[丢弃] 无 t_pose=%.3f 的可靠位姿（位姿空洞），跳过该帧", t_pose);
     return;
@@ -667,6 +785,39 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
 
   // 1) Patch 前端跟踪
   const std::vector<PatchObservation> obs = frontend_->process(gray, stamp);
+
+  // 1.1) E2 诊断落盘（默认关闭）：只记录，不参与任何估计。
+  //      T_wl_frame_ 是**该图像时刻**的 LiDAR 位姿（已按 t_pose 插值），
+  //      与视觉观测同一时刻，离线才能无偏地重算 r_vis 与帧间平移 tc。
+  if (e2_pose_ofs_.is_open()) {
+    const Eigen::Matrix3d R = T_wl_frame_.block<3, 3>(0, 0);
+    const Eigen::Vector3d p = T_wl_frame_.block<3, 1>(0, 3);
+    // 时间戳必须用 17 位有效数字：ROS 时间是 1.7e9 量级，setprecision(9) 只有
+    // 9 位有效数字 => 小数部分全丢，时间被量化到整秒（实测 946685438 这种值），
+    // 离线插值 IMU 参照会错到 0.5 s，指标完全失真。
+    e2_pose_ofs_ << std::setprecision(17) << stamp << ',' << t_pose << std::setprecision(9);
+    for (int r = 0; r < 3; ++r) {
+      for (int c = 0; c < 3; ++c) {
+        e2_pose_ofs_ << ',' << R(r, c);
+      }
+    }
+    e2_pose_ofs_ << ',' << p.x() << ',' << p.y() << ',' << p.z() << ',' << obs.size()
+                 << '\n';
+    e2_pose_ofs_.flush();
+  }
+  if (e2_obs_ofs_.is_open()) {
+    e2_obs_ofs_ << std::setprecision(17) << stamp << std::setprecision(9) << ',' << obs.size();
+    for (const auto& o : obs) {
+      e2_obs_ofs_ << ',' << o.feature_id << ',' << o.u << ',' << o.v;
+    }
+    e2_obs_ofs_ << '\n';
+    e2_obs_ofs_.flush();
+  }
+
+  // 1.2) 旋转后处理（默认关）：只用本帧像素观测与 T_wl_frame_，不写任何状态。
+  if (rot_refine_enable_ && rot_refiner_) {
+    refineRotation(stamp, t_pose, obs);
+  }
 
   // 2) 生命周期：记录观测，推进成熟；上一帧有、这一帧没跟住的记为 miss
   for (const auto& o : obs) {
@@ -846,7 +997,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   if (lio_trusted) {
     Eigen::MatrixXd H_prior;
     Eigen::VectorXd b_prior;
-    buildLidarPrior(T_wl_frame_, H_prior, b_prior);
+    buildLidarPrior(T_wl_frame_, t_pose, H_prior, b_prior);
     estimator_->lidarUpdate(H_prior, b_prior, 0.0);
   }
 
@@ -870,22 +1021,32 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   //  上限 = 健康段观测到的最大速度 × guard.vel_ratio（无健康样本时用 fallback）。
   if (guard_enable_ && estimator_initialized_) {
     const double vn = estimator_->filterState().state.v.norm();
-    if (degen_sev >= guard_sev_threshold_) {
-      double cap =
-          vel_ref_valid_ ? vel_ref_ * guard_vel_ratio_ : guard_vel_fallback_;
-      // 绝对上限兜底：视觉 spike 一旦混进 vel_ref，ratio 上限会跟着失守。
+    double cap = 0.0;
+    if (std::isfinite(vn) && vn > guard_vel_abs_cap_) {
+      // 绝对物理上限无条件生效。旧写法把它挂在 degen_sev >= sev_threshold 分支里，
+      // 而 Super-LIO 默认不发布 /lio/degeneracy ⇒ sev 恒为 0 ⇒ 整条守卫是死代码
+      // （§34：|v| 一路涨到 125 m/s、"速度限幅=0"，own 位姿飘出图像，上色率归零）。
+      cap = guard_vel_abs_cap_;
+    } else if (degen_sev >= guard_sev_threshold_) {
+      // 退化段收紧：上限 = 健康段观测到的最大速度 × guard.vel_ratio（无样本用 fallback）。
+      // 视觉 spike 一旦混进 vel_ref，ratio 上限会跟着失守，故再压到绝对上限之下。
+      cap = vel_ref_valid_ ? vel_ref_ * guard_vel_ratio_ : guard_vel_fallback_;
       cap = std::min(cap, guard_vel_abs_cap_);
+    }
+    if (cap > 0.0) {
       if (estimator_->clampSpeed(cap) > 0.0) {
         ++stat_vel_clamp_;
         RCLCPP_WARN_THROTTLE(
             this->get_logger(), *this->get_clock(), 2000,
-            "[Guard] 退化段速度 %.2f m/s 超上限 %.2f m/s，限幅（累计 %zu 次）",
-            vn, cap, stat_vel_clamp_);
+            "[Guard] 速度 %.2f m/s 超上限 %.2f m/s（sev=%.2f），限幅（累计 %zu 次）",
+            vn, cap, degen_sev, stat_vel_clamp_);
       }
-    } else if (std::isfinite(vn) && vn <= guard_vel_abs_cap_) {
+    } else {
       // 只从物理可信的速度学习参考值，超过绝对上限的样本一律不学。
-      vel_ref_ = vel_ref_valid_ ? std::max(vel_ref_, vn) : vn;
-      vel_ref_valid_ = true;
+      if (degen_sev < guard_sev_threshold_ && std::isfinite(vn)) {
+        vel_ref_ = vel_ref_valid_ ? std::max(vel_ref_, vn) : vn;
+        vel_ref_valid_ = true;
+      }
     }
   }
 
@@ -921,17 +1082,46 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   const auto t_update = std::chrono::steady_clock::now();
   publishOdomAndPath(T_wl_updated, toRosStamp(t_pose));
 
-  // 12.5) 缓存修正位姿（打在 LiDAR 钟的采集时刻 t_pose），供 color.use_own_odom 着色插值。
-  {
-    colorizer::PoseSample own;
-    own.stamp = t_pose;
-    own.T_wl = T_wl_updated;
-    own_pose_cache_.push_back(own);
-    if (own_pose_cache_.size() > max_pose_samples_) {
-      own_pose_cache_.erase(own_pose_cache_.begin(),
-                            own_pose_cache_.begin() +
-                                (own_pose_cache_.size() - max_pose_samples_));
+  // 12.5) 记录本锚点的融合残差（own ⊖ lio，世界系），并按信任域截断。
+  // own 轨迹 = lio 轨迹 ⊕ 该残差（见 onLivOdom 里的同频落缓存）：滤波器给的是
+  // 相对 lio 的修正量，残差小且慢变，比直接插值 1 Hz 的锚点位姿稳得多；
+  // 残差越界（滤波器发散）时截断，own 退化为 lio，地图不会整段作废。
+  if (color_use_own_odom_) {
+    Eigen::Vector3d dp =
+        T_wl_updated.block<3, 1>(0, 3) - T_wl_frame_.block<3, 1>(0, 3);
+    const Eigen::Matrix3d dR_full = T_wl_updated.block<3, 3>(0, 0) *
+                                    T_wl_frame_.block<3, 3>(0, 0).transpose();
+    const double dp_raw = dp.norm();
+    bool clip_p = false;
+    if (own_res_max_pos_ > 0.0 && dp.norm() > own_res_max_pos_) {
+      dp *= own_res_max_pos_ / dp.norm();
+      clip_p = true;
     }
+    Eigen::Matrix3d dR = dR_full;
+    const double ang_raw = Eigen::AngleAxisd(dR_full).angle();
+    bool clip_r = false;
+    if (own_res_max_rot_ > 0.0) {
+      Eigen::AngleAxisd aa(dR_full);
+      if (std::abs(aa.angle()) > own_res_max_rot_) {
+        aa.angle() = std::copysign(own_res_max_rot_, aa.angle());
+        dR = aa.toRotationMatrix();
+        clip_r = true;
+      }
+    }
+    // 诊断：锚点残差 = 融合位姿相对 lio/odom 的偏移，own 口径整段地图按它平移/旋转。
+    // 若 |dp| 达到分米级，1 Hz 的分段刚体位移就是"分层"的直接来源。
+    Eigen::Vector3d v_lio = Eigen::Vector3d::Zero();
+    const bool has_v = lioVelocity(t_pose, v_lio);
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 0,
+                         "[own残差] |dp|=%.3f(截=%d) ang=%.2fdeg(截=%d) "
+                         "|v|=%.2f v_lio=%.2f(%d)",
+                         dp_raw, clip_p ? 1 : 0, ang_raw * 180.0 / M_PI,
+                         clip_r ? 1 : 0, estimator_->filterState().state.v.norm(),
+                         v_lio.norm(), has_v ? 1 : 0);
+    own_anchor_dp_ = dp;
+    own_anchor_dR_ = dR;
+    own_anchor_t_ = t_pose;
+    pushOwnPoseSample(t_pose, T_wl_frame_);
   }
 
   if (!body_points_.empty() && last_cloud_) {
@@ -1205,6 +1395,28 @@ bool VisualBNode::colorizeFrame(const PendingColorFrame& frame) {
   return true;
 }
 
+void VisualBNode::pushOwnPoseSample(double stamp, const Eigen::Matrix4d& T_wl_lio) {
+  colorizer::PoseSample own;
+  own.stamp = stamp;
+  own.T_wl = Eigen::Matrix4d::Identity();
+  own.T_wl.block<3, 3>(0, 0) = own_anchor_dR_ * T_wl_lio.block<3, 3>(0, 0);
+  own.T_wl.block<3, 1>(0, 3) = T_wl_lio.block<3, 1>(0, 3) + own_anchor_dp_;
+  // 锚点采样可能落在两次 odom 采样之间，按时刻有序插入，别破坏插值前提。
+  auto pos = std::lower_bound(
+      own_pose_cache_.begin(), own_pose_cache_.end(), stamp,
+      [](const colorizer::PoseSample& s, double t) { return s.stamp < t; });
+  if (pos != own_pose_cache_.end() && std::abs(pos->stamp - stamp) < 1e-6) {
+    pos->T_wl = own.T_wl;  // 同一时刻：锚点的精修结果覆盖零阶保持值
+  } else {
+    own_pose_cache_.insert(pos, own);
+  }
+  if (own_pose_cache_.size() > max_pose_samples_) {
+    own_pose_cache_.erase(own_pose_cache_.begin(),
+                          own_pose_cache_.begin() +
+                              (own_pose_cache_.size() - max_pose_samples_));
+  }
+}
+
 bool VisualBNode::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
   // 查询时刻晚于最新采样时必须拒绝：插值器会直接用最后一个采样顶替，
   // 那等于把 t_img 的位姿退化成 t_cloud 的位姿，offset 就白加了。
@@ -1220,9 +1432,10 @@ bool VisualBNode::camPoseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
 }
 
 void VisualBNode::buildLidarPrior(const Eigen::Matrix4d& T_wl,
+                                  double t_pose,
                                   Eigen::MatrixXd& H,
                                   Eigen::VectorXd& b) const {
-  // D2：把 lio/odom 当作 LiDAR 观测，只在 30 维状态的 R/p 块上注入强先验。
+  // D2：把 lio/odom 当作 LiDAR 观测，在 30 维状态的 R/p（以及 v）块上注入强先验。
   // 法方程（信息形式）：b = H·(x_cur ⊖ x_prior)，配合 dx = -P·b 会把状态拉回先验。
   H = Eigen::MatrixXd::Zero(StateLayout::kSize, StateLayout::kSize);
   b = Eigen::VectorXd::Zero(StateLayout::kSize);
@@ -1260,6 +1473,45 @@ void VisualBNode::buildLidarPrior(const Eigen::Matrix4d& T_wl,
   H.block<3, 3>(StateLayout::kPos, StateLayout::kPos) = Hp;
   b.segment<3>(StateLayout::kRot) = Hr * rot_err;
   b.segment<3>(StateLayout::kPos) = Hp * pos_err;
+
+  // 速度观测：视觉是 pose_only（dx 的速度块恒为 0），先验又只约束 R/p，
+  // 状态速度此前完全不可观 —— IMU 传播留下的加速度残差没人纠，|v| 自由随机游走
+  // （实测 130 s 到 120 m/s，own 位姿飘出图像 → 上色率 0、地图只剩前 57 s）。
+  // 用 lio/odom 的差分速度补上这一维观测（刚体上 IMU 原点的位置差分即其速度）。
+  if (prior_vel_sigma_ > 0.0) {
+    Eigen::Vector3d v_lio = Eigen::Vector3d::Zero();
+    if (lioVelocity(t_pose, v_lio)) {
+      const double sv = std::max(1e-3, prior_vel_sigma_);
+      const Eigen::Matrix3d Hv = Eigen::Matrix3d::Identity() / (sv * sv);
+      H.block<3, 3>(StateLayout::kVel, StateLayout::kVel) = Hv;
+      b.segment<3>(StateLayout::kVel) = Hv * (s.v - v_lio);
+    }
+  }
+}
+
+bool VisualBNode::lioVelocity(double t_pose, Eigen::Vector3d& v_lio) const {
+  const double kBaseline = 0.10;  // 差分基线（s）：太短被位姿噪声主导，太长切弯
+  const colorizer::PoseSample* a = nullptr;
+  const colorizer::PoseSample* b = nullptr;
+  for (const auto& s : pose_cache_) {
+    if (s.stamp <= t_pose - kBaseline) {
+      a = &s;
+    }
+    if (s.stamp <= t_pose) {
+      b = &s;
+    }
+  }
+  if (a == nullptr || b == nullptr || b->stamp <= a->stamp) {
+    return false;
+  }
+  const double dt = b->stamp - a->stamp;
+  if (dt < 0.05 || dt > 0.30) {
+    return false;  // 位姿空洞：差分速度不可信
+  }
+  const Eigen::Vector3d p_a = (a->T_wl * T_li_).block<3, 1>(0, 3);
+  const Eigen::Vector3d p_b = (b->T_wl * T_li_).block<3, 1>(0, 3);
+  v_lio = (p_b - p_a) / dt;
+  return v_lio.allFinite() && v_lio.norm() < 10.0;
 }
 
 std::vector<FeatureTrack> VisualBNode::assembleTracks(
@@ -1492,6 +1744,117 @@ Eigen::Matrix4d VisualBNode::makeTlcFromRclPcl() {
     T_cl(2, 3) = pcl[2];
   }
   return T_cl.inverse();  // Camera -> LiDAR
+}
+
+Eigen::Matrix3d VisualBNode::whiteningFromCov(const Eigen::Matrix3d& cov) const {
+  // Cw = Σ^{-1/2}：特征分解后逐轴取 1/σ。σ 下限 1e-4 rad（≈0.0057°）只防数值爆掉，
+  // 实测逐区间主轴 σ 在 0.02–0.06°（§36.12），离该下限还有一个量级。
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
+  if (es.info() != Eigen::Success) {
+    return RotationRefiner::isotropicWhitening(0.05);
+  }
+  const double floor_var = 1e-4 * 1e-4;
+  const Eigen::Vector3d var = es.eigenvalues().cwiseMax(floor_var);
+  return es.eigenvectors() * var.cwiseInverse().cwiseSqrt().asDiagonal() *
+         es.eigenvectors().transpose();
+}
+
+void VisualBNode::refineRotation(double stamp, double t_pose,
+                                 const std::vector<PatchObservation>& obs) {
+  // 输入全部来自"该图像时刻"的量：obs 是当前帧像素，T_wl_frame_ 是 t_pose 处
+  // 插值的 LIO 位姿；上一帧的观测/位姿在 rot_prev_ 里。视觉—惯导的时间错位
+  // 已在拿位姿时处理（img_time_offset_），这里不再做时间补偿。
+  const Eigen::Matrix3d R_wb2 = T_wl_frame_.block<3, 3>(0, 0);
+  const Eigen::Vector3d p_wb2 = T_wl_frame_.block<3, 1>(0, 3);
+
+  bool usable = false;
+  Eigen::Vector3d r_vis_body = Eigen::Vector3d::Zero();
+  Eigen::Matrix3d Cw = RotationRefiner::isotropicWhitening(0.05);
+  RotationEstimator::Result est;
+
+  const double gap = rot_prev_.valid ? (t_pose - rot_prev_.t_pose) : 0.0;
+  if (rot_prev_.valid && gap > 0.0 && gap < 0.35) {
+    std::vector<Eigen::Vector2d> a;
+    std::vector<Eigen::Vector2d> b;
+    a.reserve(obs.size());
+    b.reserve(obs.size());
+    for (const auto& o : obs) {
+      const auto it = rot_prev_.obs.find(o.feature_id);
+      if (it == rot_prev_.obs.end()) {
+        continue;
+      }
+      a.emplace_back(it->second);
+      b.emplace_back(o.u, o.v);
+    }
+    // LIO 相机系帧间运动：R_wc = R_wb·R_bc，C_w = p_wb + R_wb·t_bc（t_bc 为相机
+    // 原点在 body 系的位置，即 T_lc 的平移）。
+    const Eigen::Matrix3d R_wb1 = rot_prev_.T_wl.block<3, 3>(0, 0);
+    const Eigen::Vector3d p_wb1 = rot_prev_.T_wl.block<3, 1>(0, 3);
+    const Eigen::Matrix3d R_wc1 = R_wb1 * R_bc_;
+    const Eigen::Matrix3d R_wc2 = R_wb2 * R_bc_;
+    const Eigen::Vector3d C1 = p_wb1 + R_wb1 * t_bc_;
+    const Eigen::Vector3d C2 = p_wb2 + R_wb2 * t_bc_;
+    const Eigen::Matrix3d R_c2c1 = R_wc2.transpose() * R_wc1;  // 相机 2 ← 相机 1
+    const Eigen::Vector3d t_c = R_wc2.transpose() * (C1 - C2);
+
+    est = rot_estimator_->estimate(a, b, t_c);
+    if (est.usable) {
+      // 相机系 -> body 系：R_b2b1 = R_bc·R_c2c1·R_bcᵀ，协方差同式旋转。
+      const Eigen::Matrix3d R_b2b1 = R_bc_ * est.R * R_bc_.transpose();
+      r_vis_body = so3Log(R_b2b1);
+      const Eigen::Matrix3d Sigma_cam =
+          (rot_noise_mode_ == "cov") ? est.cov : visualNoiseW3();
+      Cw = whiteningFromCov(R_bc_ * Sigma_cam * R_bc_.transpose());
+      usable = true;
+    }
+  } else if (rot_prev_.valid) {
+    // 时间不连续（丢帧/乱序）：重置滑窗，绝不把跨空洞的区间当相邻帧因子。
+    rot_refiner_->reset();
+  }
+
+  const Eigen::Vector3d u =
+      rot_refiner_->addFrame(R_wb2, r_vis_body, Cw, usable);
+  ++stat_rot_frames_;
+  if (usable) {
+    ++stat_rot_usable_;
+  }
+
+  // 精修 odom：位置沿用 LIO，旋转换成 Exp(u)·R_lio（只做旋转后处理的承诺）。
+  {
+    nav_msgs::msg::Odometry odom;
+    odom.header.stamp = toRosStamp(t_pose);
+    odom.header.frame_id = "world";
+    odom.child_frame_id = "lidar";
+    odom.pose.pose.position.x = p_wb2.x();
+    odom.pose.pose.position.y = p_wb2.y();
+    odom.pose.pose.position.z = p_wb2.z();
+    const Eigen::Quaterniond q(rot_refiner_->correctedRotation());
+    odom.pose.pose.orientation.x = q.x();
+    odom.pose.pose.orientation.y = q.y();
+    odom.pose.pose.orientation.z = q.z();
+    odom.pose.pose.orientation.w = q.w();
+    odom_rot_refined_pub_->publish(odom);
+  }
+
+  if (rot_refine_ofs_.is_open()) {
+    rot_refine_ofs_ << std::setprecision(17) << stamp << ',' << t_pose
+                    << std::setprecision(9) << ',' << est.n_pairs << ',' << est.n_inl
+                    << ',' << est.t_norm << ',' << est.th_deg << ',' << r_vis_body.x()
+                    << ',' << r_vis_body.y() << ',' << r_vis_body.z() << ',' << u.x()
+                    << ',' << u.y() << ',' << u.z() << ',' << est.sigma_rad.x() << ','
+                    << est.sigma_rad.y() << ',' << est.sigma_rad.z() << ','
+                    << est.px_med << ',' << est.px_p90 << ',' << est.d_med << ','
+                    << static_cast<int>(usable) << '\n';
+    rot_refine_ofs_.flush();
+  }
+
+  rot_prev_.valid = true;
+  rot_prev_.t_pose = t_pose;
+  rot_prev_.T_wl = T_wl_frame_;
+  rot_prev_.obs.clear();
+  for (const auto& o : obs) {
+    rot_prev_.obs.emplace(o.feature_id, Eigen::Vector2d(o.u, o.v));
+  }
 }
 
 Eigen::Matrix4d VisualBNode::applyLeftPerturbation(const Eigen::Matrix4d& T,

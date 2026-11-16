@@ -76,6 +76,13 @@
     # LiDAR 先验强度（D2）：越小越信任 lio/odom，视觉修正越弱
     lv.prior_pos_sigma: 0.05
     lv.prior_rot_sigma: 0.02
+    # 速度先验（lio/odom 差分速度）：视觉是 pose_only，速度块没有任何观测，
+    # 关掉它 |v| 会随机游走发散（Retail_Street 130 s → 120 m/s）。0 = 关闭。
+    lv.prior_vel_sigma: 0.25
+    # 物理绝对速度上限（m/s）。无条件生效（不依赖退化签名），只在状态速度越界时
+    # 限幅，是发散的最后兜底。要高于平台实际最高速度（本数据集 lio_max≈4 m/s），
+    # 否则会削掉真实运动。
+    guard.vel_abs_cap: 6.0
 
     # ========================================================================
     # MSCKF 多帧约束 MsckfConstraint（对应 gpt §3.3）

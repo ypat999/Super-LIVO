@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include <opencv2/imgproc.hpp>
+#include <opencv2/video/tracking.hpp>
 
 namespace superlivo_b {
 
@@ -15,16 +16,6 @@ bool rectInside(const cv::Rect& rect, const cv::Mat& image) {
 }  // namespace
 
 PatchTracker::PatchTracker(const Options& options) : options_(options) {}
-
-void PatchTracker::buildPyramid(const cv::Mat& gray, int levels, std::vector<cv::Mat>& pyramid) {
-  pyramid.clear();
-  pyramid.push_back(gray);
-  for (int i = 1; i < levels; ++i) {
-    cv::Mat down;
-    cv::pyrDown(pyramid.back(), down);  // 每层尺寸减半
-    pyramid.push_back(down);
-  }
-}
 
 std::vector<cv::Point2f> PatchTracker::detect(const cv::Mat& gray, std::size_t budget) const {
   std::vector<cv::Point2f> pts;
@@ -52,57 +43,60 @@ std::vector<PatchObservation> PatchTracker::process(const cv::Mat& image, double
   }
 
   const int levels = std::max(1, options_.pyramid_levels);
-  std::vector<cv::Mat> pyramid;
-  buildPyramid(gray, levels, pyramid);
-
   const int patch = std::max(3, options_.patch_size | 1);  // 奇数边长
   const int radius = std::max(1, options_.search_radius);
 
-  // ---- 1. 对上一帧每个 patch 做 SSD 匹配 ----------------------------------
-  if (!prev_pyramid_.empty() && !prev_obs_.empty()) {
-    const int prev_levels = static_cast<int>(prev_pyramid_.size());
-
+  // ---- 1. 金字塔 LK 跟踪上一帧的每个 patch --------------------------------
+  // 为什么不是单层 5x5 SSD 模板匹配（原实现）：实测该数据集帧间光流中位
+  // 6~25 px（Retail_Street 手持快速转动），单层 ±search_radius 的 5x5 SSD 在
+  // 大位移下会锁到错误极值——同一批特征用 LK 复算，位移差中位 6~16 px，
+  // 94~100% 的特征差 >3 px，视觉相对旋转因此偏差 1.5~2 deg（是真实值的数倍），
+  // 修正器只会把位姿往错方向拉。改用 LK（自带金字塔 + 亚像素）后位移一致。
+  if (!prev_gray_.empty() && !prev_obs_.empty()) {
+    std::vector<cv::Point2f> pts_prev;
+    pts_prev.reserve(prev_obs_.size());
     for (const auto& obs : prev_obs_) {
-      const int level = std::max(0, std::min({obs.level, prev_levels - 1, levels - 1}));
-      const double scale = std::pow(2.0, level);
-      const cv::Point2f prev_pt(static_cast<float>(obs.u / scale),
-                                static_cast<float>(obs.v / scale));
+      pts_prev.emplace_back(obs.u, obs.v);
+    }
+    std::vector<cv::Point2f> pts_curr;
+    std::vector<unsigned char> status;
+    std::vector<float> err;
+    const cv::Size win(2 * radius + 1, 2 * radius + 1);
+    cv::calcOpticalFlowPyrLK(
+        prev_gray_, gray, pts_prev, pts_curr, status, err, win, levels - 1,
+        cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01), 0);
 
-      const cv::Mat& prev_img = prev_pyramid_[level];
-      const cv::Mat& curr_img = pyramid[level];
-
-      const cv::Rect patch_rect(static_cast<int>(std::lround(prev_pt.x)) - patch / 2,
-                                static_cast<int>(std::lround(prev_pt.y)) - patch / 2, patch,
-                                patch);
-      const cv::Rect search_rect(patch_rect.x - radius, patch_rect.y - radius,
-                                 patch + 2 * radius, patch + 2 * radius);
-      if (!rectInside(patch_rect, prev_img) || !rectInside(search_rect, curr_img)) {
+    for (std::size_t k = 0; k < prev_obs_.size(); ++k) {
+      if (status[k] == 0) {
+        continue;  // LK 未收敛
+      }
+      const cv::Rect prev_rect(static_cast<int>(std::lround(pts_prev[k].x)) - patch / 2,
+                               static_cast<int>(std::lround(pts_prev[k].y)) - patch / 2,
+                               patch, patch);
+      const cv::Rect curr_rect(static_cast<int>(std::lround(pts_curr[k].x)) - patch / 2,
+                               static_cast<int>(std::lround(pts_curr[k].y)) - patch / 2,
+                               patch, patch);
+      if (!rectInside(prev_rect, prev_gray_) || !rectInside(curr_rect, gray)) {
         continue;  // 靠近边界，无法取块
       }
-
-      const cv::Mat templ = prev_img(patch_rect);
-      const cv::Mat search = curr_img(search_rect);
+      // 得分口径与原实现一致：1 - TM_SQDIFF_NORMED（1 = 完全匹配）
       cv::Mat score_map;
-      cv::matchTemplate(search, templ, score_map, cv::TM_SQDIFF_NORMED);
+      cv::matchTemplate(gray(curr_rect), prev_gray_(prev_rect), score_map,
+                        cv::TM_SQDIFF_NORMED);
       if (score_map.empty()) {
         continue;
       }
-
-      double min_val = 1.0;
-      cv::Point min_loc(0, 0);
-      cv::minMaxLoc(score_map, &min_val, nullptr, &min_loc, nullptr);
-
-      const float score = static_cast<float>(1.0 - min_val);  // 1 = 完全匹配
+      const float score = static_cast<float>(1.0 - score_map.at<float>(0, 0));
       if (score < options_.lssd_threshold) {
         continue;  // 匹配质量不足，判为丢失
       }
 
       PatchObservation out;
-      out.feature_id = obs.feature_id;
-      out.u = static_cast<float>((search_rect.x + min_loc.x + patch / 2) * scale);
-      out.v = static_cast<float>((search_rect.y + min_loc.y + patch / 2) * scale);
+      out.feature_id = prev_obs_[k].feature_id;
+      out.u = pts_curr[k].x;
+      out.v = pts_curr[k].y;
       out.stamp = stamp;
-      out.level = level;
+      out.level = 0;
       out.score = score;
       observations.push_back(out);
     }
@@ -112,7 +106,7 @@ std::vector<PatchObservation> PatchTracker::process(const cv::Mat& image, double
   if (static_cast<int>(observations.size()) < options_.max_features) {
     const std::size_t budget =
         static_cast<std::size_t>(options_.max_features - static_cast<int>(observations.size()));
-    for (const auto& point : detect(pyramid[0], budget)) {
+    for (const auto& point : detect(gray, budget)) {
       bool too_close = false;
       for (const auto& obs : observations) {
         const double dx = obs.u - point.x;
@@ -137,13 +131,13 @@ std::vector<PatchObservation> PatchTracker::process(const cv::Mat& image, double
   }
 
   // ---- 3. 保存本帧状态 ---------------------------------------------------
-  prev_pyramid_ = pyramid;
+  prev_gray_ = gray;
   prev_obs_ = observations;
   return observations;
 }
 
 void PatchTracker::reset() {
-  prev_pyramid_.clear();
+  prev_gray_.release();
   prev_obs_.clear();
   next_id_ = 0;
 }

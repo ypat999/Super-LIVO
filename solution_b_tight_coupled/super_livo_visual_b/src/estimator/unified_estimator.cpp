@@ -49,6 +49,7 @@ void UnifiedEstimator::propagate(const Eigen::Vector3d& acc, const Eigen::Vector
   s.p += s.v * dt;
   s.v += (a_w + s.g) * dt;
   s.R = s.R * so3Exp(omega * dt);
+  lidar_dt_accum_ += dt;  // 距上次 LiDAR 先验实际传播的时间，供 lidarUpdate 换算步长上限
 
   // ---- 协方差传播 P ← Φ P Φᵀ + Q·dt ----------------------------------------
   // 关键修复：此前只累加对角噪声、没有 Φ 传播，导致 位置↔速度↔零偏↔重力 之间
@@ -101,8 +102,13 @@ void UnifiedEstimator::lidarUpdate(const Eigen::MatrixXd& H, const Eigen::Vector
   // 先验同样需要限幅：先验 b 只含 rot/pos，但 dx=-P_new·b 会经协方差耦合
   // 把跳变扩散到速度/零偏块。一旦协方差被其它更新污染（如视觉注入偏差），
   // 未限幅的先验更新正是"帧间 46m 跳变"的泄漏路径。
-  // 正常工作时先验每帧修正量在 cm/0.1° 级，下面的上限远不会误伤。
-  applyInformationUpdate(H, b, 1.0, 0.05, 0.1, 0.5, 1.0e-3, 1.0e-2, 0.01);
+  // 上限按 0.1 s（10 Hz）标定；实际先验间隔由 lidar_dt_accum_ 给出（Retail_Street
+  // 相机 1 Hz ⇒ 1 s）。不随间隔放宽的话，先验每帧最多只能追 0.1 m，而平台 1 s 走
+  // 1~4 m —— 状态永久落后 lio/odom，耦合还会把速度一路泵飞（实测 |v| 120 m/s）。
+  const double k = std::min(10.0, std::max(1.0, lidar_dt_accum_ / 0.1));
+  lidar_dt_accum_ = 0.0;
+  applyInformationUpdate(H, b, 1.0 * k, 0.05 * k, 0.1 * k, 0.5 * k, 1.0e-3, 1.0e-2,
+                         0.01);
 }
 
 void UnifiedEstimator::visualUpdate(const VisualUpdateInput& input) {

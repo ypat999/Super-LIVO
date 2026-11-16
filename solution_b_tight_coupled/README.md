@@ -2,6 +2,8 @@
 
 > 当前状态：**已实现并接入 ROS2 节点**（统一 ESIKF、测量噪声模型与信息量上限已补齐，估计器修过 IMU 初始化），已在 NTU VIRAL `eee_03` 做过早期评测（ATE 0.681 m，IMU 初始化修复后未重测，见 `docs/HANDOVER_2026-11-08.md`）。退化对抗实验（走廊裁剪、`Y_HALF=1.2`）已用 **8 次重复单跑**验证：B 8/8 次不劣于同 bag LIO，并把终点误差的跨跑散布从 LIO 的 14~794 m 压到 8~128 m；抑制幅度按口径为均值 −73% / 中位数 −50%（单次数字不可复现，勿引用）。机制与结论见 §9，选轨耗时修复见 §9.6。下文架构与接口约定仍然有效。
 
+> 2026-11 更新：Patch 前端改**金字塔 LK**（§9.7）；`b_own` 速度观测 / 守卫 / 10 Hz 同频三层修复，恢复全程彩色点云（§9.8）；新增**旋转后处理通道**（默认关）与 `odom_rot_refined`（§9.9）；Retail_Street 现状态三轮跑批 66.80–66.83 m / 闭环 23–35 mm（§9.10）。
+
 ## 1. 目标与边界
 
 - 视觉具备**独立短期运动估计能力**，再与 Super-LIO 紧耦合，而不是只做图像上色。
@@ -46,6 +48,8 @@ solution_b_tight_coupled/
 │   │   ├── constraint/msckf_constraint.hpp         # 多帧重投影 + 零空间投影
 │   │   ├── constraint/photometric_constraint.hpp   # 可选 Patch 光度残差
 │   │   ├── estimator/unified_estimator.hpp         # 统一 ESIKF 封装
+│   │   ├── estimator/rotation_estimator.hpp        # 深度辅助的相对旋转估计（视觉增量）
+│   │   ├── estimator/rotation_refiner.hpp          # 旋转滑窗鲁棒融合（后处理，默认关）
 │   │   └── estimator/map_commit_scheduler.hpp      # 延迟地图提交
 │   ├── src/                                     # 与头文件一一对应的实现
 │   └── src/node/visual_b_node.cpp               # ROS2 接线节点（退化感知与守卫见 §9）
@@ -126,6 +130,7 @@ Super-LIO 主干 + B 视觉支路，视觉约束通过 `super_lio` 暴露的通�
 | `super_livo_visual_b/odom` | `nav_msgs/Odometry` | 发布 | 视觉修正后轨迹 |
 | `super_livo_visual_b/path` | `nav_msgs/Path` | 发布 | |
 | `super_livo_visual_b/colored_cloud` | `sensor_msgs/PointCloud2` | 发布 | 复用 Colorizer |
+| `super_livo_visual_b/odom_rot_refined` | `nav_msgs/Odometry` | 发布 | 仅旋转后处理通道（`rot_refine.enable=true` 时才发，见 §9.9） |
 
 ## 7. 实施阶段与验收
 
@@ -176,8 +181,12 @@ cond_t≈33 误映射成 0.5，健康段就无端松开先验，已修）。完�
 ### 9.3 退化段守卫
 
 `guard.enable=true`：先验否决（LIO 帧间跳变超 `lio_jump_pos=1.0 m` / `lio_jump_rot=0.2618 rad`
-且 sev≥`0.9` 时拒绝跟随）+ 速度限幅（`vel_ratio=1.5`、`vel_fallback=3.0`、`vel_abs_cap=3.0`），
+且 sev≥`0.9` 时拒绝跟随）+ 速度限幅（`vel_ratio=1.5`、`vel_fallback=3.0`、`vel_abs_cap=6.0`），
 日志尾段 `守卫: 先验否决= 速度限幅=` 计数。
+
+> 2026-11 修正：原实现把绝对速度上限挂在 `degen_sev >= sev_threshold(0.9)` 分支内，Super-LIO
+> 未发 `/lio/degeneracy` 时该分支永假 ⇒ 上限从未生效（实测 `速度限幅=0`、`|v|` 发散到 125 m/s）。
+> 现在绝对上限**无条件生效**，退化段仍按 `vel_ref × vel_ratio` 收紧并再压到绝对上限之下。
 
 ### 9.4 验证结论（NTU eee_03 走廊裁剪，Y_HALF=1.2，8 次重复单跑 tag=y12fix2~y12fix9）
 
@@ -236,3 +245,75 @@ cond_t≈33 误映射成 0.5，健康段就无端松开先验，已修）。完�
 - **效果**：8 次重复单跑 `>50 ms 帧数 = 0/176~178`，选轨 p50 0.3~0.5 ms、max ≤3.0 ms。
 - **语义变化**：参与 MSCKF 的轨迹观测史被限制在 16 帧（约束强度略降），基线一律按
   tag=y12fix* 重跑，修复前的 y12hist* 数字不再可比。
+
+### 9.7 Patch 前端：单层 SSD → 金字塔 LK
+
+**症状**：Retail_Street 手持快速转动时，帧间光流中位 **6~25 px**（远超默认 `search_radius=9` 的
+5×5 块匹配搜索域）。同批特征用 `calcOpticalFlowPyrLK` 复算，位移差中位 **6~16 px**、
+**94~100%** 特征差 >3 px ⇒ 视觉相对旋转偏差 **1.5~2°**（真实值的数倍），修正器被推向错方向。
+
+**修复**（`src/frontend/patch_tracker.cpp`）：
+
+- 光流改 `cv::calcOpticalFlowPyrLK`：窗口 `2*search_radius+1`（默认 9×9）、
+  `maxLevel = pyramid_levels-1`（默认 4 层）、亚像素终止 30 次 / 0.01 px；
+- 保留原有"NCC/SSD 打分 + `lssd_threshold` 门限"做二次筛选，角点补充、`min_distance` 去重不变；
+- `reset()` 同时释放 `prev_gray_`，避免首帧与上一条序列的灰度图做光流。
+
+**语义变化**：`search_radius` 从"SSD 搜索半径"变为"LK 窗口半边长"；`pyramid_levels` 此前只是
+声明、从未参与计算，现在真正生效。跟踪点数与内点率的变化见 §9.8 的 Retail 跑批。
+
+### 9.8 `b_own` 三层修复：速度观测、守卫与 10 Hz 同频
+
+**症状**：Retail_Street 中间段起自建轨迹停止推进，彩色点云只覆盖前段（**6,334,382** 点，全段应为
+**17,113,313** 点）；日志 `守卫: 速度限幅=0` 但 `|v|` 发散到 **125 m/s**。
+
+**三层原因与修复**：
+
+1. **守卫死代码**：绝对速度上限写在 `degen_sev >= sev_threshold(0.9)` 分支内，Super-LIO 不发
+   `/lio/degeneracy` 时该分支永假。改为无条件生效，上限 3.0 → **6.0 m/s**（退化段仍按
+   `vel_ref × vel_ratio` 收紧）。
+2. **速度无观测**：原先只在先验帧才写速度观测，LIO 高频先验下 `b_own` 长期裸积分。新增
+   `lioVelocity()` 用 **0.1 s 基线差分**注入（`lv.prior_vel_sigma=0.25`），并把
+   `lidarUpdate` 的传播步数按实际先验间隔放宽（`k = min(10, max(1, dt/0.1))`）。
+3. **own 与 `/lio/odom` 不同频**：`pushOwnPoseSample()` 改为零阶保持，own 帧与 LIO 帧一一对应；
+   own 发布前用 `color.own_res_max_pos=0.5 m` / `own_res_max_rot=0.035 rad` 做信任域截断，
+   超限时退化为"最近 LIO 位姿"而不是硬拼接。
+
+**效果**：彩色点云 6,334,382 → **17,113,313** 点，末帧上色率 **71.1%**；`|v|` 峰值 6.21
+（`速度限幅` 393 次，属安全网生效而非观测缺失）。
+
+**边界**：`b_own` 仍是双位姿源拼接，只能说明"自己的轨迹不再断"，不能当作"B 优于 b_lio"的判据
+（层裂来自两个位姿源，见 §8.3）。
+
+### 9.9 旋转后处理通道（`rot_refine`，默认关）
+
+- **组成**：`rotation_estimator`（P0-F `estimate_rotation_d` 的 C++ 移植：带深度项的 6 参数
+  IRLS/LM，只依赖 Eigen）+ `rotation_refiner`（滑窗鲁棒融合，λ=0.30、Huber、IRLS）；
+- **作用面**：只修正**发布旋转**，位置透传，不回写 ESIKF、不改地图、不影响色彩化；输出话题
+  `super_livo_visual_b/odom_rot_refined`；`rot_refine.enable=false` 时零开销；
+- **参数**：`window=15`、`sigma_prior_deg=0.30`、`sigma_accel_deg=0.50`、`clip_deg=0.30`、
+  `min_pairs=40`、`noise_mode=w3|cov`、`slew_factor`、`dump_csv`；
+- **终判**（eee_01，Δt=0.1 s，与 §36.18 的区间旋转 RPE 同口径）：默认 w3 档 RMS **0.2864°**，
+  略差于 LIO 的 **0.2810°**（偏航 0.0385 → 0.0532°）；换成实测噪声（σ=0.3° +
+  `px_med≤1.0 ∧ n_inl≥100`）后 RMS **0.2573°（−8.4%）**、中位 0.1100°，但偏航退化到 0.0469°
+  ⇒ **默认关闭**，仅保留开关与产物供后续噪声模型改进后复核；
+- **原因**：视觉噪声被低估 40–100×——W3 主轴 0.0235/0.0278/0.0567°，而实测残差稳健 σ 为
+  0.3001/0.2194/0.1499°，`|u|` 中位 0.2027°、**44% 帧顶到 clip 0.30°**。
+
+### 9.10 Retail_Street 现状态跑批（2026-11-16）
+
+同 bag、单变量（`exp_records.md` §37）：
+
+| 轮次 | `pcd.save_interval_sec` | `/lio/odom` 条数 | 路径长度 | 闭环误差 | 注入生效 | 彩色 PCD |
+| --- | --- | --- | --- | --- | --- | --- |
+| 默认 | 30 | 1293 | 66.83 m | 23.0 mm | 1248/1283（97.3%） | 16,815,272 点 / 269 MB |
+| 不落盘 | 0 | 1308 | 66.81 m | 34.2 mm | 1281 | 无（SIGINT 无响应） |
+| reliable QoS | 0（轮 2 基础上） | 1316 | 66.82 m | 35.0 mm | 1299 | 无 |
+
+- 三轮融合轨迹与 11-14 旧代码 B **无回归**（66.80–66.83 m / 闭环 23–35 mm）；
+- **未解决①**：`t≈42 s` 处 **3.2 s 数据时间空洞**（三轮与 11-14 旧运行同样存在）。原始 bag 该段
+  lidar/imu/image 全连续（最大间隔 0.1195 s）⇒ 丢样在消费侧，根因未定位；reliable QoS 未消除；
+- **未解决②**：`visual_b_app` 收到 SIGINT 无响应（45 s 后 SIGKILL，析构落盘不执行）⇒ 点云只能靠
+  `pcd.save_interval_sec` 周期落盘；`save_interval=0` 时无 PCD 属预期；
+- **注意**：第三轮 B 自有 odom 异常（85.37 m / 闭环 16.35 m / z 到 −2.99 m），同轮 `/lio/odom` 正常，
+  归因未定，引用该轮 `b_own` 数字前须先查。

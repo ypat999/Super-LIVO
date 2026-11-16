@@ -111,3 +111,18 @@
     # 期间图像/IMU 回调全阻塞，估计算法会按陈旧 acc 外推导致速度爆掉（实测发散到 km 级）。
     pcd.save_interval_sec: 0.0
     pcd.max_points: 20000000
+
+    # ---- 旋转后处理（P0-F RotationRefiner 移植，默认关）----------------------
+    # 只改"发布的旋转通道"（/super_livo_visual_b/odom_rot_refined），位置原样透传，
+    # 不写回 ESKF/地图；enable=false 时零开销（不建估计器、不建 CSV、不发话题）。
+    rot_refine.enable: false
+    # w3 = §36.12 实测固定协方差（与 §36.14 离线回放同源）；cov = 逐区间估计协方差
+    rot_refine.noise_mode: "w3"
+    rot_refine.window: 15
+    rot_refine.sigma_prior_deg: 0.30
+    rot_refine.sigma_accel_deg: 0.50
+    rot_refine.clip_deg: 0.30
+    rot_refine.slew_factor: 2.0
+    rot_refine.enable_bounds: true
+    rot_refine.min_pairs: 40
+    rot_refine.dump_csv: ""

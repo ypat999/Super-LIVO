@@ -139,6 +139,9 @@ class UnifiedEstimator {
   FilterState filter_;
   VisualDiagnostics vis_diag_;
   AppliedVisualConstraint applied_;
+  /// 距上次 lidarUpdate 实际传播的时间（s）。LiDAR 先验的每步修正上限按 0.1 s
+  /// 标定，需要乘上本间隔才能跟上低频相机（Retail_Street 1 Hz）的节奏。
+  double lidar_dt_accum_{0.0};
 };
 
 }  // namespace superlivo_b

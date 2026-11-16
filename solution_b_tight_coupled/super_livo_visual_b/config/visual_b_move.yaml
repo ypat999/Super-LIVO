@@ -1,5 +1,5 @@
 # move bag（1280x1024 bgr8 全局快门相机 + Livox CustomMsg）——方案 B 支路参数。
-# 外参 Rcl/Pcl 由 FAST-Calib 标定结果回填（标定 bag：livo_bag/all_ros2，RMSE 0.0150 m）。
+# 外参 Rcl/Pcl 由 FAST-Calib 标定结果回填（标定 bag：livo_bag/all_ros2，RMSE 7.9 mm）。
 super_livo_visual_b:
   ros__parameters:
     image_topic: /left_camera/image
@@ -13,13 +13,13 @@ super_livo_visual_b:
     cam_d: [5.4466418090825280e-02, -4.5147373415016401e-02,
             8.5461102120314711e-06, 1.0486594840736336e-03]
     # LiDAR -> Camera（p_cam = Rcl * P_lidar + Pcl），与方案 A 同一标定结果
-    # FAST-Calib 远端标定（all_ros2_pc2 + img_0120.png，RMSE 7.9 mm）
-    # holefix：按真实板面法向重解 4 孔心（板厚 15mm 前表面 +1° 扇区最小半径），
-    # 孔心重投影 1.17px(mean)/1.69px(max)，比 remote7.9 的 1.37px 略优。
-    Rcl: [-0.018262, -0.999803, -0.007833,
-           0.469345, -0.001655, -0.883013,
-           0.882826, -0.019802,  0.469283]
-    Pcl: [0.028643, -0.142351, -0.026469]
+    # FAST-Calib 重标（all_ros2 + img_0120.png，本地标定参数，RMSE 7.9 mm）
+    # holefix：真实板面 RANSAC 法向 + 前表面 + ±1° 扇区最小半径重解 4 孔心，
+    # 帧 120 四孔重投影 1.00px(mean)/1.62px(max)，优于 FAST-Calib 的 1.26/2.17px。
+    Rcl: [-0.016751, -0.999859, -0.001174,
+           0.458555, -0.006640, -0.888641,
+           0.888508, -0.015424,  0.458601]
+    Pcl: [0.016642, -0.113077, -0.037398]
     img_time_offset: 0.0
     # 相机与雷达扫描存在相位差（最近邻 dt 中位 16.7ms、最大 74ms），放宽同步窗。
     color.sync_max_offset: 0.1

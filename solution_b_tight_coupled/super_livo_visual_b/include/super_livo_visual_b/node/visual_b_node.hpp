@@ -2,9 +2,11 @@
 
 #include <chrono>
 #include <deque>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
@@ -27,6 +29,8 @@
 #include "super_livo_visual_b/constraint/msckf_constraint.hpp"
 #include "super_livo_visual_b/constraint/photometric_constraint.hpp"
 #include "super_livo_visual_b/estimator/map_commit_scheduler.hpp"
+#include "super_livo_visual_b/estimator/rotation_estimator.hpp"
+#include "super_livo_visual_b/estimator/rotation_refiner.hpp"
 #include "super_livo_visual_b/estimator/unified_estimator.hpp"
 #include "super_livo_visual_b/feature_map/keyframe_manager.hpp"
 #include "super_livo_visual_b/frontend/feature_lifecycle.hpp"
@@ -120,6 +124,14 @@ class VisualBNode : public rclcpp::Node {
   /// 每帧图像触发：前端 -> 生命周期 -> 关键帧/轨迹 -> 视觉约束 -> 统一估计器。
   void processVisualFrame(const cv::Mat& gray, double stamp);
 
+  /// 旋转后处理（默认关）：像素对 + LIO 帧间平移 -> 深度辅助相对旋转
+  /// -> RotationRefiner 因果滑窗 -> 发布精修 odom。只改旋转通道，不动 ESKF 状态。
+  void refineRotation(double stamp, double t_pose,
+                      const std::vector<PatchObservation>& obs);
+
+  /// 由相机系旋转协方差 Σ 构白化矩阵 Cw（=Σ^{-1/2}），供 RotationRefiner 用。
+  Eigen::Matrix3d whiteningFromCov(const Eigen::Matrix3d& cov) const;
+
   /// 彩色点云流水线（复用 pointcloud_colorizer），同方案 A。
   ///
   /// 时间基准（与 A 完全一致，2026-11 修复）：
@@ -146,6 +158,9 @@ class VisualBNode : public rclcpp::Node {
   /// 对单帧执行着色；位姿尚未到齐（未来时刻）时返回 false 表示"稍后重试"。
   bool colorizeFrame(const PendingColorFrame& frame);
 
+  /// 最近锚点的融合残差（零阶保持）叠加到 lio 位姿上，写入 own_pose_cache_。
+  void pushOwnPoseSample(double stamp, const Eigen::Matrix4d& T_wl_lio);
+
   /// 按时间插值 T_wl；查询时刻晚于最新采样时返回 false（拒绝用最新位姿顶替未来时刻）。
   bool poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const;
 
@@ -163,9 +178,11 @@ class VisualBNode : public rclcpp::Node {
   /// 把 lio/odom 的 T_wl 先验构造成 30 维信息形式 H/b（只填充 R/p 块）。
   /// b = H·(x_cur ⊖ x_prior)，配合 applyInformationUpdate 的 dx = -P·b，
   /// 结果把当前状态拉回先验位姿。
-  void buildLidarPrior(const Eigen::Matrix4d& T_wl,
+  void buildLidarPrior(const Eigen::Matrix4d& T_wl, double t_pose,
                        Eigen::MatrixXd& H,
                        Eigen::VectorXd& b) const;
+  /// 用 pose_cache_（lio/odom）在 t_pose 附近做 ~0.1 s 差分速度；不可用时 false。
+  bool lioVelocity(double t_pose, Eigen::Vector3d& v_lio) const;
   /// 把本帧 patch 观测 + 相机位姿组装成 FeatureTrack（单观测），跨帧合并交给 KeyframeManager。
   std::vector<FeatureTrack> assembleTracks(
       const std::vector<PatchObservation>& obs, double stamp) const;
@@ -222,6 +239,39 @@ class VisualBNode : public rclcpp::Node {
   /// 本数据集实测最优 0.1 s（与官方 avia.yaml 一致），见 A 的 offset 扫描结论。
   double img_time_offset_{0.0};
 
+  // ---- E2 诊断落盘（默认关闭，与滤波逻辑完全无关）--------------------------
+  // 目的：把"真实 10 Hz 生产链路"上的两样东西原样记下来——该图像时刻的 LIO
+  // 位姿、前端跟踪到的特征像素。离线再用与 P0-F 同口径的深度辅助相对旋转估计
+  // 重算 r_vis，顺序喂 RotationRefiner，从而把"视觉估计器实现差异"与
+  // "修正器在生产数据流上是否成立"两件事解耦。enable=false 时节点行为不变。
+  bool e2_dump_enable_{false};
+  std::string e2_dump_dir_;
+  std::ofstream e2_pose_ofs_;  ///< 每帧一行：stamp,t_pose,R(9),p(3),n_obs
+  std::ofstream e2_obs_ofs_;   ///< 每帧一行：stamp,n,id,u,v,...
+
+  // ---- 旋转后处理（P0-F RotationRefiner，默认关）----------------------------
+  // 只作用于"发布的旋转通道"：R' = Exp(u)·R_lio。不写回 ESKF/地图，因此与
+  // 主滤波完全解耦，可单独评估（M5 之前不做"大改"）。enable=false 时零开销。
+  bool rot_refine_enable_{false};
+  std::string rot_noise_mode_{"w3"};  ///< w3=固定 W3 协方差（§36.14 口径）/ cov=逐区间
+  RotationEstimator::Options rot_estimator_options_;
+  RotationRefiner::Options rot_refine_options_;
+  std::unique_ptr<RotationEstimator> rot_estimator_;
+  std::unique_ptr<RotationRefiner> rot_refiner_;
+  std::ofstream rot_refine_ofs_;  ///< 诊断 CSV（rot_refine.dump_csv 非空时开启）
+  /// 上一帧配对所需的图像时刻观测（feature_id -> 像素）与 LIO 位姿。
+  struct RotPrevFrame {
+    bool valid{false};
+    double t_pose{0.0};
+    Eigen::Matrix4d T_wl{Eigen::Matrix4d::Identity()};
+    std::unordered_map<int, Eigen::Vector2d> obs;
+  };
+  RotPrevFrame rot_prev_;
+  Eigen::Matrix3d R_bc_{Eigen::Matrix3d::Identity()};  ///< Camera->LiDAR 旋转
+  Eigen::Vector3d t_bc_{Eigen::Vector3d::Zero()};      ///< 相机原点在 LiDAR 系
+  std::size_t stat_rot_frames_{0};   ///< 进入精修的帧数
+  std::size_t stat_rot_usable_{0};   ///< 产生可用视觉因子的区间数
+
   // ---- 数据缓存 ------------------------------------------------------------
   std::vector<colorizer::TimedImage> image_cache_;
   std::vector<colorizer::PoseSample> pose_cache_;
@@ -253,6 +303,19 @@ class VisualBNode : public rclcpp::Node {
   // ---- LiDAR 先验（D2）参数 ------------------------------------------------
   double prior_pos_sigma_{0.05};  ///< 位置先验标准差（米）
   double prior_rot_sigma_{0.02};  ///< 旋转先验标准差（弧度）
+  /// 速度先验标准差（米/秒），由 lio/odom 差分速度构造；<=0 关闭。
+  /// 关闭时状态速度没有任何观测（视觉 pose_only、先验只约束 R/p），IMU 传播的
+  /// 残余加速度误差无人纠正，|v| 自由随机游走（实测 Retail_Street 130 s → 120 m/s）。
+  double prior_vel_sigma_{0.25};
+  /// own 着色轨迹的信任域：融合残差（own ⊖ lio）的截断上限。
+  /// 滤波器一旦发散，残差会把 own 位姿拖出图像（§34 上色率 0）；超过上限就按
+  /// 上限截断，让 own 退化成 lio + 有界修正，地图不会整段作废。<=0 表示不截断。
+  double own_res_max_pos_{0.5};
+  double own_res_max_rot_{0.035};
+  /// 最近一次视觉锚点的融合残差（世界系），零阶保持到下一个锚点。
+  double own_anchor_t_{-1.0};
+  Eigen::Vector3d own_anchor_dp_{Eigen::Vector3d::Zero()};
+  Eigen::Matrix3d own_anchor_dR_{Eigen::Matrix3d::Identity()};
   // ---- 退化感知的先验（关键改动）----------------------------------------
   // 各向同性先验在退化场景会把状态强行拉回正在漂移的 LiDAR 位姿，
   // 而且因为 σ 固定，视觉即使有能力也抢不过来。退化时把位置先验按方向拆开：
@@ -316,6 +379,8 @@ class VisualBNode : public rclcpp::Node {
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr colored_cloud_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+  /// 旋转精修后的 odom（只改旋转，位置沿用 LIO；rot_refine.enable=false 时无输出）。
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_rot_refined_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
 
   // ---- 视觉约束桥接（-> Super-LIO ESKF）------------------------------------
