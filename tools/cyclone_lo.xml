@@ -25,7 +25,10 @@
       </Peers>
     </Discovery>
     <Internal>
-      <SocketReceiveBufferSize min="1MB" max="32MB"/>
+      <!-- min 必须 <= 本机 net.core.rmem_max，否则 rmw_create_node 直接 abort。
+           本机 rmem_max=425984 B 且无 root（sysctl 属宿主命名空间）：min=1MB 不满足。
+           无后缀即字节数（CycloneDDS 不认 KB 后缀）。 -->
+      <SocketReceiveBufferSize min="131072" max="33554432"/>
       <DefragReliableMaxSamples>512</DefragReliableMaxSamples>
       <DefragUnreliableMaxSamples>512</DefragUnreliableMaxSamples>
     </Internal>

@@ -1,0 +1,41 @@
+/**:
+  ros__parameters:
+    # Camera intrinsics from /home/ywj/slam_data/camera_intrinsic.yaml (1280x1024)
+    fx: 7.0863125924497740e+02
+    fy: 7.0871513587278127e+02
+    cx: 6.4449372682521789e+02
+    cy: 4.9588359175254533e+02
+    k1: 5.4466418090825280e-02
+    k2: -4.5147373415016401e-02
+    p1: 8.5461102120314711e-06
+    p2: 1.0486594840736336e-03
+
+    # FAST-Calib standard board geometry (measured from this bag:
+    # fitted circle radius ~0.119, horizontal spacing ~0.48 -> default board)
+    marker_size: 0.2
+    delta_width_qr_center: 0.55
+    delta_height_qr_center: 0.35
+    delta_width_circles: 0.5
+    delta_height_circles: 0.4
+    circle_radius: 0.12
+    min_detected_markers: 3
+
+    # Distance filter window in LiDAR frame (board plane at x~1.9m, scene has floor/wall clutter beyond)
+    x_min: 1.4
+    x_max: 2.3
+    y_min: -1.0
+    y_max: 0.8
+    z_min: 0.2
+    z_max: 1.6
+
+    # Board plane prior in LiDAR frame (from offline RANSAC on this bag:
+    # fc_board_verify.py plane3, the surface with the 4 circular holes)
+    board_normal_x: -0.973
+    board_normal_y: -0.004
+    board_normal_z: -0.229
+    board_d: 1.998
+
+    lidar_topic: "/livox/lidar"
+    bag_path: "/home/ywj/slam_data/livo_bag/all_ros2"
+    image_path: "/home/ywj/tmp/calib_frames/f2.png"
+    output_path: "/home/ywj/slam_data/calib_fast_calib"

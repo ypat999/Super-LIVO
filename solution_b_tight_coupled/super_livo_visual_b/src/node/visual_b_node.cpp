@@ -124,12 +124,13 @@ VisualBNode::VisualBNode(const rclcpp::NodeOptions& options)
   const std::string imu_topic = this->declare_parameter<std::string>("imu_topic", "/livox/imu");
 
   // ---- 创建订阅器 ---------------------------------------------------------
-  // 图像订阅 QoS 默认沿用 SensorDataQoS（best_effort，与相机驱动一致）。
-  // image.qos_reliable=true 时改成 reliable/depth 10，与 Rosbag2 回放端一致：
-  // 单线程 executor 被密集点云回调占住时，best_effort 读者会被静默丢样且不恢复
-  // （实测 own 模式整段 0 帧图像，而 reliable 读者同期稳定收到），reliable 则有背压。
+  // 图像订阅 QoS 默认 reliable/depth 10，与 Rosbag2 回放端（以及 FL2 的 reliable 订阅）一致。
+  // 实测本机（WSL2，rmem_max=208 KB 且无 root）用 best_effort 订阅 4 MB 级原图时，
+  // 只要该订阅存在，整条图像流就被拖到 ~0.35 Hz（并行的 reliable 计数订阅也一起掉），
+  // B 臂因此拿不到图；调大 DefragUnreliableMaxSamples 无效。
+  // 若真实相机驱动发布 best_effort，需把 image.qos_reliable 设为 false。
   const bool image_qos_reliable =
-      this->declare_parameter<bool>("image.qos_reliable", false);
+      this->declare_parameter<bool>("image.qos_reliable", true);
   if (image_qos_reliable) {
     image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
         image_topic, rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),

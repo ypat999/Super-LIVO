@@ -1,0 +1,24 @@
+# RTK-SLAM construction_seq2（Livox Mid-360 CustomMsg + 1600x1200 压缩相机）——方案 A 相机参数。
+# 外参由 experiments/config/livox_360_visa.yaml 的 T_cam_lidar 转置得到（p_lidar = Rcl*p_cam + Pcl）：
+#   Rcl(cam->lidar) = R(L->C)^T，Pcl = -R(L->C)^T * t(L->C)
+# 数值与 fl2_cfg/rtk_construction_lvi.yaml 的 Rcl(L->C)/Pcl(L->C) 互为逆。
+super_livo_visual_a:
+  ros__parameters:
+    image_topic: /camera/image_raw
+    imu_topic: /livox/imu
+    cam_width: 1600
+    cam_height: 1200
+    cam_fx: 890.6048325304455
+    cam_fy: 890.6189647772335
+    cam_cx: 780.9722805357044
+    cam_cy: 589.7898852172461
+    cam_d: [-0.14707811196570506, 0.08102897302832712,
+            -0.00039435857931765405, 0.0006560130981826822]
+    Rcl: [0.001086871, -0.383650515, -0.923477721,
+          0.999998872, -0.000540803, 0.001401603,
+          -0.001037145, -0.923478202, 0.383649495]
+    Pcl: [-0.072197009, -0.022028085, -0.021964874]
+    # 数据集已把 -20.6 ms 相机触发延迟补偿进发布格式
+    img_time_offset: 0.0
+    # 相机 20 Hz / 雷达 10 Hz
+    color.sync_max_offset: 0.05

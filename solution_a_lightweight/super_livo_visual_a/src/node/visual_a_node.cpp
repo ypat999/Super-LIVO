@@ -76,9 +76,22 @@ VisualANode::VisualANode(const rclcpp::NodeOptions& options)
       this->declare_parameter<std::string>("body_cloud_topic", "lio/cloud_body_dense");
 
   // ---- 创建订阅器 ---------------------------------------------------------
-  image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-      image_topic, rclcpp::SensorDataQoS(),
-      std::bind(&VisualANode::onImage, this, std::placeholders::_1));
+  // 图像订阅 QoS 默认 reliable/depth 10，与 Rosbag2 回放端（以及 FL2 的 200000 深队列
+  // reliable 订阅）一致。实测本机（WSL2，rmem_max=208 KB 且无 root）用 best_effort
+  // 订阅 1280x1024/1600x1200 原图时，只要该订阅存在，整条图像流就被拖到 ~0.35 Hz，
+  // 连并行的 reliable 计数订阅也一起掉（发布端被阻塞），A 臂因此拿不到图。
+  // 若真实相机驱动发布 best_effort，需把 image.qos_reliable 设为 false。
+  const bool image_qos_reliable =
+      this->declare_parameter<bool>("image.qos_reliable", true);
+  if (image_qos_reliable) {
+    image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+        image_topic, rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
+        std::bind(&VisualANode::onImage, this, std::placeholders::_1));
+  } else {
+    image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+        image_topic, rclcpp::SensorDataQoS(),
+        std::bind(&VisualANode::onImage, this, std::placeholders::_1));
+  }
   odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
       odom_topic, rclcpp::SensorDataQoS(),
       std::bind(&VisualANode::onOdom, this, std::placeholders::_1));

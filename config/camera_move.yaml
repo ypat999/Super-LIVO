@@ -1,0 +1,16 @@
+/**:
+  ros__parameters:
+    # FL2 从 parameter_blackboard 读相机内参（LIVMapper.cpp: loadFromRosNs(node, "parameter_blackboard", ...)）。
+    # 数值与 config/camera_intrinsic.yaml、config/calib_result.txt 同一套标定（海康 MV-CB013，1280x1024）。
+    cam_model: Pinhole
+    cam_width: 1280
+    cam_height: 1024
+    scale: 1.0
+    cam_fx: 708.63125924497740
+    cam_fy: 708.71513587278127
+    cam_cx: 644.49372682521789
+    cam_cy: 495.88359175254533
+    cam_d0: 0.054466418090825280
+    cam_d1: -0.045147373415016401
+    cam_d2: 0.0000085461102120314711
+    cam_d3: 0.0010486594840736336
