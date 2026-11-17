@@ -1,0 +1,94 @@
+# 方案 A「两进程」跑 move 的参数文件：super_lio_node（LIO 核）+ visual_a_node（上色/视觉支路）。
+# 与 solution_a_lightweight/.../visual_a_move.yaml（单进程 app：visual_a_app，内部话题直连）不同，
+# 这里的 LIO 话题走本目录 20_move_clock_shift_relay.py 重发布的 *_shift 版本。
+# ⚠️ Rcl/Pcl 必须与以下四处逐字一致（改外参时一起改）：
+#   config/move_fastcalib.yaml（FL2 用）
+#   solution_a_lightweight/super_livo_visual_a/config/visual_a_move.yaml
+#   solution_b_tight_coupled/super_livo_visual_b/config/visual_b_move.yaml
+#   本文件与 20_move_b_node.yaml
+/**:
+  ros__parameters:
+    # 自采 move_ros2 bag（MV-CB013 1280x1024 全局快门 + MID360）
+    # 图像保持原始 header（主机时钟）；LIO 侧 odom/点云由 20_move_clock_shift_relay.py
+    # 抬到同一时钟域（+204262818.9974 s），因此这里 offset 置 0。
+    image_topic: "/left_camera/image"
+    odom_topic: "lio/odom_shift"
+    cloud_topic: "lio/cloud_world_shift"
+    body_cloud_topic: "lio/cloud_body_dense_shift"
+
+    # camera_intrinsic.yaml（全分辨率，不缩放）
+    scale: 1.0
+    cam_width: 1280
+    cam_height: 1024
+    cam_fx: 708.63125924497740
+    cam_fy: 708.71513587278127
+    cam_cx: 644.49372682521789
+    cam_cy: 495.88359175254533
+    cam_d: [0.054466418090825280, -0.045147373415016401,
+           0.0000085461102120314711, 0.0010486594840736336]
+
+    # holefix 重写解（2026-11-17），语义 p_cam = Rcl·p_lidar + Pcl（与 FAST-LIVO2 一致）
+    # 四孔 3D 对应点 RMSE 3.2 mm；FAST-Calib 直出为 7.9 mm
+    Rcl: [-0.017100, -0.999833, -0.006427,
+           0.482159, -0.002615, -0.876080,
+           0.875917, -0.018080,  0.482123]
+    Pcl: [0.027840, -0.172288, -0.047550]
+
+    # 时间域已由 relay 平移，节点内不再加偏移
+    img_time_offset: 0.0
+
+    klt.max_features: 150
+    klt.pyramid_levels: 3
+    klt.min_distance: 10.0
+    klt.fb_error_threshold: 1.0
+    klt.min_track_length: 3
+    klt.trace_window: 5
+    klt.use_fast: true
+    klt.fast_threshold: 20
+    klt.quality_level: 0.01
+    klt.lk_window: 21
+
+    depth.pixel_radius: 3
+    depth.search_radius: 0.3
+    depth.min_depth: 0.5
+    depth.max_depth: 80.0
+    depth.max_neighbors: 5
+    depth.anchor_window: 5
+
+    reproj.huber_delta: 1.0
+    reproj.min_constraints: 8
+    reproj.max_pixel_error: 8.0
+    reproj.sigma_pix: 1.5
+    reproj.sigma_anchor: 0.05
+
+    gate.min_tracked_features: 30
+    gate.max_reprojection_rmse: 3.0
+    gate.min_spread: 0.15
+    gate.max_condition: 1.0e5
+    gate.assist_weight: 0.3
+    gate.high_weight: 0.8
+    gate.assist_degeneracy: 0.3
+    gate.high_degeneracy: 0.7
+
+    update.enable: true
+    update.max_dx_norm: 0.5
+    update.prior_rot_sigma: 0.02
+    update.prior_pos_sigma: 0.05
+
+    visual.use_exposure_pose: true
+
+    # Super-LIO 的 dense cloud stamp 是帧末（比雷达 header 晚约 0.1 s），
+    # 放宽到 0.2 s 才能与 10 Hz 图像配对上
+    color.sync_max_offset: 0.2
+    color.use_exposure_mid: true
+    color.depth_tolerance: 0.1
+    color.check_depth_edges: true
+    color.edge_threshold: 0.5
+    color.bilinear: true
+    color.keep_best_quality: true
+    color.min_quality: 0.2
+
+    # 仅作缺省值：20a_run_move_a.sh 会用 -p pcd.save_dir:=$RESULTS/$TAG 覆盖
+    pcd.save_dir: "/mnt/dataset/slam_data/calib/results/move_hf_a"
+    pcd.save_interval_sec: 0.0
+    pcd.max_points: 20000000

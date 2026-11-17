@@ -1,6 +1,6 @@
 # freqcmd.txt — Super-LIVO 换机/换环境常用命令（标定 / 跑批 / 测速）
 # 适用：Ubuntu 20.04/22.04 + ROS2 Humble，Livox Avia + 集成 IMU + 相机（MV-CB013，1280x1024）
-# 换环境只需改 §0 的路径变量，其余命令原样可用。最近核对：2026-11-16（外参复标定 + move 三臂跑批）
+# 换环境只需改 §0 的路径变量，其余命令原样可用。最近核对：2026-11-17（holefix 外参重写 + move 三臂重跑，命令见 §4.3）
 
 # ============================================================
 # 0. 路径与环境变量（按需修改）
@@ -120,6 +120,28 @@ sleep 3; kill -TERM $REC; sleep 2
 pkill -INT -f fastlivo_mapping; for i in $(seq 1 80); do pgrep -f fastlivo_mapping >/dev/null || break; sleep 1; done
 cp $REPO/third_party/FAST-LIVO2-ROS2/Log/pcd/*.pcd $OUT/ 2>/dev/null   # all_raw / all_downsampled
 
+# --- 4.3 本轮（2026-11-17 holefix 外参）实际用的三臂命令：两进程模式 ---
+# 与 4.1 的区别：4.1 是单进程 app（visual_*_app，话题内部直连、输入 move_livoxclk）；
+# 4.3 走 super_lio_node + visual_{a,b}_node，输入原始 move_ros2，LIO 话题由
+# experiments/octvox_ablation/20_move_clock_shift_relay.py 平移 +204262818.9974 s
+# 重发为 *_shift（odom / cloud_body_dense / cloud_world 三个，⚠️ 不含 /tf），
+# 所以参数里 img_time_offset=0.0。脚本与参数已入库，产物默认写 /mnt/dataset/slam_data/calib/results/<tag>。
+export LD_LIBRARY_PATH=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v trae | paste -sd:)  # 见 §8
+cd $REPO/experiments/octvox_ablation
+
+RATE=0.1 bash 20c_run_move_fl2.sh  move_hf_fl2   # → raw_points.pcd 4.12M，736 位姿，闭环 0.020 m
+RATE=0.6 bash 20a_run_move_a.sh   move_hf_a      # → super_livo_visual_a_colored.pcd 3.38M，721/741 帧着色
+RATE=0.05 bash 20b_run_move_b.sh  move_hf_b      # → super_livo_visual_b_colored.pcd 2.30M，430/739 帧着色
+# 倍速是硬约束，不要随手改：
+#  · A 两支路合计 1.07 CPU-秒/数据秒（实测 /proc：LIO 53.9 ms/云帧 + VIS 56.8 ms/图帧），0.6x 有余量；
+#  · B 单帧 ~2.8s > 0.05x 的 2.1s 到达间隔，>0.12x 整段跑不完（丢帧在 DDS 订阅侧，非配对阈值问题）；
+#  · B 收到 SIGINT 不落盘，彩色图只靠 pcd.save_interval_sec:=15 周期落盘，脚本要等日志静止 40s 再杀。
+# 本轮结果：path FL2 10.089 / A 9.581 / B 9.561 m；闭环 0.020 / 0.027 / 0.025 m；
+#   互查 A↔B NN P50=1.4 P90=2.6 P99=7.1 cm，ICP |t|=1mm θ=0.00°（两臂基本重合）；
+#        A↔FL2 3.6/5.3/18.5 cm；B↔FL2 3.7/5.6/24.1 cm（ICP |t| 均 45mm，θ=0.05°）。
+# 分析脚本（未入库）：/tmp/hf_cmp.py <results根> move_hf_a move_hf_b move_hf_fl2 出俯/侧视对比图；
+#                    /tmp/hf_chamfer.py A=<pcd> B=<pcd> FL2=<pcd> 出双向 NN + point-to-plane ICP。
+
 # ============================================================
 # 5. 相机-雷达外参标定（FAST-Calib：静态累积点云 + 单帧图）
 # ============================================================
@@ -133,10 +155,12 @@ ros2 run fast_calib fast_calib --ros-args \
   --params-file $REPO/third_party/FAST-Calib-ROS2/config/qr_params.yaml -r __node:=fast_calib
 # 或 ros2 launch fast_calib calib_launch.py rviz:=false   （launch 已把节点改名为 fast_calib）
 # 终端输出最终 R/T 与 RMSE；本轮 all_ros2 + img_0120：RMSE 7.9 mm、四孔重投影 1.00/1.62 px（去畸变像素）
-# 5.3 外参落到三份配置（必须一致）：
-#     solution_a_lightweight/super_livo_visual_a/config/visual_a_move.yaml
-#     solution_b_tight_coupled/super_livo_visual_b/config/visual_b_move.yaml
-#     config/move_fastcalib.yaml
+# 5.3 外参落到五份配置（必须逐字一致，改外参时五处一起改）：
+#     solution_a_lightweight/super_livo_visual_a/config/visual_a_move.yaml    （4.1 单进程 app）
+#     solution_b_tight_coupled/super_livo_visual_b/config/visual_b_move.yaml  （4.1 单进程 app）
+#     config/move_fastcalib.yaml                                             （4.2/4.3 FL2 主参数文件）
+#     experiments/octvox_ablation/20_move_a_node.yaml                        （4.3 A 两进程）
+#     experiments/octvox_ablation/20_move_b_node.yaml                        （4.3 B 两进程）
 
 # ============================================================
 # 6. 测速（核心：实时率 = 处理总耗时 / bag 时长 135.47s）
