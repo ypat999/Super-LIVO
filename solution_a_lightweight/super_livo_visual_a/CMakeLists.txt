@@ -44,6 +44,25 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
   ${OpenCV_LIBS}
 )
 
+# ---- 方案 A 单体流水线（ROS 无关，纯新增） --------------------------------
+# 把原 VisualANode 的处理逻辑抽成不依赖 rclcpp 的类：输入是普通类型，输出走
+# std::function 回调。这样 Super-LIO 可以在同一进程内直接"推"数据给它，
+# 完全绕开 DDS 话题回环。原有的 visual_a_node / visual_a_app 行为不变。
+add_library(${PROJECT_NAME}_pipeline SHARED
+  src/pipeline/visual_pipeline.cpp
+)
+target_include_directories(${PROJECT_NAME}_pipeline PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${PCL_INCLUDE_DIRS}
+  ${super_livo_common_INCLUDE_DIRS}
+)
+target_link_libraries(${PROJECT_NAME}_pipeline
+  ${PROJECT_NAME}
+  ${PCL_LIBRARIES}
+)
+ament_target_dependencies(${PROJECT_NAME}_pipeline pointcloud_colorizer)
+
 # ---- 方案 A ROS2 节点 ------------------------------------------------------
 add_executable(visual_a_node src/node/visual_a_node_main.cpp src/node/visual_a_node.cpp)
 target_include_directories(visual_a_node PRIVATE
@@ -62,14 +81,14 @@ target_include_directories(visual_a_app PRIVATE
   ${PCL_INCLUDE_DIRS}
   ${super_livo_common_INCLUDE_DIRS}
 )
-target_link_libraries(visual_a_app ${PROJECT_NAME} ${PCL_LIBRARIES} super_lio::lio)
+target_link_libraries(visual_a_app ${PROJECT_NAME} ${PROJECT_NAME}_pipeline ${PCL_LIBRARIES} super_lio::lio)
 ament_target_dependencies(visual_a_app rclcpp sensor_msgs nav_msgs geometry_msgs cv_bridge pcl_conversions pointcloud_colorizer)
 
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME}
 )
-install(TARGETS ${PROJECT_NAME} visual_a_node visual_a_app
+install(TARGETS ${PROJECT_NAME} ${PROJECT_NAME}_pipeline visual_a_node visual_a_app
   EXPORT ${PROJECT_NAME}Targets
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
