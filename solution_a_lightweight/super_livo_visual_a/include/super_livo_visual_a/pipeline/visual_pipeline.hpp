@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -96,6 +97,24 @@ struct VisualPipelineOptions {
   std::string pcd_save_dir{"/home/ywj/slam_data/pcd"};
   /// 时间中位数体素边长（米），<=0 关闭。
   float median_voxel_size{0.01F};
+
+  // ---- 轨迹 / 图像落盘（参照 FAST-LIVO2 的 evo / image_save 开关） ----
+  /// 轨迹输出开关：TUM 格式（timestamp tx ty tz qx qy qz qw），
+  /// 位姿为 camera_init（Super-LIO world）系下的 LiDAR 位姿 T_wl，每个 LiDAR 帧一行。
+  bool pose_output_en{false};
+  /// 轨迹文件名（不含 .txt），最终文件 = <pose_save_dir>/<pose_seq_name>.txt。
+  std::string pose_seq_name{"scene_move"};
+  /// 轨迹输出目录；空 = pcd_save_dir。
+  std::string pose_save_dir;
+  /// 每 N 个 LiDAR 帧写一行（<=0 关闭）。
+  int pose_save_interval{1};
+
+  /// 图像输出开关：PNG，文件名 = 图像时间戳（固定 6 位小数）。
+  bool img_save_en{false};
+  /// 图像输出目录；空 = <pcd_save_dir>/image。
+  std::string img_save_dir;
+  /// 每 N 张图像写一张（<=0 关闭）。
+  int img_save_interval{1};
 };
 
 /// 进程内视觉流水线（方案 A）。
@@ -193,6 +212,8 @@ class VisualPipeline {
   void decayPoseOffset(double dt, double severity, const Eigen::Vector3d& dir_w);
   void accumulateColoredMap(const std::vector<colorizer::ColoredPoint>& points, double stamp);
   void saveColoredMap();
+  void savePose(const Eigen::Matrix4d& T_wl, double stamp);
+  void saveImage(const cv::Mat& bgr, double stamp);
   void publishColoredCloud(const std::vector<colorizer::ColoredPoint>& points, double stamp);
   void publishOdomAndPath(const Eigen::Matrix4d& T_wl, double stamp);
 
@@ -274,6 +295,12 @@ class VisualPipeline {
   std::deque<PendingColorFrame> pending_color_;
   std::deque<PendingCloud> pending_clouds_;
   double last_colored_cloud_stamp_{-1.0};
+
+  // ---- 轨迹 / 图像落盘（仅工作线程写） ----
+  std::ofstream pose_file_;
+  std::string img_save_dir_resolved_;
+  std::size_t pose_frame_count_{0};
+  std::size_t img_frame_count_{0};
 
   // ---- 统计 ----
   std::size_t stat_colorizer_calls_{0};

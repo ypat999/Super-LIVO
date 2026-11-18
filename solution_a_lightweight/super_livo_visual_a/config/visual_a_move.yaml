@@ -33,3 +33,16 @@ super_livo_visual_a:
       save_dir: "/home/ywj/slam_data/output/move_a"
       save_interval_sec: 30.0
       max_points: 20000000
+
+    # 轨迹 / 图像落盘（参照 FAST-LIVO2 的 evo / image_save）
+    #   轨迹：<save_dir>/<seq_name>.txt，TUM 格式
+    #   图像：<image_save.dir>/<timestamp>.png（目录留空 = <pcd.save_dir>/image）
+    evo:
+      pose_output_en: false
+      save_dir: ""                 # 空 = pcd.save_dir
+      seq_name: "scene_move"       # → scene_move.txt
+      interval: 1
+    image_save:
+      img_save_en: false
+      dir: ""                      # 空 = <pcd.save_dir>/image
+      interval: 1

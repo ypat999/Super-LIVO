@@ -4,12 +4,15 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <utility>
 
 #include <Eigen/Eigenvalues>
 #include <Eigen/Geometry>
 #include <opencv2/calib3d.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 namespace superlivo_a {
@@ -95,6 +98,41 @@ VisualPipeline::VisualPipeline(const VisualPipelineOptions& options) : opt_(opti
 
   median_map_.set_voxel_size(opt_.median_voxel_size);
 
+  // ---- 轨迹 / 图像落盘（目录解析与文件打开，参照 FAST-LIVO2 evo/image_save） ----
+  if (opt_.pose_output_en) {
+    const std::string dir =
+        opt_.pose_save_dir.empty() ? opt_.pcd_save_dir : opt_.pose_save_dir;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::string seq = opt_.pose_seq_name.empty() ? "scene_move" : opt_.pose_seq_name;
+    if (seq.size() < 4 || seq.substr(seq.size() - 4) != ".txt") {
+      seq += ".txt";
+    }
+    const std::string path = (std::filesystem::path(dir) / seq).string();
+    if (!ec) {
+      pose_file_.open(path, std::ios::out | std::ios::trunc);
+    }
+    if (pose_file_.is_open()) {
+      log(LogLevel::kInfo, "轨迹输出: " + path);
+    } else {
+      log(LogLevel::kWarn, "无法创建轨迹输出文件 " + path + ": " + ec.message());
+    }
+  }
+  if (opt_.img_save_en) {
+    img_save_dir_resolved_ = opt_.img_save_dir.empty()
+                                 ? (std::filesystem::path(opt_.pcd_save_dir) / "image").string()
+                                 : opt_.img_save_dir;
+    std::error_code ec;
+    std::filesystem::create_directories(img_save_dir_resolved_, ec);
+    if (ec) {
+      log(LogLevel::kWarn,
+          "无法创建图像输出目录 " + img_save_dir_resolved_ + ": " + ec.message());
+      img_save_dir_resolved_.clear();
+    } else {
+      log(LogLevel::kInfo, "图像输出: " + img_save_dir_resolved_);
+    }
+  }
+
   colored_map_.reserve(1024);
   worker_ = std::thread(&VisualPipeline::workerLoop, this);
   log(LogLevel::kInfo, "VisualPipeline 初始化完成（进程内流水线，无 DDS）");
@@ -110,6 +148,10 @@ VisualPipeline::~VisualPipeline() {
   queue_cv_.notify_all();
   if (worker_.joinable()) {
     worker_.join();
+  }
+  if (pose_file_.is_open()) {
+    pose_file_.flush();
+    pose_file_.close();
   }
 }
 
@@ -258,6 +300,7 @@ void VisualPipeline::handleImage(const cv::Mat& bgr, double stamp) {
   if (rectified.empty()) {
     return;
   }
+  saveImage(rectified, stamp);
   cv::Mat gray;
   cv::cvtColor(rectified, gray, cv::COLOR_BGR2GRAY);
 
@@ -284,6 +327,7 @@ void VisualPipeline::handleImage(const cv::Mat& bgr, double stamp) {
 void VisualPipeline::handleOdom(const Eigen::Matrix4d& T_wl, double stamp) {
   T_wl_ = T_wl;
   last_odom_stamp_ = stamp;
+  savePose(T_wl, stamp);
 
   // 累积位姿采样供彩色点云运动补偿。
   colorizer::PoseSample sample;
@@ -983,6 +1027,36 @@ void VisualPipeline::saveColoredMap() {
                              (median_map_.enabled() ? "，时间中位数回填色" : "") + "）");
   } else {
     logThrottled("pcd_save", 5000, LogLevel::kWarn, "保存 PCD 失败: " + path);
+  }
+}
+
+void VisualPipeline::savePose(const Eigen::Matrix4d& T_wl, double stamp) {
+  if (!pose_file_.is_open() || opt_.pose_save_interval <= 0) {
+    return;
+  }
+  if (pose_frame_count_++ % static_cast<std::size_t>(opt_.pose_save_interval) != 0) {
+    return;
+  }
+  const Eigen::Quaterniond q(T_wl.block<3, 3>(0, 0));
+  pose_file_ << std::fixed << std::setprecision(6)
+             << stamp << " " << T_wl(0, 3) << " " << T_wl(1, 3) << " " << T_wl(2, 3)
+             << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w()
+             << std::endl;
+}
+
+void VisualPipeline::saveImage(const cv::Mat& bgr, double stamp) {
+  if (img_save_dir_resolved_.empty() || opt_.img_save_interval <= 0) {
+    return;
+  }
+  if (img_frame_count_++ % static_cast<std::size_t>(opt_.img_save_interval) != 0) {
+    return;
+  }
+  std::ostringstream name;
+  name << std::fixed << std::setprecision(6) << stamp << ".png";
+  const std::string path =
+      (std::filesystem::path(img_save_dir_resolved_) / name.str()).string();
+  if (!cv::imwrite(path, bgr)) {
+    logThrottled("img_save", 5000, LogLevel::kWarn, "保存图像失败: " + path);
   }
 }
 

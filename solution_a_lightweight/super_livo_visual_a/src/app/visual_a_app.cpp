@@ -189,6 +189,19 @@ superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
       getOrDeclare<int>(node, "pcd.max_points", 20000000));
   opt.median_voxel_size =
       static_cast<float>(getOrDeclare<double>(node, "pcd.median_voxel_size", 0.01));
+
+  // ---- 轨迹 / 图像落盘（与 FAST-LIVO2 的 evo / image_save 同口径） ----
+  // 轨迹：<evo.save_dir>/<evo.seq_name>.txt，TUM 格式，每行
+  //       timestamp tx ty tz qx qy qz qw（camera_init 系下 LiDAR 位姿）。
+  // 图像：<image_save.dir>/<timestamp>.png，时间戳固定 6 位小数。
+  // 目录留空时分别落到 pcd.save_dir 与 <pcd.save_dir>/image。
+  opt.pose_output_en = getOrDeclare<bool>(node, "evo.pose_output_en", false);
+  opt.pose_save_dir = getOrDeclare<std::string>(node, "evo.save_dir", "");
+  opt.pose_seq_name = getOrDeclare<std::string>(node, "evo.seq_name", "scene_move");
+  opt.pose_save_interval = getOrDeclare<int>(node, "evo.interval", 1);
+  opt.img_save_en = getOrDeclare<bool>(node, "image_save.img_save_en", false);
+  opt.img_save_dir = getOrDeclare<std::string>(node, "image_save.dir", "");
+  opt.img_save_interval = getOrDeclare<int>(node, "image_save.interval", 1);
   return opt;
 }
 
