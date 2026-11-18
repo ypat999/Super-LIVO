@@ -111,6 +111,98 @@ Eigen::Vector3d so3Log(const Eigen::Matrix3d& R) {
   const Eigen::AngleAxisd aa(R);
   return aa.angle() * aa.axis();
 }
+
+// ===========================================================================
+// 临时探针（只为回答"B 为什么只出 52 帧"，不参与任何估计，可整块删除）。
+// 单线程 executor ⇒ 全部用文件级静态变量，无需加锁。
+// 计三类证据：
+//   ① 订阅侧：每个 topic 的到达次数与相邻 header 间隔（帧到底有没有到）
+//   ② 处理侧：processVisualFrame 次数、相邻处理间隔、各分段耗时的窗口均值/峰值
+//      （现有 "耗时 ms" 行是 INFO_THROTTLE(1000)，一秒只打印最后一帧，不能用来算总量）
+//   ③ 丢弃侧：每条丢弃/延迟路径分开计数，外加周期落盘对 executor 的阻塞时长
+// ===========================================================================
+struct ProbeAcc {
+  double sum{0.0};
+  double max{0.0};
+  std::size_t n{0};
+  void add(double v) {
+    sum += v;
+    max = std::max(max, v);
+    ++n;
+  }
+  double avg() const { return n > 0 ? sum / static_cast<double>(n) : 0.0; }
+  void reset() { *this = ProbeAcc{}; }
+};
+
+struct BranchProbe {
+  // ① 订阅侧
+  std::size_t n_image{0}, n_cloud{0}, n_body{0}, n_odom{0}, n_imu{0};
+  ProbeAcc image_gap, cloud_gap, body_gap, odom_gap, imu_gap;  ///< wall 到达间隔 ms
+  ProbeAcc image_hgap, odom_hgap, body_hgap;  ///< header 相邻增量 ms（找时间域空洞）
+  double first_image{-1.0}, last_image{0.0};
+  double first_odom{-1.0}, last_odom{0.0};
+  double first_body{-1.0}, last_body{0.0};
+  std::chrono::steady_clock::time_point t_image{}, t_cloud{}, t_body{}, t_odom{}, t_imu{};
+
+  // ② 处理侧
+  std::size_t n_process{0};
+  std::chrono::steady_clock::time_point t_process{};
+  ProbeAcc process_gap;   ///< 相邻两次 processVisualFrame 的 wall 间隔 ms
+  ProbeAcc wait_visual;   ///< 视觉帧在 pending_visual_ 中等待 t_pose 的时长 ms
+  ProbeAcc ms_front, ms_constraint, ms_update, ms_color, ms_total;
+  ProbeAcc ms_copy_map, ms_project, ms_normal_eq, ms_select, ms_mscfk;
+  ProbeAcc ms_colorize, ms_accum_map, ms_pub_cloud;
+  ProbeAcc ms_imu_prop, ms_prior, ms_vis_upd, ms_map_commit, ms_pub;
+  ProbeAcc acc_obs, acc_tracks, acc_lv, acc_mscfk_used, acc_used, acc_map_pts;
+
+  // ③ 丢弃 / 延迟侧（每条路径独立计数，累计值不清零）
+  std::size_t drop_pose_hole{0};       ///< 位姿空洞，processVisualFrame 直接返回
+  std::size_t drop_pose_timeout{0};    ///< 视觉帧等位姿超时
+  std::size_t drop_visual_full{0};     ///< 待定视觉队列超限丢弃
+  std::size_t drop_no_image{0};        ///< 云等图像超时
+  std::size_t drop_cloud_full{0};      ///< 等图像队列溢出
+  std::size_t drop_color_timeout{0};   ///< 着色等位姿超时
+  std::size_t drop_color_full{0};      ///< 待着色队列溢出
+  std::size_t color_defer{0};          ///< 本帧位姿未到，留到下次重试
+  std::size_t color_ok{0};             ///< 成功着色帧
+  std::size_t queue_push{0};           ///< runColorizer 入队次数
+  std::size_t n_save{0};
+  ProbeAcc ms_save;                    ///< 周期落盘阻塞时长（单线程 executor 期间全丢）
+  ProbeAcc ms_colored_pts;             ///< 每帧上色点数
+
+  std::chrono::steady_clock::time_point t_report{};
+  std::chrono::steady_clock::time_point t0{};
+  double t_last_report{-1.0};
+  // 窗口增量用：上次上报时的累计计数。
+  std::size_t prev_image{0}, prev_cloud{0}, prev_body{0}, prev_odom{0}, prev_imu{0};
+  std::size_t prev_process{0}, prev_color_ok{0}, prev_queue_push{0}, prev_save{0};
+};
+
+BranchProbe g_probe;
+
+/// 相邻消息到达间隔（首次调用只记时刻）。
+void probeGap(ProbeAcc& acc, std::chrono::steady_clock::time_point& last,
+              const std::chrono::steady_clock::time_point& now) {
+  if (last.time_since_epoch().count() != 0) {
+    acc.add(std::chrono::duration<double, std::milli>(now - last).count());
+  }
+  last = now;
+}
+
+/// 从给定时刻到现在的毫秒数（探针专用）。
+double probeMs(const std::chrono::steady_clock::time_point& from) {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count();
+}
+
+/// header 跨度（秒）转 ms 记录，用于发现时间域空洞。
+void probeHeaderSpan(ProbeAcc& acc, double& first, double& last, double stamp) {
+  if (first < 0.0) {
+    first = stamp;
+  } else if (stamp > last) {
+    acc.add((stamp - last) * 1000.0);
+  }
+  last = std::max(last, stamp);
+}
 }  // namespace
 
 VisualBNode::VisualBNode(const rclcpp::NodeOptions& options)
@@ -131,30 +223,63 @@ VisualBNode::VisualBNode(const rclcpp::NodeOptions& options)
   // 若真实相机驱动发布 best_effort，需把 image.qos_reliable 设为 false。
   const bool image_qos_reliable =
       this->declare_parameter<bool>("image.qos_reliable", true);
+  // 回调侧一律只投递事件到 input_queue_（见 hpp "线程化"段），真正的解析与估计
+  // 在计算工作线程里按到达顺序执行，因此下面的 std::bind(&VisualBNode::onXxx)
+  // 已不再是 executor 回调，而是 workerLoop 的分派目标。
   if (image_qos_reliable) {
     image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
         image_topic, rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
-        std::bind(&VisualBNode::onImage, this, std::placeholders::_1));
+        [this](const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
+          InputEvent ev;
+          ev.kind = InputEvent::Kind::kImage;
+          ev.image = msg;
+          this->pushInputEvent(std::move(ev));
+        });
   } else {
     image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
         image_topic, rclcpp::SensorDataQoS(),
-        std::bind(&VisualBNode::onImage, this, std::placeholders::_1));
+        [this](const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
+          InputEvent ev;
+          ev.kind = InputEvent::Kind::kImage;
+          ev.image = msg;
+          this->pushInputEvent(std::move(ev));
+        });
   }
   odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
       odom_topic, rclcpp::SensorDataQoS(),
-      std::bind(&VisualBNode::onOdom, this, std::placeholders::_1));
+      [this](const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
+        InputEvent ev;
+        ev.kind = InputEvent::Kind::kOdom;
+        ev.odom = msg;
+        this->pushInputEvent(std::move(ev));
+      });
   cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       cloud_topic, rclcpp::SensorDataQoS(),
-      std::bind(&VisualBNode::onCloud, this, std::placeholders::_1));
+      [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
+        InputEvent ev;
+        ev.kind = InputEvent::Kind::kCloud;
+        ev.cloud = msg;
+        this->pushInputEvent(std::move(ev));
+      });
   // body 云发布端 QoS 不统一：FL2 是 reliable，Super-LIO 的 lio/cloud_body_dense 是 best_effort。
   // 订阅端取更宽松的 best_effort 才能同时兼容两者；用 reliable 订阅 best_effort 发布端时
   // 两端 QoS 不兼容，DDS 直接不投递（实测只有一条 "offering incompatible QoS" 警告，整段 0 帧）。
   body_cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       body_cloud_topic, rclcpp::QoS(rclcpp::KeepLast(50)).best_effort(),
-      std::bind(&VisualBNode::onBodyCloud, this, std::placeholders::_1));
+      [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
+        InputEvent ev;
+        ev.kind = InputEvent::Kind::kBodyCloud;
+        ev.cloud = msg;
+        this->pushInputEvent(std::move(ev));
+      });
   imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
       imu_topic, rclcpp::SensorDataQoS(),
-      std::bind(&VisualBNode::onImu, this, std::placeholders::_1));
+      [this](const sensor_msgs::msg::Imu::ConstSharedPtr& msg) {
+        InputEvent ev;
+        ev.kind = InputEvent::Kind::kImu;
+        ev.imu = msg;
+        this->pushInputEvent(std::move(ev));
+      });
   degen_topic_ = this->declare_parameter<std::string>("degen_topic", "lio/degeneracy");
   degen_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
       degen_topic_,
@@ -174,22 +299,226 @@ VisualBNode::VisualBNode(const rclcpp::NodeOptions& options)
 
   loadParameters();
 
-  // 周期性把累积的彩色地图落盘（默认 10 s 一次，覆盖写同一个文件）。
-  // 注意：单线程 executor 下这里会阻塞所有订阅回调（实测 NTU 4M 点落盘一次 ~25 s，
-  // 期间图像/IMU 全丢，恢复后按陈旧 acc 外推 25 s，速度直接冲到几十 m/s）。
+  // 周期性把累积的彩色地图落盘（覆盖写同一个文件）。
+  // 定时器回调只投递一个 kSaveSnapshot 事件：原先在这里同步 saveColoredMap()，
+  // 实测一次阻塞 855~980 ms（NTU 4M 点曾到 ~25 s），期间所有图像/IMU/odom 回调
+  // 停摆、pending_visual_ 溢出丢帧。现在序列化与写盘都在独立落盘线程上。
   // 需要对 odom 精度做评测时把 pcd.save_interval_sec 设成 <=0，只在退出时存一次。
   if (pcd_save_interval_sec_ > 0.0) {
     pcd_save_timer_ = this->create_wall_timer(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::duration<double>(pcd_save_interval_sec_)),
-        std::bind(&VisualBNode::saveColoredMap, this));
+        [this]() {
+          InputEvent ev;
+          ev.kind = InputEvent::Kind::kSaveSnapshot;
+          this->pushInputEvent(std::move(ev));
+        });
   }
 
   path_msg_.header.frame_id = "world";
+  startWorkerThreads();
   RCLCPP_INFO(this->get_logger(), "VisualBNode 初始化完成");
 }
 
+// ===========================================================================
+// 线程化设施（分工与理由见 hpp "线程化：IO 与计算互不阻塞"段）
+// ===========================================================================
+
+void VisualBNode::startWorkerThreads() {
+  save_thread_ = std::thread(&VisualBNode::saveLoop, this);
+  worker_ = std::thread(&VisualBNode::workerLoop, this);
+}
+
+void VisualBNode::stopWorkerThreads() {
+  {
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    if (input_stop_) {
+      return;
+    }
+    input_stop_ = true;
+  }
+  input_cv_.notify_one();
+  if (worker_.joinable()) {
+    worker_.join();  // 先排空输入队列，剩余事件照常处理完（不丢尾段）
+  }
+  {
+    std::lock_guard<std::mutex> lock(save_mutex_);
+    save_stop_ = true;
+  }
+  save_cv_.notify_one();
+  if (save_thread_.joinable()) {
+    save_thread_.join();
+  }
+}
+
+void VisualBNode::pushInputEvent(InputEvent event) {
+  {
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    if (input_stop_) {
+      return;  // 停机后不再接收，避免向已退出的 worker 投递
+    }
+    // 上限兜底：正常情况 worker 单帧约 30 ms、输入约 213 条/秒，不会积压。
+    // 真积压说明 CPU 被抢或算法退化，此时丢最旧事件以守住内存上界
+    // （一帧原图 4 MB，不设限会直接吃掉几十 GB）。
+    constexpr std::size_t kMaxInputEvents = 2048;
+    while (input_queue_.size() >= kMaxInputEvents) {
+      input_queue_.pop_front();
+      stat_input_dropped_.fetch_add(1, std::memory_order_relaxed);
+    }
+    input_queue_.push_back(std::move(event));
+  }
+  input_cv_.notify_one();
+}
+
+void VisualBNode::workerLoop() {
+  for (;;) {
+    InputEvent ev;
+    {
+      std::unique_lock<std::mutex> lock(input_mutex_);
+      input_cv_.wait(lock, [this] { return input_stop_ || !input_queue_.empty(); });
+      if (input_queue_.empty()) {
+        if (input_stop_) {
+          break;
+        }
+        continue;
+      }
+      ev = std::move(input_queue_.front());
+      input_queue_.pop_front();
+    }
+    // 全部算法状态只在这条线程上访问，因此 onXxx 内部无需任何锁。
+    switch (ev.kind) {
+      case InputEvent::Kind::kImage:
+        onImage(ev.image);
+        break;
+      case InputEvent::Kind::kOdom:
+        onOdom(ev.odom);
+        break;
+      case InputEvent::Kind::kCamOdom:
+        onCamOdom(ev.odom);
+        break;
+      case InputEvent::Kind::kCloud:
+        onCloud(ev.cloud);
+        break;
+      case InputEvent::Kind::kBodyCloud:
+        onBodyCloud(ev.cloud);
+        break;
+      case InputEvent::Kind::kImu:
+        onImu(ev.imu);
+        break;
+      case InputEvent::Kind::kSaveSnapshot:
+        requestColoredMapSave();
+        break;
+      case InputEvent::Kind::kQuit:
+        return;
+    }
+  }
+}
+
+void VisualBNode::saveLoop() {
+  for (;;) {
+    std::deque<ColorSegment> segments;
+    {
+      std::unique_lock<std::mutex> lock(save_mutex_);
+      save_cv_.wait(lock, [this] { return save_stop_ || save_pending_; });
+      if (!save_pending_) {
+        if (save_stop_) {
+          break;
+        }
+        continue;
+      }
+      save_pending_ = false;
+      segments.swap(save_segments_);  // 整队取走，工作线程随后照常往空队列追加
+    }
+    writeColoredSnapshot(std::move(segments));
+  }
+}
+
+void VisualBNode::requestColoredMapSave() {
+  const std::size_t n = colored_map_.size();
+  if (n <= save_handed_points_) {
+    return;  // 无新增
+  }
+  ++g_probe.n_save;
+  const auto t0 = std::chrono::steady_clock::now();
+  // 只切"上次移交以来新增的那一段"：彩色地图是 append-only（accumulateColoredMap
+  // 只有 push_back，达到上限后直接 return），所以按下标切段等价于整图快照，
+  // 但工作线程的代价从 O(全图) 降到 O(15 s 新增)。
+  ColorSegment seg;
+  seg.points.assign(colored_map_.points.begin() +
+                        static_cast<std::ptrdiff_t>(save_handed_points_),
+                    colored_map_.points.end());
+  seg.points.width = static_cast<std::uint32_t>(seg.points.size());
+  seg.points.height = 1;
+  seg.points.is_dense = false;
+  if (median_map_.enabled()) {
+    seg.median = std::make_shared<colorizer::VoxelColorMedian>(median_map_);
+  }
+  save_handed_points_ = n;
+  g_probe.ms_save.add(probeMs(t0));
+  {
+    std::lock_guard<std::mutex> lock(save_mutex_);
+    save_segments_.push_back(std::move(seg));
+    save_pending_ = true;
+  }
+  save_cv_.notify_one();
+  probeMaybeReport();
+}
+
+void VisualBNode::writeColoredSnapshot(std::deque<ColorSegment> segments) {
+  std::error_code ec;
+  std::filesystem::create_directories(pcd_save_dir_, ec);
+  if (ec) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "无法创建 PCD 输出目录 %s: %s", pcd_save_dir_.c_str(),
+                         ec.message().c_str());
+    return;
+  }
+  const std::string path =
+      (std::filesystem::path(pcd_save_dir_) / "super_livo_visual_b_colored.pcd").string();
+
+  // 合并增量段到常驻缓冲。正常每 15 s 只有一段；落盘慢于移交时会有多段。
+  for (auto& seg : segments) {
+    save_buffer_.points.insert(save_buffer_.points.end(), seg.points.points.begin(),
+                               seg.points.points.end());
+    if (seg.median) {
+      save_median_ = seg.median;
+    }
+  }
+  if (save_buffer_.empty()) {
+    return;
+  }
+
+  // 时间中位数：只回填颜色，几何/点数完全不动（避免体素化把点云变稀）。
+  if (save_median_ && save_median_->enabled()) {
+    const auto c8 = [](double v) {
+      return static_cast<std::uint8_t>(std::clamp(v, 0.0, 255.0));
+    };
+    for (auto& p : save_buffer_.points) {
+      Eigen::Vector3d rgb;
+      if (save_median_->colorAt(Eigen::Vector3f(p.x, p.y, p.z), rgb)) {
+        p.r = c8(rgb.x());
+        p.g = c8(rgb.y());
+        p.b = c8(rgb.z());
+      }
+    }
+  }
+  save_buffer_.width = static_cast<std::uint32_t>(save_buffer_.size());
+  save_buffer_.height = 1;
+  save_buffer_.is_dense = false;
+  if (pcl::io::savePCDFileBinary(path, save_buffer_) == 0) {
+    RCLCPP_INFO(this->get_logger(), "彩色地图已保存: %s（%zu 点，世界系%s）", path.c_str(),
+                save_buffer_.size(),
+                (save_median_ && save_median_->enabled()) ? "，时间中位数回填色" : "");
+  } else {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "保存 PCD 失败: %s", path.c_str());
+  }
+}
+
 VisualBNode::~VisualBNode() {
+  // 先停线程：worker 排空输入队列后退出，落盘线程写完手上那份快照。
+  // join 之后本函数独占全部状态，下面的收尾可以直接同步调用算法。
+  stopWorkerThreads();
   // 收尾：bag 结束时队列里可能还有等图像/等位姿的帧，尽量补完再落盘。
   // 待处理视觉帧不会再等到位姿了，直接按最新位姿算完，保证轨迹不缺尾段。
   for (const auto& frame : pending_visual_) {
@@ -200,6 +529,7 @@ VisualBNode::~VisualBNode() {
   drainPendingColorization();
   // 退出（Ctrl+C / SIGTERM 触发 rclcpp::spin 返回）时再存一次，保证短时长运行也有结果。
   saveColoredMap();
+  probeReport();  // 收尾打一份完整探针汇总
 }
 
 void VisualBNode::loadParameters() {
@@ -376,7 +706,12 @@ void VisualBNode::loadParameters() {
   if (!cam_odom_topic.empty()) {
     cam_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
         cam_odom_topic, rclcpp::SensorDataQoS(),
-        std::bind(&VisualBNode::onCamOdom, this, std::placeholders::_1));
+        [this](const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
+          InputEvent ev;
+          ev.kind = InputEvent::Kind::kCamOdom;
+          ev.odom = msg;
+          this->pushInputEvent(std::move(ev));
+        });
     RCLCPP_INFO(this->get_logger(),
                 "相机位姿源: %s（点云世界变换仍用 odom_topic）", cam_odom_topic.c_str());
   }
@@ -485,6 +820,9 @@ void VisualBNode::onImage(const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
   // 图像 header 时刻：与 dense 点云 header 同一时钟基准（实测差 < 7 ms），只用于配对。
   // 图像真实采集时刻 header + img_time_offset_ 只用于取相机位姿，见 runColorizer。
   const double stamp = rclcpp::Time(msg->header.stamp).seconds();
+  ++g_probe.n_image;
+  probeGap(g_probe.image_gap, g_probe.t_image, std::chrono::steady_clock::now());
+  probeHeaderSpan(g_probe.image_hgap, g_probe.first_image, g_probe.last_image, stamp);
 
   // toCvCopy：得到拥有数据所有权的 Mat，才能安全放进 image_cache_。
   cv::Mat bgr;
@@ -526,10 +864,12 @@ void VisualBNode::onImage(const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
   pending_visual_.push_back({gray, stamp, std::chrono::steady_clock::now()});
   while (pending_visual_.size() > kMaxPendingVisualFrames) {
     ++stat_drop_pose_;
+    ++g_probe.drop_visual_full;
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                          "视觉[丢弃] 待定队列超限（%zu 帧），丢弃最旧帧", pending_visual_.size());
     pending_visual_.pop_front();
   }
+  probeMaybeReport();
 }
 
 void VisualBNode::onDegeneracy(
@@ -584,6 +924,9 @@ void VisualBNode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
     pose_cache_.erase(pose_cache_.begin(),
                       pose_cache_.begin() + (pose_cache_.size() - max_pose_samples_));
   }
+  ++g_probe.n_odom;
+  probeGap(g_probe.odom_gap, g_probe.t_odom, std::chrono::steady_clock::now());
+  probeHeaderSpan(g_probe.odom_hgap, g_probe.first_odom, g_probe.last_odom, sample.stamp);
 
   // own 着色轨迹与 /lio/odom 同频落缓存（残差零阶保持）。
   // 只在视觉锚点写 own_pose_cache_ 是不够的：本数据集相机 1 Hz ⇒ 锚点间隔 1 s，
@@ -654,6 +997,7 @@ void VisualBNode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
   if (!pending_color_.empty()) {
     drainPendingColorization();
   }
+  probeMaybeReport();
 }
 
 void VisualBNode::onCamOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
@@ -683,6 +1027,8 @@ void VisualBNode::onCamOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) 
 }
 
 void VisualBNode::onCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
+  ++g_probe.n_cloud;
+  probeGap(g_probe.cloud_gap, g_probe.t_cloud, std::chrono::steady_clock::now());
   // lio/cloud_world：世界系点，直接作为 2D-3D 约束的地图点来源。
   pcl::PointCloud<pcl::PointXYZI> cloud;
   try {
@@ -725,12 +1071,17 @@ void VisualBNode::onBodyCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPt
     body_points_.emplace_back(p.x, p.y, p.z);
   }
   body_stamp_ = rclcpp::Time(msg->header.stamp).seconds();
+  ++g_probe.n_body;
+  probeGap(g_probe.body_gap, g_probe.t_body, std::chrono::steady_clock::now());
+  probeHeaderSpan(g_probe.body_hgap, g_probe.first_body, g_probe.last_body, body_stamp_);
 
   // 新扫描到达即入队等图像/位姿（大图回调比云慢约 1 帧，不能等图像回调才入队）。
   runColorizer(*msg);
 }
 
 void VisualBNode::onImu(const sensor_msgs::msg::Imu::ConstSharedPtr& msg) {
+  ++g_probe.n_imu;
+  probeGap(g_probe.imu_gap, g_probe.t_imu, std::chrono::steady_clock::now());
   ImuSample sample;
   sample.stamp = rclcpp::Time(msg->header.stamp).seconds();
   sample.acc = Eigen::Vector3d(msg->linear_acceleration.x,
@@ -746,12 +1097,134 @@ void VisualBNode::onImu(const sensor_msgs::msg::Imu::ConstSharedPtr& msg) {
   }
 }
 
+void VisualBNode::probeMaybeReport() {
+  const auto now = std::chrono::steady_clock::now();
+  if (g_probe.t0.time_since_epoch().count() == 0) {
+    g_probe.t0 = now;
+    g_probe.t_report = now;
+    return;
+  }
+  if (std::chrono::duration<double>(now - g_probe.t_report).count() < 2.0) {
+    return;
+  }
+  g_probe.t_report = now;
+  probeReport();
+}
+
+void VisualBNode::probeReport() {
+  BranchProbe& p = g_probe;
+  const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - p.t0).count();
+  const double win = t - std::max(0.0, p.t_last_report);
+  p.t_last_report = t;
+  auto dt = [](std::size_t cur, std::size_t& prev) {
+    const std::size_t d = cur - prev;
+    prev = cur;
+    return d;
+  };
+
+  RCLCPP_INFO(this->get_logger(),
+              "[PROBE-IO] t=%.1f/%.1fs 到达(img|odom|body|cloud|imu)="
+              "%zu/%zu/%zu/%zu/%zu Δ%zu/%zu/%zu/%zu/%zu | 间隔ms avg|max img=%.1f|%.1f "
+              "odom=%.1f|%.1f body=%.1f|%.1f | headerΔms max img=%.1f odom=%.1f body=%.1f",
+              win, t, p.n_image, p.n_odom, p.n_body, p.n_cloud, p.n_imu,
+              dt(p.n_image, p.prev_image), dt(p.n_odom, p.prev_odom), dt(p.n_body, p.prev_body),
+              dt(p.n_cloud, p.prev_cloud), dt(p.n_imu, p.prev_imu),
+              p.image_gap.avg(), p.image_gap.max, p.odom_gap.avg(), p.odom_gap.max,
+              p.body_gap.avg(), p.body_gap.max, p.image_hgap.max, p.odom_hgap.max,
+              p.body_hgap.max);
+  RCLCPP_INFO(this->get_logger(),
+              "[PROBE-T] 时刻 img[%.2f→%.2f] odom[%.2f→%.2f] body[%.2f→%.2f] | "
+              "处理 Δ=%zu/%zu gap=%.1f|%.1f 等位姿=%.1f|%.1f | "
+              "耗时ms avg|max 前端=%.1f|%.1f 约束=%.1f|%.1f 更新=%.1f|%.1f 彩色=%.1f|%.1f "
+              "合计=%.1f|%.1f",
+              p.first_image, p.last_image, p.first_odom, p.last_odom, p.first_body, p.last_body,
+              dt(p.n_process, p.prev_process), p.n_process, p.process_gap.avg(), p.process_gap.max,
+              p.wait_visual.avg(), p.wait_visual.max, p.ms_front.avg(), p.ms_front.max,
+              p.ms_constraint.avg(), p.ms_constraint.max, p.ms_update.avg(), p.ms_update.max,
+              p.ms_color.avg(), p.ms_color.max, p.ms_total.avg(), p.ms_total.max);
+  RCLCPP_INFO(this->get_logger(),
+              "[PROBE-S] 约束细分ms avg|max 拷贝地图=%.1f|%.1f 投影建栅格=%.1f|%.1f "
+              "法方程=%.1f|%.1f 选轨=%.1f|%.1f mscfk=%.1f|%.1f | "
+              "上色内部ms 流水线=%.1f|%.1f 并入地图=%.1f|%.1f 发布=%.1f|%.1f",
+              p.ms_copy_map.avg(), p.ms_copy_map.max, p.ms_project.avg(), p.ms_project.max,
+              p.ms_normal_eq.avg(), p.ms_normal_eq.max, p.ms_select.avg(), p.ms_select.max,
+              p.ms_mscfk.avg(), p.ms_mscfk.max, p.ms_colorize.avg(), p.ms_colorize.max,
+              p.ms_accum_map.avg(), p.ms_accum_map.max, p.ms_pub_cloud.avg(), p.ms_pub_cloud.max);
+  RCLCPP_INFO(this->get_logger(),
+              "[PROBE-U] 更新细分ms avg|max IMU传播=%.1f|%.1f 激光先验=%.1f|%.1f "
+              "视觉更新+发布约束=%.1f|%.1f 地图提交=%.1f|%.1f 位姿发布=%.1f|%.1f",
+              p.ms_imu_prop.avg(), p.ms_imu_prop.max, p.ms_prior.avg(), p.ms_prior.max,
+              p.ms_vis_upd.avg(), p.ms_vis_upd.max, p.ms_map_commit.avg(), p.ms_map_commit.max,
+              p.ms_pub.avg(), p.ms_pub.max);
+  RCLCPP_INFO(this->get_logger(),
+              "[PROBE-X] 规模 avg obs=%.1f tracks=%.1f lv=%.1f mscfk用=%.1f used=%.1f "
+              "地图点=%.1f 上色点=%.1f | 丢弃累计 位姿空洞=%zu 等位姿超时=%zu 待定满=%zu "
+              "无图像=%zu 图像队列满=%zu 着色等位姿超时=%zu 着色队列满=%zu | "
+              "着色 Δ=%zu/%zu 入队Δ=%zu 延迟重试=%zu",
+              p.acc_obs.avg(), p.acc_tracks.avg(), p.acc_lv.avg(), p.acc_mscfk_used.avg(),
+              p.acc_used.avg(), p.acc_map_pts.avg(), p.ms_colored_pts.avg(),
+              p.drop_pose_hole, p.drop_pose_timeout, p.drop_visual_full, p.drop_no_image,
+              p.drop_cloud_full, p.drop_color_timeout, p.drop_color_full,
+              dt(p.color_ok, p.prev_color_ok), p.color_ok, dt(p.queue_push, p.prev_queue_push),
+              p.color_defer);
+  RCLCPP_INFO(this->get_logger(),
+              "[PROBE-Q] 队列 img=%zu pend_vis=%zu pend_cloud=%zu pend_color=%zu pose=%zu "
+              "imu=%zu 地图=%zu/%zu | 落盘 Δ=%zu n=%zu 快照ms=%.1f|%.1f | "
+              "守卫 先验否决=%zu 速度限幅=%zu | 输入队列溢出丢弃=%zu",
+              image_cache_.size(), pending_visual_.size(), pending_clouds_.size(),
+              pending_color_.size(), pose_cache_.size(), imu_buffer_.size(),
+              map_points_.size(), max_map_points_,
+              dt(p.n_save, p.prev_save), p.n_save, p.ms_save.avg(), p.ms_save.max,
+              stat_prior_veto_, stat_vel_clamp_,
+              stat_input_dropped_.load(std::memory_order_relaxed));
+
+  // 窗口量清零（累计计数与 first/last 时刻保留）
+  p.image_gap.reset();
+  p.odom_gap.reset();
+  p.body_gap.reset();
+  p.cloud_gap.reset();
+  p.imu_gap.reset();
+  p.image_hgap.reset();
+  p.odom_hgap.reset();
+  p.body_hgap.reset();
+  p.process_gap.reset();
+  p.wait_visual.reset();
+  p.ms_front.reset();
+  p.ms_constraint.reset();
+  p.ms_update.reset();
+  p.ms_color.reset();
+  p.ms_total.reset();
+  p.ms_copy_map.reset();
+  p.ms_project.reset();
+  p.ms_normal_eq.reset();
+  p.ms_select.reset();
+  p.ms_mscfk.reset();
+  p.ms_colorize.reset();
+  p.ms_accum_map.reset();
+  p.ms_pub_cloud.reset();
+  p.ms_imu_prop.reset();
+  p.ms_prior.reset();
+  p.ms_vis_upd.reset();
+  p.ms_map_commit.reset();
+  p.ms_pub.reset();
+  p.ms_save.reset();
+  p.acc_obs.reset();
+  p.acc_tracks.reset();
+  p.acc_lv.reset();
+  p.acc_mscfk_used.reset();
+  p.acc_used.reset();
+  p.acc_map_pts.reset();
+  p.ms_colored_pts.reset();
+}
+
 void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   // ==========================================================================
   // 主流程（对应 gpt §3.4）：
   //   前端 -> 生命周期 -> 关键帧/轨迹 -> LiDAR 2D-3D + MSCKF -> 统一估计器
   // ==========================================================================
   const auto t_start = std::chrono::steady_clock::now();
+  ++g_probe.n_process;
+  probeGap(g_probe.process_gap, g_probe.t_process, t_start);
 
   // 0) 位姿时基对齐：T_wl_ 是"最新一条" lio/odom，未必是本图像时刻的位姿。
   //    相机 header 戳比 LiDAR/IMU 钟晚 img_time_offset_（实测 0.1 s），
@@ -767,6 +1240,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     // 此时退回"最新位姿"会把视觉注入锚到最多 0.7 s 前的位姿上，实测造成 0.75 m
     // 瞬跳；宁可丢这一帧（少一个采样），也不要发布错误时间的位姿。
     ++stat_drop_pose_;
+    ++g_probe.drop_pose_hole;
     // 丢帧后上一帧不再是"相邻帧"，必须切断配对，避免跨位姿空洞算区间旋转。
     rot_prev_.valid = false;
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
@@ -937,6 +1411,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
 
   // 8) IMU 传播：把上次传播到本帧之间的 IMU 样本逐条积分
   //    acc 乘 imu_acc_scale_ 归一化到 m/s²（见初始化处说明）。
+  const auto t_prop0 = std::chrono::steady_clock::now();
   if (imu_initialized_) {
     double t_prev = last_imu_stamp_;
     Eigen::Vector3d acc_prev = last_imu_acc_;
@@ -969,6 +1444,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     last_imu_acc_ = acc_prev;
     last_imu_gyro_ = gyro_prev;
   }
+  g_probe.ms_imu_prop.add(probeMs(t_prop0));
 
   // 9) LiDAR 更新（D2）：把 lio/odom 位姿当强先验注入
   //    Trust 守卫：退化段上游解算会被带飞，lio/odom 若出现单帧大跳变，
@@ -995,14 +1471,17 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     last_trust_T_wl_ = T_wl_frame_;
     last_trust_stamp_ = t_pose;
   }
+  const auto t_prior0 = std::chrono::steady_clock::now();
   if (lio_trusted) {
     Eigen::MatrixXd H_prior;
     Eigen::VectorXd b_prior;
     buildLidarPrior(T_wl_frame_, t_pose, H_prior, b_prior);
     estimator_->lidarUpdate(H_prior, b_prior, 0.0);
   }
+  g_probe.ms_prior.add(probeMs(t_prior0));
 
   // 10) 视觉更新
+  const auto t_vupd0 = std::chrono::steady_clock::now();
   if (estimator_options_.enable_visual) {
     VisualUpdateInput vin;
     vin.H = H_vis;
@@ -1015,6 +1494,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     estimator_->visualUpdate(vin);
     publishVisualConstraint(t_pose);
   }
+  g_probe.ms_vis_upd.add(probeMs(t_vupd0));
 
   // 10.5) 退化段速度守卫
   //  完全退化时（Super-LIO n_effect=0 → cond=1e12）激光先验在退化方向被放松，
@@ -1052,6 +1532,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   }
 
   // 11) 延迟地图提交：状态更新后再用新位姿把本帧点云写入本地地图
+  const auto t_commit0 = std::chrono::steady_clock::now();
   Eigen::Matrix4d T_wl_updated = T_wl_;
   {
     const FilterState& fs = estimator_->filterState();
@@ -1081,7 +1562,9 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
 
   // 12) 发布：以统一估计器的位姿为准（视觉修正后的结果）
   const auto t_update = std::chrono::steady_clock::now();
+  g_probe.ms_map_commit.add(probeMs(t_commit0));
   publishOdomAndPath(T_wl_updated, toRosStamp(t_pose));
+  g_probe.ms_pub.add(probeMs(t_update));
 
   // 12.5) 记录本锚点的融合残差（own ⊖ lio，世界系），并按信任域截断。
   // own 轨迹 = lio 轨迹 ⊕ 该残差（见 onLivOdom 里的同频落缓存）：滤波器给的是
@@ -1155,6 +1638,25 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
       ms(t_lv0, t_lv1), ms(t_lv1, t_lv2), ms(t_lv2, t_lv3), ms(t_ct0, t_mk0),
       ms(t_mk0, t_mk1), tp.num_tracks, tp.total_obs, tp.max_obs, tp.pair_work,
       map_points_.size(), stat_prior_veto_, stat_vel_clamp_);
+
+  // ---- 探针：把本帧分段/规模计入窗口（2 s 汇总打印一次）----
+  g_probe.ms_front.add(ms(t_start, t_front));
+  g_probe.ms_constraint.add(ms(t_front, t_vis));
+  g_probe.ms_update.add(ms(t_vis, t_update));
+  g_probe.ms_color.add(ms(t_update, t_end));
+  g_probe.ms_total.add(ms(t_start, t_end));
+  g_probe.ms_copy_map.add(ms(t_lv0, t_lv1));
+  g_probe.ms_project.add(ms(t_lv1, t_lv2));
+  g_probe.ms_normal_eq.add(ms(t_lv2, t_lv3));
+  g_probe.ms_select.add(ms(t_ct0, t_mk0));
+  g_probe.ms_mscfk.add(ms(t_mk0, t_mk1));
+  g_probe.acc_obs.add(static_cast<double>(obs.size()));
+  g_probe.acc_tracks.add(static_cast<double>(constraint_tracks.size()));
+  g_probe.acc_lv.add(static_cast<double>(lv_residuals.size()));
+  g_probe.acc_mscfk_used.add(static_cast<double>(msckf_eq.used_features));
+  g_probe.acc_used.add(static_cast<double>(used_features));
+  g_probe.acc_map_pts.add(static_cast<double>(map_points_.size()));
+  probeMaybeReport();
 }
 
 void VisualBNode::publishVisualConstraint(double stamp) {
@@ -1232,9 +1734,11 @@ void VisualBNode::runColorizer(const sensor_msgs::msg::PointCloud2& cloud_msg) {
     pc.t_cloud = t_cloud;
     pc.queued_at = std::chrono::steady_clock::now();
     pending_clouds_.push_back(std::move(pc));
+    ++g_probe.queue_push;
     while (pending_clouds_.size() > kMaxPendingClouds) {
       pending_clouds_.pop_front();
       ++stat_drop_no_image_;
+      ++g_probe.drop_cloud_full;
       RCLCPP_WARN(this->get_logger(), "彩色[丢弃] 等图像队列溢出，丢弃最早一帧");
     }
   }
@@ -1274,6 +1778,7 @@ void VisualBNode::drainPendingClouds() {
       while (pending_color_.size() > kMaxPendingColorFrames) {
         pending_color_.pop_front();
         ++stat_drop_pose_;
+        ++g_probe.drop_color_full;
         RCLCPP_WARN(this->get_logger(), "彩色[丢弃] 待处理队列溢出，丢弃最早一帧");
       }
       it = pending_clouds_.erase(it);
@@ -1282,6 +1787,7 @@ void VisualBNode::drainPendingClouds() {
     const double waited = std::chrono::duration<double>(now - it->queued_at).count();
     if (waited > kPendingCloudTimeoutSec) {
       ++stat_drop_no_image_;
+      ++g_probe.drop_no_image;
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                            "彩色[丢弃] 等待图像超时: t_cloud=%.4f 最近差=%.4f 阈值=%.4f 已等 %.2fs",
                            it->t_cloud, best_dt, colorizer_options_.sync.max_offset, waited);
@@ -1305,6 +1811,7 @@ void VisualBNode::drainPendingVisualFrames() {
       // 先取出副本再 erase：processVisualFrame 可能改动容器，迭代器会失效。
       const cv::Mat gray = it->gray;
       const double stamp = it->stamp;
+      g_probe.wait_visual.add(std::chrono::duration<double, std::milli>(now - it->queued_at).count());
       it = pending_visual_.erase(it);
       processVisualFrame(gray, stamp);
       continue;
@@ -1312,6 +1819,7 @@ void VisualBNode::drainPendingVisualFrames() {
     const double waited = std::chrono::duration<double>(now - it->queued_at).count();
     if (waited > kPendingVisualTimeoutSec) {
       ++stat_drop_pose_;
+      ++g_probe.drop_pose_timeout;
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                            "视觉[丢弃] 等待位姿超时: stamp=%.4f t_pose=%.4f 已等 %.2fs",
                            it->stamp, t_pose, waited);
@@ -1326,12 +1834,15 @@ void VisualBNode::drainPendingColorization() {
   const auto now = std::chrono::steady_clock::now();
   for (auto it = pending_color_.begin(); it != pending_color_.end();) {
     if (colorizeFrame(*it)) {
+      ++g_probe.color_ok;
       it = pending_color_.erase(it);
       continue;
     }
+    ++g_probe.color_defer;
     const double waited = std::chrono::duration<double>(now - it->queued_at).count();
     if (waited > kPendingColorTimeoutSec) {
       ++stat_drop_pose_;
+      ++g_probe.drop_color_timeout;
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                            "彩色[丢弃] 等待位姿超时: t_cloud=%.4f t_img=%.4f 已等 %.2fs",
                            it->t_cloud, it->t_img, waited);
@@ -1369,8 +1880,10 @@ bool VisualBNode::colorizeFrame(const PendingColorFrame& frame) {
   std::vector<double> point_stamps(frame.points_lidar.size(), t_cloud);
 
   const colorizer::ColorizerPipeline pipeline(options);
+  const auto t_pipe0 = std::chrono::steady_clock::now();
   const std::vector<colorizer::ColoredPoint> colored =
       pipeline.process(frame.points_lidar, point_stamps, images_for_frame, pose_cache_);
+  g_probe.ms_colorize.add(probeMs(t_pipe0));
   if (colored.empty()) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                          "彩色点云为空（t_cloud=%.4f t_img=%.4f）", t_cloud, t_img);
@@ -1391,8 +1904,13 @@ bool VisualBNode::colorizeFrame(const PendingColorFrame& frame) {
                        frame.t_pair - t_cloud, t_img - t_cloud, colored_count,
                        colored.size(), stat_colored_frames_);
 
+  g_probe.ms_colored_pts.add(static_cast<double>(colored_count));
+  const auto t_acc0 = std::chrono::steady_clock::now();
   accumulateColoredMap(colored, t_cloud);
+  g_probe.ms_accum_map.add(probeMs(t_acc0));
+  const auto t_pub0 = std::chrono::steady_clock::now();
   publishColoredCloud(colored, toRosStamp(t_cloud));
+  g_probe.ms_pub_cloud.add(probeMs(t_pub0));
   return true;
 }
 

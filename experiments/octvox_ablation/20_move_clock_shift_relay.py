@@ -7,16 +7,21 @@
 
 ⚠️ 只平移上面三个话题的 header，**绝不平移 /tf**：super_lio 发布 odom 时会用 transformAt
 把姿态换算到 tf 时间域，平移 tf 会破坏父子关系（实测相机中心被推到 345 m）。
-⚠️ SHIFT 硬编码在 IMG_OFFSET_NS，来源 median(rec - hdr_imu)（见 config/move_fastcalib.yaml
-的 time_offset 注释）；改这里必须同步把 20_move_{a,b}_node.yaml 的 img_time_offset 置 0。
+⚠️ 偏移量是**每个 bag 一个常数**（设备钟在每次上电时重新对齐，跨 session 差几十万公里），
+由环境变量 IMG_OFFSET_SEC 传入 = median(bag 录制时刻 - /livox/imu header)，
+20a/20b 脚本会强制要求设置；改这里必须同步把 20_move_{a,b}_node.yaml 的 img_time_offset 置 0。
 """
+import os
+
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import PointCloud2
+from rclpy.qos import qos_profile_sensor_data
 
-IMG_OFFSET_NS = 204262818997400000
+# 缺省值只对应旧的 move_ros2；换 bag 必须显式给 IMG_OFFSET_SEC
+IMG_OFFSET_SEC = float(os.environ.get('IMG_OFFSET_SEC', '204262818.9974'))
+IMG_OFFSET_NS = int(round(IMG_OFFSET_SEC * 1e9))
 
 
 class ClockShift(Node):
@@ -30,6 +35,7 @@ class ClockShift(Node):
         self.create_subscription(PointCloud2, 'lio/cloud_body_dense', self.cb_body, cloud_qos)
         self.create_subscription(PointCloud2, 'lio/cloud_world', self.cb_world, cloud_qos)
         self.n = {'odom': 0, 'body': 0, 'world': 0}
+        self.get_logger().info(f'clock_shift_relay: IMG_OFFSET_SEC={IMG_OFFSET_SEC:.6f}')
 
     @staticmethod
     def shift(msg):

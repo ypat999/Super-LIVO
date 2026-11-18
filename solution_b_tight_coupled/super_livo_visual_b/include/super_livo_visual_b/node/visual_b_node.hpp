@@ -1,11 +1,16 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -449,6 +454,92 @@ class VisualBNode : public rclcpp::Node {
   std::size_t stat_drop_no_image_{0};
   std::size_t stat_drop_pose_{0};
   std::size_t stat_deferred_{0};
+
+  // ==========================================================================
+  // 线程化：IO 与计算互不阻塞（2026-11-18）
+  // --------------------------------------------------------------------------
+  // 原先 6 个订阅 + 1 个落盘定时器全在节点默认互斥回调组内串行：一次彩色地图
+  // 落盘（47 MB PCD）实测阻塞单线程 executor 855~980 ms，期间图像/里程计回调
+  // 全部停摆，压爆 pending_visual_（kMaxPendingVisualFrames=8）白丢 293 帧。
+  // 现在拆成三条线程：
+  //   ① 回调线程（rclcpp executor）：只把消息 ConstSharedPtr 放进 input_queue_，
+  //      不解析、不搬大数据（shared_ptr 引用计数 +1），耗时 O(µs)。
+  //   ② 计算工作线程：按到达顺序 FIFO 取事件，调用原来的 onXxx。全部算法状态
+  //      仍由这一条线程独占 ⇒ 依旧不给它们加锁。
+  //   ③ 落盘线程：只做彩色地图的序列化写盘。工作线程每次只交出"自上次以来新增的
+  //      那一段"（彩色地图是 append-only），落盘线程把它并进自己的常驻缓冲再写盘。
+  //      第一版交的是整图快照，实测随地图增长到 1267 ms，工作线程照样被拖停，
+  //      因此必须按增量移交（1× 复跑数据见 20b 头注释）。
+  // 与方案 A 的 VisualPipeline 同构，理由见 visual_pipeline.hpp:44-48：
+  // 用"单线程独占状态"而不是"多回调组 + 细粒度锁"，避免数据竞争窗口。
+  // ==========================================================================
+
+  /// 回调线程投递给工作线程的一个输入事件。
+  struct InputEvent {
+    enum class Kind : std::uint8_t {
+      kImage,
+      kOdom,
+      kCamOdom,
+      kCloud,
+      kBodyCloud,
+      kImu,
+      kSaveSnapshot,
+      kQuit
+    };
+    Kind kind{Kind::kQuit};
+    sensor_msgs::msg::Image::ConstSharedPtr image;
+    nav_msgs::msg::Odometry::ConstSharedPtr odom;
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud;
+    sensor_msgs::msg::Imu::ConstSharedPtr imu;
+  };
+
+  /// 启动工作线程与落盘线程（构造函数末尾）。
+  void startWorkerThreads();
+  /// 排空输入队列后停止并 join 两条线程（析构开头，之后状态无并发访问）。
+  void stopWorkerThreads();
+  /// 回调线程入口：入队并唤醒工作线程；队列超限时丢最旧事件。
+  void pushInputEvent(InputEvent event);
+  /// 工作线程主循环。
+  void workerLoop();
+  /// 落盘线程主循环。
+  void saveLoop();
+  /// 工作线程→落盘线程的一次增量移交（一段新点 + 移交时刻的中位数表）。
+  struct ColorSegment {
+    pcl::PointCloud<pcl::PointXYZRGB> points;
+    /// 仅 pcd.median_voxel_size>0 时非空；整表快照，回填由落盘线程在常驻缓冲上做。
+    std::shared_ptr<colorizer::VoxelColorMedian> median;
+  };
+
+  /// 工作线程侧：把"上次移交以来新增的那一段"彩色地图交给落盘线程。
+  void requestColoredMapSave();
+  /// 落盘线程侧：合并增量段 -> 中位数回填 -> 写 PCD（原 saveColoredMap 后半）。
+  void writeColoredSnapshot(std::deque<ColorSegment> segments);
+
+  std::deque<InputEvent> input_queue_;  ///< 按到达顺序排列的输入事件
+  std::mutex input_mutex_;
+  std::condition_variable input_cv_;
+  bool input_stop_{false};
+  std::atomic<std::size_t> stat_input_dropped_{0};  ///< 输入队列超限丢弃数
+  std::thread worker_;
+
+  /// 已移交过多少点（只在工作线程访问；彩色地图是 append-only，故可按下标增量切段）。
+  std::size_t save_handed_points_{0};
+  /// 待写增量队列：工作线程 push_back，落盘线程整队 swap 取走（全程在 save_mutex_ 内）。
+  std::deque<ColorSegment> save_segments_;
+  bool save_pending_{false};  ///< 有增量待写
+  std::mutex save_mutex_;
+  std::condition_variable save_cv_;
+  bool save_stop_{false};
+  std::thread save_thread_;
+  /// 落盘线程的常驻累积缓冲（只有它自己访问，无需加锁）。
+  pcl::PointCloud<pcl::PointXYZRGB> save_buffer_;
+  std::shared_ptr<colorizer::VoxelColorMedian> save_median_;
+
+  // ---- 临时探针（诊断"B 只出 52 帧"，见 .cpp 中 BranchProbe，可整块删除）----
+  /// 距上次上报超过 2 s 才打印，任何回调里都可以安全调用。
+  void probeMaybeReport();
+  /// 打印一行 [PROBE] 汇总并清零窗口统计量。
+  void probeReport();
 };
 
 }  // namespace superlivo_b

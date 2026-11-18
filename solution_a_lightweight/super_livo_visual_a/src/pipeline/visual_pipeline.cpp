@@ -300,7 +300,9 @@ void VisualPipeline::handleImage(const cv::Mat& bgr, double stamp) {
   if (rectified.empty()) {
     return;
   }
-  saveImage(rectified, stamp);
+  // 文件名用 LIO 时间域（header + img_time_offset），与轨迹 T_wl 的时间戳同域，
+  // 便于后续按时间与 scene_move.txt / GT 关联。
+  saveImage(rectified, stamp + img_time_offset_);
   cv::Mat gray;
   cv::cvtColor(rectified, gray, cv::COLOR_BGR2GRAY);
 

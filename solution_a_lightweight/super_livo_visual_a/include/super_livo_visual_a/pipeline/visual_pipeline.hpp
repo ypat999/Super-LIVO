@@ -109,7 +109,8 @@ struct VisualPipelineOptions {
   /// 每 N 个 LiDAR 帧写一行（<=0 关闭）。
   int pose_save_interval{1};
 
-  /// 图像输出开关：PNG，文件名 = 图像时间戳（固定 6 位小数）。
+  /// 图像输出开关：PNG，文件名 = LIO 时间域时间戳（header + img_time_offset，
+  /// 与轨迹时间戳同域），固定 6 位小数。
   bool img_save_en{false};
   /// 图像输出目录；空 = <pcd_save_dir>/image。
   std::string img_save_dir;

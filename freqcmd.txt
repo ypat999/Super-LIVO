@@ -134,7 +134,10 @@ RATE=0.6 bash 20a_run_move_a.sh   move_hf_a      # → super_livo_visual_a_color
 RATE=0.05 bash 20b_run_move_b.sh  move_hf_b      # → super_livo_visual_b_colored.pcd 2.30M，430/739 帧着色
 # 倍速是硬约束，不要随手改：
 #  · A 两支路合计 1.07 CPU-秒/数据秒（实测 /proc：LIO 53.9 ms/云帧 + VIS 56.8 ms/图帧），0.6x 有余量；
-#  · B 单帧 ~2.8s > 0.05x 的 2.1s 到达间隔，>0.12x 整段跑不完（丢帧在 DDS 订阅侧，非配对阈值问题）；
+#  · B 单帧耗时（2026-11-18 节点内 [PROBE] 实测，test4_move@1×）：合计 avg 30 ms / 峰值 52 ms
+#    = 前端 24 + 约束装配 5.3 + 更新 0.4 + 上色 1；9 Hz 图像只占 ~0.27 核 ⇒ B 不缺算力，1× 直接跑；
+#    历史读数 2.8s / 0.94s 全部作废：那行 "耗时 ms" 是 INFO_THROTTLE(1000)，一秒只代表最后一帧，
+#    低倍速下的 943ms 是等 DDS/等落盘的空窗而不是计算；"只出 52 帧"同理是把打印条数当帧数（详见 §9.6）。
 #  · B 收到 SIGINT 不落盘，彩色图只靠 pcd.save_interval_sec:=15 周期落盘，脚本要等日志静止 40s 再杀。
 # 本轮结果：path FL2 10.089 / A 9.581 / B 9.561 m；闭环 0.020 / 0.027 / 0.025 m；
 #   互查 A↔B NN P50=1.4 P90=2.6 P99=7.1 cm，ICP |t|=1mm θ=0.00°（两臂基本重合）；
@@ -231,3 +234,92 @@ EOF
 # - 官方 FAST-LIVO2 的 parameter_blackboard 在部分环境不可达：用 07a_wrap_official_cfg.py 把内参并入主参数文件
 # - move bag 本身有图像空洞：/left_camera/image 缺 14.87–17.51 s（2.63 s）与 70.47–71.20 s（0.73 s），
 #   imu/lidar 连续；FL2 在该窗口尾部出现 0.59 m 瞬态跳变（A/B 无），排查中
+
+# ============================================================
+# 9. 2026-11-18 空载 1× 实跑（test4_move / test20261118 × FL2 / A；B 挂起查根因）
+# ============================================================
+# 9.1 启动式（硬约束：任何外部网络禁止 ⇒ 全部在私有 netns 内跑，只留 lo）
+setsid nohup unshare -rn --propagation private bash /tmp/isolated.sh bash /tmp/queue_fa.sh \
+  > /tmp/queue_fa.log 2>&1 &
+#   /tmp/isolated.sh：ip link set lo up → 起 rviz2 -d config/move_live.rviz（同命名空间才能发现）
+#   → sleep 8 → 执行传入脚本 → 结束时 TERM rviz。/tmp/queue_fa.sh 逐袋逐臂串行调用 §9.2 的两个脚本。
+#   每臂单独日志：/tmp/<tag>.run.log，节点日志 /tmp/<tag>_node.log，播放日志 /tmp/<tag>_bag.log。
+
+# 9.2 两臂命令（tag = <bag>_<arm>，产物根 /mnt/dataset/slam_data/livo_bag/results/<tag>）
+IMG_TIME_OFFSET=-204701439.3211 RATE=1.0 BAG=$BAGROOT/test4_move \
+  bash experiments/octvox_ablation/20c_run_move_fl2.sh test4_move_fl2
+IMG_OFFSET_SEC=204701439.3211 RATE=1.0 BAG=$BAGROOT/test4_move RESULTS=$RESULTS \
+  bash experiments/octvox_ablation/20a_run_move_a.sh  test4_move_a
+# 时钟偏移（bag 消息戳是设备时钟域，需平移到主机时钟；存 /tmp/offsets.txt）：
+#   test4_move     204701439.3211      test20261118  204777459.7680
+#   A/B 走 20_move_clock_shift_relay.py 重发 *_shift，传正数 IMG_OFFSET_SEC；
+#   FL2 走参数 img_time_offset，传负数 IMG_TIME_OFFSET（符号相反，别搞混）。
+# 本轮不传 lio.kf.dynamic_start（默认 false），即"空载"= 关掉动态 KF 支路。
+
+# 9.3 结果（span/path/loop 由 odom.csv 或 lidar_poses.txt 计算，脚本 /tmp/pose_metrics.py，
+#     两轨迹按相对时间最近邻(±60ms)+首帧平移对齐比较，脚本 /tmp/pose_diff.py）
+#   bag            arm   n     span(s)  path(m)  loop(m)  maxstep(m)  彩色图
+#   test4_move     FL2   822    89.79   14.102   3.058    0.167       raw 4.565M / ds 11,453
+#   test4_move     A     874    87.30   12.809   3.360    0.056       3,344,293（着色 752/1605 调用，无图像 36，等位姿超时 0）
+#   test20261118   FL2  1601   175.69   48.398   0.804    0.470       raw 8.841M / ds 19,048
+#   test20261118   A    1748   174.70   46.047   1.036    0.071       6,737,507（着色 1516/3207，无图像 94，等位姿超时 2）
+#   A↔FL2 位置偏差：test4_move mean 0.194 / p50 0.196 / p90 0.297 / max 0.336 m（匹配 797 帧）
+#                    test20261118 mean 0.503 / p50 0.476 / p90 0.861 / max 0.972 m（匹配 1591 帧）
+#   A↔SLIO_ctl(纯LIO) 位置偏差：test4_move mean 0.256 / p90 0.463 m；test20261118 mean 0.480 / p90 0.766 m
+#   两袋 loop 都是 1~3 m 量级：起点终点本来不重合（开放式轨迹），loop 不能当闭环误差用。
+
+# 9.4 FL2 的两个数据侧问题（本轮坐实，不是算法退化）
+#   - 每袋 FL2 都少 ~6%/8% 位姿：伴随 "IMU and LiDAR not synced! delta time: -0.500"
+#     test4_move 9,913 条、test20261118 6,563 条 ⇒ 雷达 effective stamp 比 IMU 慢。
+#   - rec−hdr 实测（点云记录时间戳 − header 时间戳）：test4_move 0.5408 s、test20261118 0.19 s，
+#     与 FL2 报的 -0.500 同量级 ⇒ 自采 bag 的 LiDAR header 时钟有问题，需在录制端或重定时修。
+#   - 订正：bag_probe 报的 "192 pts/frame" 不可信。FL2 实收 raw 4,565,434 点 / 874 云帧 ≈ 5,224 点/帧。
+
+# 9.5 脚本坑：pkill/pgrep 在 unshare userns 里不可靠（看不到 / 杀不掉目标进程组）。
+#   三臂脚本已改 `set -m` + pidfile（$OUT/pids、/tmp/fl2_pids_<tag>）+ `kill -SIG -- -PGID` 收尾。
+#   另外 `pkill -f <tag>` 会串写到别名的进程，别再用。
+
+# 9.6 B 臂计时探针（2026-11-18；代码在 solution_b_tight_coupled/super_livo_visual_b/src/node/
+#     visual_b_node.cpp 顶部匿名命名空间的 BranchProbe + probeReport，纯诊断、可整块删除）
+#   启动式多了个 NO_RVIZ=1（/tmp/isolated.sh 的开关：计时跑不起 rviz，免得抢 CPU 污染读数）：
+#     NO_RVIZ=1 IMG_OFFSET_SEC=204701439.3211 RATE=1.0 BAG=$BAGROOT/test4_move RESULTS=$RESULTS \
+#       bash experiments/octvox_ablation/20b_run_move_b.sh test4_move_b_probe
+#   每 2 s 打 6 行 [PROBE-IO/T/S/U/X/Q]，窗口均值|峰值；累计计数与丢弃分通道，不再靠节流打印猜。
+#   单帧耗时 avg|peak (ms)：前端 24|46（缩放+畸变+光流跟踪，占 80%）；约束装配 5.3|7
+#     = 拷贝地图 0.2 + 投影建栅格 1.1 + LV 法方程 ~0 + 选轨 1.0 + MSCKF 2.4；
+#     更新 0.4|0.6 = IMU 传播 0.1 + 激光先验 0.1 + 视觉更新&发布约束 0.1 + 地图提交 0.3 + 发布 0.0；
+#     上色 ~1|14 = 流水线 4.8 + 并入地图 1.4 + 发布 0.2；合计 30|52 ⇒ 33 Hz 算力上限，1× 毫不费力。
+#   帧数账（数据跨度 90.4 s）：到达 img 828 / odom 877 / body 711 / cloud 868 / imu 15,739；
+#     processVisualFrame 513 帧；丢 315 = 待定视觉队列超限(kMaxPendingVisualFrames=8) 293
+#     + 等位姿超时 19 + 位姿空洞 18；上色 661/711 云帧（延迟重试 527、着色等位姿超时 11）；
+#     地图点常驻上限 lv.max_map_points=60000；彩色图 47 MB（0.3× 那轮 29 MB）。
+#   丢帧机制不在算力：odom 比图像晚 100~160 ms，图像流还有 0.7~0.9 s 偶发停顿
+#     （到达间隔峰值 918 ms、headerΔ 峰值 700 ms），8 帧队列一堵就丢最旧帧；
+#     pcd.save_interval_sec:=15 的周期落盘单次阻塞单线程 executor 855~980 ms，是压爆队列的推手。
+#   轨迹本身健康：n=874 @9.997 Hz，path 12.876 / loop 3.323 / maxstep 0.0555，
+#     与 A 臂（12.809 / 3.360 / 0.056）同量级 ⇒ 之前"B 只出 52 帧、轨迹可疑"的判断作废。
+#   ⚠️ 顺带查出的红旗（与时间无关，待单独查）：速度限幅守卫在 513 帧里触发 385 次（75%），
+#     即视觉更新后的速度几乎每帧都被守卫改写；先验否决仅 2 次。
+#   副作用已处理：探针每 2 s 刷日志会让 20b 收尾的"日志静止 40 s"永不成立（白等 500 s），
+#     行数统计已改成 `grep -avc PROBE`。
+#
+# 9.7 B 的线程化宽改 + 1× 复跑（2026-11-18 18:19）
+#   改了 node/visual_b_node.{hpp,cpp}（原地，不新建 Pipeline；方案 A 经评估不需要同样改造：
+#   A 的 S1 VisualPipeline 早就是"单工作线程 + 任务队列"，S0 visual_a_node 是待删对照）。
+#   三层：executor 只投递 ConstSharedPtr 到 input_queue_（上限 2048）→ 单计算线程按到达序
+#   FIFO 执行原 7 个 onXxx（全部算法状态仍由这一条线程独占，没加一把锁）→ 独立落盘线程。
+#   编译：colcon --packages-select super_livo_visual_b Release，1min45s 零告警。
+#   复跑（启动式同 §9.6，输出目录 test4_move_b_threaded）：
+#     IO 侧达到目的：img 829 / odom 886 / body 711 / cloud 868 / imu 15,739 全量到达，
+#       "输入队列溢出丢弃=0"（2048 深队列从未满），DDS/executor 不再因落盘停摆。
+#     但视觉覆盖率没变：processVisualFrame 累计 508（旧 513），待定满丢弃 300（旧 293）。
+#       ⇒ §9.6 把"落盘阻塞 executor"当成主要推手是错的，它只是次要因素。
+#     丢帧集中在一个 32 s 的窗口（epoch 1794997245→277）：处理 Δ=0、pending_visual_ 常驻 9
+#       （= kMaxPendingVisualFrames），期间"彩色:"照常打印、着色继续累计，"等待位姿超时"
+#       整轮只 18 次 ⇒ 队列既不排空也不超时，说明排空入口在那段里根本没被走到。待查。
+#     落盘第一版交"整图快照"，拷贝耗时随地图增长 32→95→203→139→143→168→1267 ms
+#       （47 MB / 260 万点），工作线程照样被拖停 ⇒ 已改成"只交自上次以来新增的那一段"
+#       （colored_map_ 是 append-only，按下标切段），落盘线程自己维护常驻缓冲合并后写盘；
+#       顺带修掉一处数据竞争（旧写法 save_snapshot_ 由工作线程写、落盘线程读，不在锁内）。
+#     守卫红旗仍未处理：先验否决 2、速度限幅 424/508（83%），与 §9.6 同一问题。
+#   结果目录：$RESULTS/test4_move_b_threaded（odom.csv n=869 path=13.027 loop=3.348）。
