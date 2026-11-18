@@ -15,13 +15,18 @@
 // LIO 输出，这不是"约束回灌"——约束写回走 ExternalObserve() 的直接函数调用。
 // ============================================================================
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 
 #include "lio/ESKF.h"
+#include "lio/params.h"
 #include "lio/super_lio.h"
 #include "ros/ROSWrapper.h"
 
@@ -29,6 +34,26 @@
 #include "super_livo_visual_b/node/visual_b_node.hpp"
 
 namespace {
+
+/// 把 YAML 分支 <prefix>.<name> 的原始参数覆盖去掉前缀，作为 VisualBNode 的
+/// 参数覆盖注入。这样配置文件里视觉参数可以统一挂在
+/// super_lio → ros__parameters → super_livo_visual_b 下，而节点内部仍然按扁平
+/// 参数名（cam_fx / pcd.save_dir ...）声明与读取，不需要改造节点。
+rclcpp::NodeOptions visualNodeOptionsFromBranch(rclcpp::Node& source,
+                                                const std::string& prefix) {
+  rclcpp::NodeOptions options;
+  const auto& overrides =
+      source.get_node_parameters_interface()->get_parameter_overrides();
+  const std::string head = prefix + ".";
+  std::vector<rclcpp::Parameter> params;
+  for (const auto& kv : overrides) {
+    if (kv.first.compare(0, head.size(), head) == 0) {
+      params.emplace_back(kv.first.substr(head.size()), kv.second);
+    }
+  }
+  options.parameter_overrides(params);
+  return options;
+}
 
 /// 方案 B 的 LIO 主体：只覆写公共库预留的通用扩展点。
 /// 约束写回统一放在这里，super_lio 内部不出现任何视觉概念。
@@ -46,6 +71,16 @@ class VisualBSuperLIO : public LI2Sup::SuperLIO {
   long applied() const { return applied_; }
   long rejected() const { return rejected_; }
   long stale() const { return stale_; }
+  /// 探针：ExternalObserve 的调用次数 / 间隔（= LIO 雷达帧处理节奏），以及
+  /// 约束被取用时的时差（>0 表示约束落后于 ESKF）。
+  long extCalls() const { return ext_calls_; }
+  double extGapAvgMs() const { return gap_n_ > 0 ? gap_sum_ms_ / static_cast<double>(gap_n_) : 0.0; }
+  double extGapMaxMs() const { return gap_max_ms_; }
+  double takeAgeAvgMs() const { return age_n_ > 0 ? 1000.0 * age_sum_ / static_cast<double>(age_n_) : 0.0; }
+  double takeAgeAbsMaxMs() const { return 1000.0 * age_abs_max_; }
+  /// 取用时的 |age| 直方图：<0.1 / <0.2 / <0.3 / <0.4 / ≥0.4 s。
+  /// 阈值放宽的边际收益完全由这个分布决定（同一趟数据内比较，避开逐次波动）。
+  const std::array<long, 5>& takeAgeHist() const { return age_hist_; }
 
   /// 每帧雷达观测（含信任域裁决）之后、建图与输出之前调用。
   /// 视觉约束通过 eskf()->UpdateObserveFull(H, r, R) 在此写入。
@@ -53,9 +88,33 @@ class VisualBSuperLIO : public LI2Sup::SuperLIO {
     if (!inject_enable_ || !bridge_) {
       return;
     }
+    // ---- 探针：调用节奏。ExternalObserve 挂在 LIO 的 process() 之后、每帧雷达
+    // 观测调用一次，因此它和上一帧的间隔就是 LIO 主干的"处理间隙"；间隙被拉长
+    // 说明主线程被阻塞（视觉回调抢占 / 建图 / 落盘），此时视觉约束会被拖旧。
+    {
+      const auto now = std::chrono::steady_clock::now();
+      if (last_call_.time_since_epoch().count() != 0) {
+        const double gap =
+            std::chrono::duration<double, std::milli>(now - last_call_).count();
+        gap_sum_ms_ += gap;
+        gap_max_ms_ = std::max(gap_max_ms_, gap);
+        ++gap_n_;
+      }
+      last_call_ = now;
+      ++ext_calls_;
+    }
     superlivo_b::VisualObs obs;
     if (!bridge_->take(obs)) {
       return;
+    }
+    // 约束取用时的时差：正值表示约束时间戳落后 ESKF 当前时刻。
+    {
+      const double age = eskf()->GetTime() - obs.stamp;
+      age_sum_ += age;
+      age_abs_max_ = std::max(age_abs_max_, std::abs(age));
+      ++age_n_;
+      const double a = std::abs(age);
+      ++age_hist_[a < 0.1 ? 0 : (a < 0.2 ? 1 : (a < 0.3 ? 2 : (a < 0.4 ? 3 : 4)))];
     }
     // 视觉帧异步于雷达帧：时间差过大说明这条约束已过期，直接丢弃（不重试）。
     if (std::abs(obs.stamp - eskf()->GetTime()) > inject_max_dt_) {
@@ -83,6 +142,15 @@ class VisualBSuperLIO : public LI2Sup::SuperLIO {
   long applied_{0};
   long rejected_{0};
   long stale_{0};
+  long ext_calls_{0};
+  long gap_n_{0};
+  double gap_sum_ms_{0.0};
+  double gap_max_ms_{0.0};
+  long age_n_{0};
+  double age_sum_{0.0};
+  double age_abs_max_{0.0};
+  std::array<long, 5> age_hist_{};
+  std::chrono::steady_clock::time_point last_call_{};
 };
 
 }  // namespace
@@ -119,8 +187,22 @@ int main(int argc, char** argv) {
 
   std::shared_ptr<superlivo_b::VisualBNode> visual;
   if (embed_visual) {
-    visual = std::make_shared<superlivo_b::VisualBNode>();
+    // 视觉参数统一挂在 YAML 的 super_lio → ros__parameters → super_livo_visual_b
+    // 分支下；这里把该分支的覆盖去掉前缀后注入 VisualBNode，节点内部仍按原参数名
+    // （cam_fx / pcd.save_dir ...）声明与读取。
+    visual = std::make_shared<superlivo_b::VisualBNode>(
+        visualNodeOptionsFromBranch(*wrapper, "super_livo_visual_b"));
     visual->setConstraintBridge(bridge);  // 为空时节点行为与原先一致
+
+    // /lio/odom 发布的是 base_link 系（LIO 已施加 lio.extrinsic.odom_robo），而 B 的
+    // 估计全在 IMU 系：把 LIO 参数里同一份外参交给节点，由 onOdom 换回 IMU 系。
+    Eigen::Matrix4d T_imu_body = Eigen::Matrix4d::Identity();
+    T_imu_body.block<3, 3>(0, 0) = LI2Sup::g_odom_robo.R_.template cast<double>();
+    T_imu_body.block<3, 1>(0, 3) = LI2Sup::g_odom_robo.t_.template cast<double>();
+    visual->setOdomBodyExtrinsic(T_imu_body);
+    RCLCPP_INFO(rclcpp::get_logger("visual_b_app"),
+                "[odom] odom_robo t=(%.4f,%.4f,%.4f) ⇒ base_link 位姿将换回 IMU 系",
+                T_imu_body(0, 3), T_imu_body(1, 3), T_imu_body(2, 3));
   }
 
   // process 定时器使用独立回调组，与 IMU/lidar 回调并行
@@ -137,9 +219,22 @@ int main(int argc, char** argv) {
         static int tick = 0;
         if (bridge && (++tick % 10) == 0) {
           const auto [pushed, taken] = bridge->stats();
-          RCLCPP_INFO(rclcpp::get_logger("visual_b_app"),
-                      "[注入] push=%ld take=%ld 生效=%ld 被拒=%ld 过期=%ld",
-                      pushed, taken, lio->applied(), lio->rejected(), lio->stale());
+          RCLCPP_INFO(
+              rclcpp::get_logger("visual_b_app"),
+              "[注入] push=%ld take=%ld 生效=%ld 被拒=%ld 过期=%ld | 覆盖=%ld "
+              "| 取用时差ms avg=%.1f absmax=%.1f | ExternalObserve次数=%ld 间隔ms avg=%.1f max=%.1f",
+              pushed, taken, lio->applied(), lio->rejected(), lio->stale(),
+              bridge->overwritten(), lio->takeAgeAvgMs(), lio->takeAgeAbsMaxMs(),
+              lio->extCalls(), lio->extGapAvgMs(), lio->extGapMaxMs());
+          // 同一趟数据内的 |age| 分布：直接读出不同门限能多接多少条约束。
+          const auto& h = lio->takeAgeHist();
+          const long tot = h[0] + h[1] + h[2] + h[3] + h[4];
+          RCLCPP_INFO(
+              rclcpp::get_logger("visual_b_app"),
+              "[年龄] n=%ld <0.1=%.1f%% <0.2=%.1f%% <0.3=%.1f%% <0.4=%.1f%% >=0.4=%.1f%%",
+              tot, tot ? 100.0 * h[0] / tot : 0.0, tot ? 100.0 * h[1] / tot : 0.0,
+              tot ? 100.0 * h[2] / tot : 0.0, tot ? 100.0 * h[3] / tot : 0.0,
+              tot ? 100.0 * h[4] / tot : 0.0);
         }
       },
       wrapper->getReportCallbackGroup());

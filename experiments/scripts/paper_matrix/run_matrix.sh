@@ -17,13 +17,34 @@ export OUTROOT
 LOG=$OUTROOT/matrix.log
 mkdir -p "$OUTROOT"
 
+one() {
+  echo "=========== $(date -Is) $1/$2 ===========" | tee -a "$LOG"
+  bash "$REPO/experiments/scripts/paper_matrix/run_one.sh" "$1" "$2" 2>&1 | tee -a "$LOG"
+  local rc=${PIPESTATUS[0]}
+  [ "$rc" = "0" ] || echo "!! $1/$2 退出码 $rc" | tee -a "$LOG"
+  sleep 5
+}
+
 for seq in $SEQS; do
   for arm in $ARMS; do
-    echo "=========== $(date -Is) $seq/$arm ===========" | tee -a "$LOG"
-    bash "$REPO/experiments/scripts/paper_matrix/run_one.sh" "$seq" "$arm" 2>&1 | tee -a "$LOG"
-    rc=${PIPESTATUS[0]}
-    [ "$rc" = "0" ] || echo "!! $seq/$arm 退出码 $rc" | tee -a "$LOG"
-    sleep 5
+    one "$seq" "$arm"
   done
 done
+
+# 失败补跑：偶发 DDS 发现不到（节点一帧都没收到）会让该臂 0 odom，
+# 按缺失 done 再补两轮，避免整晚跑批因为一次发现失败缺一整臂。
+for try in 1 2; do
+  MISS=""
+  for seq in $SEQS; do
+    for arm in $ARMS; do
+      [ -f "$OUTROOT/$seq/$arm/done" ] || MISS="$MISS $seq:$arm"
+    done
+  done
+  [ -z "$MISS" ] && break
+  echo "=========== $(date -Is) 补跑第 $try 轮:$MISS ===========" | tee -a "$LOG"
+  for item in $MISS; do
+    one "${item%%:*}" "${item##*:}"
+  done
+done
+
 echo "=========== $(date -Is) MATRIX DONE ===========" | tee -a "$LOG"

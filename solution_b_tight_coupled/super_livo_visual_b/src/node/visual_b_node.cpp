@@ -29,7 +29,8 @@ namespace superlivo_b {
 namespace {
 /// 位姿历史缓冲允许的最大相邻采样间隔（秒）。
 /// 与 color.sync_max_offset（图像-点云同步窗口）是两件事，不能混用。
-/// /lio/odom 约 10 Hz，这里留 5 倍余量，仅用于拒绝真正的空洞。
+/// pose_cache_ 来自 odom_topic（默认 lio/odom，10 Hz 激光帧后验）；0.5 s 已能容忍
+/// 连续 5 帧丢失，只用于拒绝真空洞。
 constexpr double kPoseHistoryMaxGapSec = 0.5;
 
 /// 待着色帧最长等待时间（秒）：t_img 比 t_cloud 晚 img_time_offset，等 1 s 还拿不到
@@ -39,7 +40,13 @@ constexpr double kPendingColorTimeoutSec = 1.0;
 /// 待着色队列上限，防止 odom 长时间缺失时内存膨胀。
 constexpr std::size_t kMaxPendingColorFrames = 8;
 
-/// 待处理视觉帧：/lio/odom 相对图像采集时刻约滞后 0.2 s，留 1 s 余量后丢弃。
+/// 彩色排空最小间隔（秒）：位姿缓存只随 odom_topic（默认 lio/odom，10 Hz）推进，
+/// 图像也是 10 Hz，drain 由 odom/云/图像回调共同触发，按最小间隔限流可避免无解重试
+/// 把工作线程吃满（见 [PROBE-D]）。
+constexpr double kColorDrainMinIntervalSec = 0.1;
+
+/// 待处理视觉帧：odom_topic（默认 lio/odom）要等下一帧激光位姿才覆盖图像时刻
+/// （实测取用时差 avg≈0.32–0.35 s），留 1 s 余量后丢弃。
 constexpr double kPendingVisualTimeoutSec = 1.0;
 constexpr std::size_t kMaxPendingVisualFrames = 8;
 
@@ -61,23 +68,68 @@ Eigen::Matrix3d visualNoiseW3() {
   return S;
 }
 
-/// 在给定位姿缓存上按时刻插值；查询时刻晚于最新采样时返回 false
-/// （插值器会拿最后一个采样顶替，等于把不同时刻的位姿当成同一时刻）。
+/// 在给定（按 stamp 升序）位姿缓存上按时刻插值；查询时刻晚于最新采样时返回
+/// false（拿最后一个采样顶替等于把不同时刻的位姿当成同一时刻）。
+///
+/// 这里直接在缓存上二分 + 自行插值，不再把整个缓存重建成 LidarPoseInterpolator：
+///   * 插值器内部只保留最近 200 条采样，而缓存有 2000 条（10 Hz ≈ 200 s），
+///     逐条 addSample 后前面 1800 条会被立刻裁掉 —— 既白做 O(N) 工作，又让
+///     落后较多的查询必然查不到位姿；
+///   * 彩色排空路径上每次对积压的每一帧重试，单次约 1 ms，会把工作线程直接吃满
+///     （见 [PROBE-D]）。
 bool poseFromSamples(const std::vector<colorizer::PoseSample>& cache, double stamp,
                      Eigen::Matrix4d& T_wl) {
-  double newest = -std::numeric_limits<double>::max();
-  for (const auto& sample : cache) {
-    newest = std::max(newest, sample.stamp);
-  }
-  if (stamp > newest) {
+  if (cache.size() < 2) {
     return false;
   }
-  colorizer::LidarPoseInterpolator interp(
-      colorizer::LidarPoseInterpolator::Options{kPoseHistoryMaxGapSec});
-  for (const auto& sample : cache) {
-    interp.addSample(sample);
+  if (stamp > cache.back().stamp) {
+    return false;
   }
-  return interp.poseAt(stamp, T_wl);
+
+  const auto it = std::lower_bound(
+      cache.begin(), cache.end(), stamp,
+      [](const colorizer::PoseSample& s, double value) { return s.stamp < value; });
+
+  if (it == cache.begin()) {
+    // 查询时刻早于最早采样：时间差足够小时直接用首个采样。
+    if (it->stamp - stamp > kPoseHistoryMaxGapSec) {
+      return false;
+    }
+    T_wl = it->T_wl;
+    return true;
+  }
+  if (it == cache.end()) {
+    const auto& last = cache.back();
+    if (stamp - last.stamp > kPoseHistoryMaxGapSec) {
+      return false;
+    }
+    T_wl = last.T_wl;
+    return true;
+  }
+
+  const auto& s1 = *it;
+  const auto& s0 = *(it - 1);
+  const double dt_total = s1.stamp - s0.stamp;
+  if (dt_total <= 0.0 || dt_total > kPoseHistoryMaxGapSec) {
+    return false;
+  }
+  const double alpha = (stamp - s0.stamp) / dt_total;
+
+  const Eigen::Vector3d t = (1.0 - alpha) * s0.T_wl.block<3, 1>(0, 3) +
+                            alpha * s1.T_wl.block<3, 1>(0, 3);
+  Eigen::Quaterniond q0(s0.T_wl.block<3, 3>(0, 0));
+  Eigen::Quaterniond q1(s1.T_wl.block<3, 3>(0, 0));
+  q0.normalize();
+  q1.normalize();
+  if (q0.dot(q1) < 0.0) {
+    q1.coeffs() = -q1.coeffs();
+  }
+  const Eigen::Quaterniond q = q0.slerp(alpha, q1);
+
+  T_wl = Eigen::Matrix4d::Identity();
+  T_wl.block<3, 3>(0, 0) = q.normalized().toRotationMatrix();
+  T_wl.block<3, 1>(0, 3) = t;
+  return true;
 }
 
 /// double 秒 -> ROS 时间戳。
@@ -176,6 +228,20 @@ struct BranchProbe {
   // 窗口增量用：上次上报时的累计计数。
   std::size_t prev_image{0}, prev_cloud{0}, prev_body{0}, prev_odom{0}, prev_imu{0};
   std::size_t prev_process{0}, prev_color_ok{0}, prev_queue_push{0}, prev_save{0};
+
+  // ④ 阻塞定位：输入队列排队延迟与深度（窗口内统计）
+  ProbeAcc q_wait_image, q_wait_odom, q_wait_cloud, q_wait_body, q_wait_imu;
+  ProbeAcc queue_depth;      ///< 每次出队后队列剩余深度
+  ProbeAcc ms_handler;       ///< 工作线程单事件处理时长（分派+算法）
+  std::size_t n_dequeue{0}, prev_dequeue{0};
+
+  // ⑤ 阻塞定位：彩色排空路径。drainPendingColorization() 挂在 odom_topic（默认
+  // lio/odom，10 Hz）以及云/图像回调上，每次对 pending_color_ 里每一帧重试一次
+  // colorizeFrame()；失败重试本身要重建位姿插值器，因此"重试次数 × 单次耗时"
+  // 可能整段吃掉工作线程。
+  ProbeAcc ms_drain_color;   ///< 单次 drainPendingColorization() 时长
+  std::size_t n_retry_color{0}, prev_retry_color{0};  ///< colorizeFrame 调用次数
+  std::size_t n_pose_fail{0};                         ///< 其中位姿查询失败次数
 };
 
 BranchProbe g_probe;
@@ -209,7 +275,13 @@ VisualBNode::VisualBNode(const rclcpp::NodeOptions& options)
     : Node("super_livo_visual_b", options) {
   // ---- 先声明 topic 参数（订阅/发布器创建前需要） -------------------------
   const std::string image_topic = this->declare_parameter<std::string>("image_topic", "/left_camera/image");
-  const std::string odom_topic = this->declare_parameter<std::string>("odom_topic", "lio/odom");
+  // 默认用 10 Hz 的 /lio/odom（激光帧后验、带协方差），与 A 一致。
+  // 注意它发布的是 base_link（robot body）系 —— Super-LIO 对它施加了
+  // lio.extrinsic.odom_robo —— 所以 onOdom 里要先用 T_imu_robo_⁻¹ 换回 IMU 系
+  // （外参由 app 从 LIO 同一份参数里取，见 setOdomBodyExtrinsic）。
+  // 旧默认 lio/imu/odom 是 200 Hz 的 IMU 系传播结果，两者只差这个外参。
+  const std::string odom_topic =
+      this->declare_parameter<std::string>("odom_topic", "lio/odom");
   const std::string cloud_topic = this->declare_parameter<std::string>("cloud_topic", "lio/cloud_world");
   const std::string body_cloud_topic =
       this->declare_parameter<std::string>("body_cloud_topic", "lio/cloud_body_dense");
@@ -317,7 +389,12 @@ VisualBNode::VisualBNode(const rclcpp::NodeOptions& options)
 
   path_msg_.header.frame_id = "world";
   startWorkerThreads();
-  RCLCPP_INFO(this->get_logger(), "VisualBNode 初始化完成");
+  // 启动自检：确认 YAML 分支参数确实注入到本节点（分支式配置最容易静默失效）。
+  RCLCPP_INFO(this->get_logger(),
+              "VisualBNode 初始化完成：相机 %dx%d fx=%.2f fy=%.2f cx=%.2f cy=%.2f "
+              "img_time_offset=%.3f pcd=%s",
+              intrinsics_.width, intrinsics_.height, intrinsics_.fx, intrinsics_.fy,
+              intrinsics_.cx, intrinsics_.cy, img_time_offset_, pcd_save_dir_.c_str());
 }
 
 // ===========================================================================
@@ -352,6 +429,7 @@ void VisualBNode::stopWorkerThreads() {
 }
 
 void VisualBNode::pushInputEvent(InputEvent event) {
+  event.enqueued = std::chrono::steady_clock::now();
   {
     std::lock_guard<std::mutex> lock(input_mutex_);
     if (input_stop_) {
@@ -384,8 +462,38 @@ void VisualBNode::workerLoop() {
       }
       ev = std::move(input_queue_.front());
       input_queue_.pop_front();
+      // 探针：出队时刻的队列深度与"入队→出队"排队延迟，按事件类型分开统计。
+      // 若某一类的延迟持续抬升，说明工作线程被该类型/更早的事件阻塞。
+      {
+        const auto now = std::chrono::steady_clock::now();
+        g_probe.queue_depth.add(static_cast<double>(input_queue_.size()));
+        const double waited_ms =
+            std::chrono::duration<double, std::milli>(now - ev.enqueued).count();
+        switch (ev.kind) {
+          case InputEvent::Kind::kImage:
+            g_probe.q_wait_image.add(waited_ms);
+            break;
+          case InputEvent::Kind::kOdom:
+          case InputEvent::Kind::kCamOdom:
+            g_probe.q_wait_odom.add(waited_ms);
+            break;
+          case InputEvent::Kind::kCloud:
+            g_probe.q_wait_cloud.add(waited_ms);
+            break;
+          case InputEvent::Kind::kBodyCloud:
+            g_probe.q_wait_body.add(waited_ms);
+            break;
+          case InputEvent::Kind::kImu:
+            g_probe.q_wait_imu.add(waited_ms);
+            break;
+          default:
+            break;
+        }
+        ++g_probe.n_dequeue;
+      }
     }
     // 全部算法状态只在这条线程上访问，因此 onXxx 内部无需任何锁。
+    const auto handler_begin = std::chrono::steady_clock::now();
     switch (ev.kind) {
       case InputEvent::Kind::kImage:
         onImage(ev.image);
@@ -411,6 +519,8 @@ void VisualBNode::workerLoop() {
       case InputEvent::Kind::kQuit:
         return;
     }
+    // 工作线程占用时长（分派+处理），配合报告窗口可算线程占空比。
+    g_probe.ms_handler.add(probeMs(handler_begin));
   }
 }
 
@@ -914,6 +1024,12 @@ void VisualBNode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
   T_wl(0, 3) = pose.position.x;
   T_wl(1, 3) = pose.position.y;
   T_wl(2, 3) = pose.position.z;
+
+  // /lio/odom 是 base_link（robot body）系：T_w_body = T_w_imu · T_imu_body。
+  // 本节点的 ESKF、IMU 量测、T_li=I 的点云全在 IMU 系，先把外参除掉。
+  if (!T_imu_robo_.isApprox(Eigen::Matrix4d::Identity(), 1e-12)) {
+    T_wl = T_wl * T_imu_robo_.inverse();
+  }
   T_wl_ = T_wl;
 
   colorizer::PoseSample sample;
@@ -1177,6 +1293,27 @@ void VisualBNode::probeReport() {
               dt(p.n_save, p.prev_save), p.n_save, p.ms_save.avg(), p.ms_save.max,
               stat_prior_veto_, stat_vel_clamp_,
               stat_input_dropped_.load(std::memory_order_relaxed));
+  // 阻塞定位：排队延迟（入队→出队）按事件类型拆开，队列深度与工作线程占用时长。
+  // 判读：某类延迟随窗口持续抬升 = 工作线程被前面的事件拖住；深度长期 >10 =
+  // 消费速度跟不上；处理耗时接近窗口时长 = 线程满负荷。
+  RCLCPP_INFO(this->get_logger(),
+              "[PROBE-L] 排队延迟ms img=%.1f|%.1f odom=%.1f|%.1f body=%.1f|%.1f "
+              "cloud=%.1f|%.1f imu=%.1f|%.1f | 队列深度 avg=%.1f max=%.0f 出队Δ=%zu "
+              "| 处理耗时ms avg=%.1f max=%.1f",
+              p.q_wait_image.avg(), p.q_wait_image.max, p.q_wait_odom.avg(),
+              p.q_wait_odom.max, p.q_wait_body.avg(), p.q_wait_body.max,
+              p.q_wait_cloud.avg(), p.q_wait_cloud.max, p.q_wait_imu.avg(),
+              p.q_wait_imu.max, p.queue_depth.avg(), p.queue_depth.max,
+              dt(p.n_dequeue, p.prev_dequeue), p.ms_handler.avg(), p.ms_handler.max);
+  // 彩色排空路径占用：窗口内累计耗时（占窗口的百分比）与重试规模。
+  // 判读：占比 >50% 说明工作线程主要被"查不到位姿的彩色重试"吃掉，
+  // 此时输入队列必然堆积，图像事件排队 => 视觉约束时差变大 => 注入过期。
+  RCLCPP_INFO(this->get_logger(),
+              "[PROBE-D] 彩色排空 重试Δ=%zu/%zu 位姿失败=%zu | 窗口累计=%.0fms "
+              "单次ms avg=%.2f max=%.1f",
+              dt(p.n_retry_color, p.prev_retry_color), p.n_retry_color,
+              p.n_pose_fail, p.ms_drain_color.sum, p.ms_drain_color.avg(),
+              p.ms_drain_color.max);
 
   // 窗口量清零（累计计数与 first/last 时刻保留）
   p.image_gap.reset();
@@ -1215,6 +1352,14 @@ void VisualBNode::probeReport() {
   p.acc_used.reset();
   p.acc_map_pts.reset();
   p.ms_colored_pts.reset();
+  p.q_wait_image.reset();
+  p.q_wait_odom.reset();
+  p.q_wait_cloud.reset();
+  p.q_wait_body.reset();
+  p.q_wait_imu.reset();
+  p.queue_depth.reset();
+  p.ms_handler.reset();
+  p.ms_drain_color.reset();
 }
 
 void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
@@ -1423,7 +1568,17 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
       if (s.stamp > t_pose) {
         break;
       }
-      estimator_->propagate(acc_prev * imu_acc_scale_, gyro_prev, s.stamp - t_prev);
+      const double imu_dt = s.stamp - t_prev;
+      if (imu_dt > 0.2) {
+        // 区间内出现 IMU 空洞（订阅丢包/回调被阻塞，实测 move 有一次 0.92 s）。
+        // 空洞**之后的**样本不能用旧姿态积分：空洞期间真实转过的角度已经丢失，
+        // 用陈旧 R 继续积分等价于凭空产生 |g|·sin(Δθ) 的水平伪加速度
+        // （实测 |v| 一帧内从 0.10 泵到 1.69 m/s、路径多出 1.2 m）。
+        // 因此整段剩余区间一律不积分，交给紧随其后的激光先验按该间隔重新锚定；
+        // 间隔由下面的 noteSkippedInterval(gap) 登记，先验才能放宽修正上限。
+        break;
+      }
+      estimator_->propagate(acc_prev * imu_acc_scale_, gyro_prev, imu_dt);
       t_prev = s.stamp;
       acc_prev = s.acc;
       gyro_prev = s.gyro;
@@ -1433,8 +1588,14 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
       // 速度误差就大 1 个量级且再也拉不回来。超过 0.2 s 视为中断，不积分。
       const double gap = t_pose - t_prev;
       if (gap > 0.2) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                             "IMU 中断 %.3f s，跳过该段传播（速度状态保持）", gap);
+        // 不积分，但这段真实时间必须登记给先验的间隔换算：先验的修正上限按
+        // 0.1 s 标定，若仍按单帧上限逐帧追，姿态会持续落后 lio/odom，残差在
+        // 下一帧 propagate 里变成 |g|·sinΔθ ≈ 2.25 m/s² 的水平伪加速度。
+        estimator_->noteSkippedInterval(gap);
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "IMU 中断 %.3f s（%.3f→%.3f），该段不积分，交由激光先验按该间隔锚定",
+            gap, t_prev, t_pose);
       } else {
         estimator_->propagate(acc_prev * imu_acc_scale_, gyro_prev, gap);
       }
@@ -1443,6 +1604,40 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     last_imu_stamp_ = t_prev;
     last_imu_acc_ = acc_prev;
     last_imu_gyro_ = gyro_prev;
+
+    static int acc_dbg_n = 0;
+    if (++acc_dbg_n % 10 == 1) {
+      const auto& st = estimator_->filterState().state;
+      const Eigen::Vector3d aw =
+          st.R * (acc_prev * imu_acc_scale_ - st.ba) + st.g;
+      RCLCPP_INFO(this->get_logger(),
+                  "[传播] a_w=(%.2f,%.2f,%.2f) |a_w|=%.2f ba=(%.3f,%.3f,%.3f) "
+                  "bg=(%.4f,%.4f,%.4f) g=(%.2f,%.2f,%.2f) |v|=%.3f",
+                  aw.x(), aw.y(), aw.z(), aw.norm(), st.ba.x(), st.ba.y(), st.ba.z(),
+                  st.bg.x(), st.bg.y(), st.bg.z(), st.g.x(), st.g.y(), st.g.z(),
+                  st.v.norm());
+    }
+  } else {
+    // 一条 IMU 样本都没有（订阅失效/回调被阻塞）：没有任何惯性传播可用。
+    // 若只是跳过本段，滤波器既没有名义积分也没有过程噪声，P 被先验/视觉逐帧
+    // 收缩（σp→0.002、dxp=0.0000），先验增益→0 ⇒ 状态冻结在初值：
+    // 批量跑批实测 move/b path 1.33 m（SL 10.44 m），终点 (−0.07,−0.15,0.40)。
+    // 退化策略：把名义状态直接重置到本帧 lio/odom 的 IMU 位姿（速度取 lio 差分），
+    // 视觉更新仍在其后叠加 ⇒ 输出退化为"LIO + 有界视觉修正"，而不是停住不动。
+    State deg = estimator_->filterState().state;  // 保留重力/零偏/外参
+    const Eigen::Matrix4d T_wi = T_wl_frame_ * T_li_;  // T_wi = T_wl · T_li
+    deg.R = T_wi.block<3, 3>(0, 0);
+    deg.p = T_wi.block<3, 1>(0, 3);
+    Eigen::Vector3d v_lio;
+    if (lioVelocity(t_pose, v_lio)) {
+      deg.v = v_lio;
+    }
+    estimator_->resetState(deg);
+    ++stat_no_imu_;
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "未收到任何 IMU 样本：按 lio/odom 位姿重置状态（退化模式，累计 %zu 帧）",
+        stat_no_imu_);
   }
   g_probe.ms_imu_prop.add(probeMs(t_prop0));
 
@@ -1457,14 +1652,19 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     const Eigen::Matrix3d dR = T_wl_frame_.block<3, 3>(0, 0) *
                                last_trust_T_wl_.block<3, 3>(0, 0).transpose();
     const double dtheta = so3Log(dR).norm();
-    if (dp.norm() > guard_lio_jump_pos_ || dtheta > guard_lio_jump_rot_) {
+    // 阈值必须按两次视觉帧的间隔缩放：图像空洞（move 实测 2.62 s）后正常运动
+    // 就能累积到 0.37 m / 29.6°，用"单帧"阈值会把最需要先验的那一帧直接否决
+    // （实测 |v| 恰在该帧冲到 2.2 m/s，随后被 IMU 残差持续泵到 3 m/s 上限）。
+    const double scale_dt = std::max(1.0, (t_pose - last_trust_stamp_) / 0.1);
+    if (dp.norm() > guard_lio_jump_pos_ * scale_dt ||
+        dtheta > guard_lio_jump_rot_ * scale_dt) {
       lio_trusted = false;
       ++stat_prior_veto_;
       RCLCPP_WARN_THROTTLE(
           this->get_logger(), *this->get_clock(), 2000,
-          "[Guard] lio/odom 单帧跳变 %.2f m / %.2f deg 超阈值，本帧撤销激光先验"
-          "（累计 %zu 次）",
-          dp.norm(), dtheta * 57.29577951308232, stat_prior_veto_);
+          "[Guard] lio/odom 单帧跳变 %.2f m / %.2f deg 超阈值（间隔 %.2f s），本帧撤销"
+          "激光先验（累计 %zu 次）",
+          dp.norm(), dtheta * 57.29577951308232, t_pose - last_trust_stamp_, stat_prior_veto_);
     }
   }
   if (guard_enable_) {
@@ -1831,27 +2031,74 @@ void VisualBNode::drainPendingVisualFrames() {
 }
 
 void VisualBNode::drainPendingColorization() {
+  if (pending_color_.empty()) {
+    return;
+  }
   const auto now = std::chrono::steady_clock::now();
+  // 节流：调用方是 odom_topic（默认 lio/odom，10 Hz）以及云/图像回调，位姿缓存只在
+  // odom 上推进，图像也只有 10 Hz —— 没必要每个事件都重试一遍（旧实现在 200 Hz odom
+  // 下积压时会以 ≈740 次/s 的无解重试吃满工作线程，见 [PROBE-D]）。
+  if (last_color_drain_.time_since_epoch().count() != 0 &&
+      now - last_color_drain_ <
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(kColorDrainMinIntervalSec))) {
+    return;
+  }
+  last_color_drain_ = now;
+
+  const auto t_begin = std::chrono::steady_clock::now();
+  // 与 camPoseAtStamp 取同一个缓存，判断"位姿是否已覆盖 t_img"才准。
+  const auto& cache = cam_pose_cache_.empty()
+                          ? (color_use_own_odom_ ? own_pose_cache_ : pose_cache_)
+                          : cam_pose_cache_;
+  const double newest = cache.empty() ? -std::numeric_limits<double>::max()
+                                      : cache.back().stamp;
   for (auto it = pending_color_.begin(); it != pending_color_.end();) {
+    // 位姿还没覆盖 t_img：此刻重试必然失败，只做超时清理，不做无解重试。
+    if (it->t_img > newest) {
+      const double waited = std::chrono::duration<double>(now - it->queued_at).count();
+      if (waited > kPendingColorTimeoutSec) {
+        ++stat_drop_pose_;
+        ++g_probe.drop_color_timeout;
+        // 探针：把"缺位姿"的判定依据一并打出来——t_img 比最新位姿落后多少、缓存里
+        // 还有多少采样。
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                             "彩色[丢弃] 等待位姿超时: t_cloud=%.4f t_img=%.4f 已等 %.2fs "
+                             "最新位姿=%.4f 落后=%.3fs cache=%zu",
+                             it->t_cloud, it->t_img, waited, newest, newest - it->t_img,
+                             cache.size());
+        it = pending_color_.erase(it);
+        continue;
+      }
+      ++stat_deferred_;
+      ++g_probe.color_defer;
+      ++it;
+      continue;
+    }
+
+    ++g_probe.n_retry_color;
     if (colorizeFrame(*it)) {
       ++g_probe.color_ok;
       it = pending_color_.erase(it);
       continue;
     }
     ++g_probe.color_defer;
+    ++g_probe.n_pose_fail;
     const double waited = std::chrono::duration<double>(now - it->queued_at).count();
     if (waited > kPendingColorTimeoutSec) {
       ++stat_drop_pose_;
       ++g_probe.drop_color_timeout;
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                           "彩色[丢弃] 等待位姿超时: t_cloud=%.4f t_img=%.4f 已等 %.2fs",
-                           it->t_cloud, it->t_img, waited);
+                           "彩色[丢弃] 着色失败超时: t_cloud=%.4f t_img=%.4f 已等 %.2fs "
+                           "最新位姿=%.4f cache=%zu",
+                           it->t_cloud, it->t_img, waited, newest, cache.size());
       it = pending_color_.erase(it);
       continue;
     }
     ++stat_deferred_;
     ++it;
   }
+  g_probe.ms_drain_color.add(probeMs(t_begin));
 }
 
 bool VisualBNode::colorizeFrame(const PendingColorFrame& frame) {
@@ -1999,11 +2246,18 @@ void VisualBNode::buildLidarPrior(const Eigen::Matrix4d& T_wl,
   // 用 lio/odom 的差分速度补上这一维观测（刚体上 IMU 原点的位置差分即其速度）。
   if (prior_vel_sigma_ > 0.0) {
     Eigen::Vector3d v_lio = Eigen::Vector3d::Zero();
-    if (lioVelocity(t_pose, v_lio)) {
+    const bool vel_ok = lioVelocity(t_pose, v_lio);
+    if (vel_ok) {
       const double sv = std::max(1e-3, prior_vel_sigma_);
       const Eigen::Matrix3d Hv = Eigen::Matrix3d::Identity() / (sv * sv);
       H.block<3, 3>(StateLayout::kVel, StateLayout::kVel) = Hv;
       b.segment<3>(StateLayout::kVel) = Hv * (s.v - v_lio);
+    }
+    static int vel_dbg_n = 0;
+    if (++vel_dbg_n % 10 == 1) {
+      RCLCPP_INFO(this->get_logger(),
+                  "[先验] vel_ok=%d |v_lio|=%.3f |v_cur|=%.3f t_pose=%.3f cache=%zu",
+                  vel_ok ? 1 : 0, v_lio.norm(), s.v.norm(), t_pose, pose_cache_.size());
     }
   }
 }

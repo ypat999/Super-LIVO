@@ -5,7 +5,7 @@
     # 传感器参数取自官方 third_party/FAST-LIVO2-ROS2/config/{NTU_VIRAL,camera_NTU_VIRAL}.yaml
     # ========================================================================
     image_topic: "/left/image_raw"
-    odom_topic: "lio/odom"
+    odom_topic: "lio/odom"  # 10 Hz 激光帧后验；base_link 系由 app 按 odom_robo 换回 IMU 系
     cloud_topic: "lio/cloud_world"
     body_cloud_topic: "lio/cloud_body_dense"
     imu_topic: "/imu/imu"

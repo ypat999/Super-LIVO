@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""汇总 latency_probe.py 的 CSV，输出各臂 odom 输出节拍与整帧延时。
+"""汇总 latency_probe_cpp（或 latency_probe.py）的 CSV，输出各臂 odom 输出节拍与整帧延时。
 
    python3 tools/latency_summary.py --label FL2 run/fl2/latency.csv \
        --label A run/a/latency.csv --label B run/b/latency.csv
 
 也可直接传 run 目录（自动找 latency.csv），或 --json 输出机器可读结果。
-配对规则：每条 odom 按其 header.stamp 找最近邻雷达帧 header.stamp
-（容差 --tol-ms，默认 250 ms；FL2 的 stamp 为帧尾，差值 ≈ 一个扫描周期）。
-"""
+配对规则：各臂 odom.stamp 相对雷达帧的约定不同（帧首 / 帧中 / 帧尾，实测
+SL/A 约 +97 ms 属帧尾、retail 的 b/fl2 约 0 属帧首、ntu 的 b/fl2 约 +45 属帧中）。
+先用「floor 配对」的差值中位数估计本臂偏移，再把 odom.stamp 减去该偏移后
+找最近邻雷达帧——直接用最近邻会被帧尾约定带到下一帧，把 algo 算成负值。
+配对容差 --tol-ms（默认 30 ms）。"""
+
 import argparse
 import bisect
 import csv
@@ -41,22 +44,33 @@ def periods_ms(stamps):
     return [(b - a) / 1e6 for a, b in zip(stamps, stamps[1:])]
 
 
+def nearest_stamp(stamps, x):
+    i = bisect.bisect_left(stamps, x)
+    cand = [stamps[j] for j in (i - 1, i) if 0 <= j < len(stamps)]
+    if not cand:
+        return None
+    return min(cand, key=lambda v: abs(v - x))
+
+
 def summarize(lidar, odom, tol_ms):
     l_stamps = [s for s, _ in lidar]
     l_recv = {s: r for s, r in lidar}
+
+    # 第一步：用「floor 配对」的差值中位数估计本臂 odom.stamp 相对雷达帧起点的
+    # 约定偏移（帧首≈0、帧尾≈+100 ms、帧中≈+45 ms）。
+    floor_off = []
+    for st_, _ in odom:
+        i = bisect.bisect_right(l_stamps, st_)
+        if i > 0:
+            floor_off.append(st_ - l_stamps[i - 1])
+    med_off = st.median(floor_off) if floor_off else 0
+
+    # 第二步：减去偏移后找最近邻，等价于「落在哪一帧的积分窗口里就配哪一帧」。
     algo, e2e, off, matched = [], [], [], 0
     tol_ns = tol_ms * 1e6
     for st_, recv in odom:
-        i = bisect.bisect_left(l_stamps, st_)
-        cand = []
-        if i < len(l_stamps):
-            cand.append(l_stamps[i])
-        if i > 0:
-            cand.append(l_stamps[i - 1])
-        if not cand:
-            continue
-        near = min(cand, key=lambda x: abs(x - st_))
-        if abs(near - st_) > tol_ns:
+        near = nearest_stamp(l_stamps, st_ - med_off)
+        if near is None or abs((st_ - med_off) - near) > tol_ns:
             continue
         matched += 1
         algo.append((recv - l_recv[near]) / 1e6)
@@ -105,7 +119,7 @@ def summarize(lidar, odom, tol_ms):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", action="append", default=[])
-    ap.add_argument("--tol-ms", type=float, default=250.0)
+    ap.add_argument("--tol-ms", type=float, default=30.0)
     ap.add_argument("--json", default="")
     ap.add_argument("paths", nargs="+")
     a = ap.parse_args()
@@ -135,8 +149,8 @@ def main():
               f"{s['stamp_offset_ms_med']:>10.1f}{s['algo_ms_med']:>9.2f}"
               f"{s['algo_ms_p95']:>8.2f}{s['algo_ms_max']:>8.1f}{s['e2e_ms_med']:>9.2f}")
     print("-" * len(hdr))
-    print("单位 ms；algo=odom到达−雷达帧到达（跨臂可比），e2e=odom到达−雷达stamp；"
-          "stamp_off=odom.stamp−雷达.stamp（FL2≈+100 ms 属帧尾口径）。")
+    print("单位 ms；algo=odom到达−对应雷达帧到达（跨臂可比），e2e=odom到达−雷达stamp；"
+          "stamp_off=odom.stamp−雷达帧起点（≈0 帧首、≈+100 帧尾、≈+45 帧中）。")
     if a.json:
         slim = [{k: v for k, v in s.items() if k not in ("algo_ms", "e2e_ms", "odom_period_ms")}
                 for s in rows]

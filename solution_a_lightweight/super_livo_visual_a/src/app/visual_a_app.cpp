@@ -57,15 +57,30 @@ builtin_interfaces::msg::Time toRosStamp(double sec) {
   return stamp;
 }
 
+/// 方案 A 视觉参数的 YAML 分支前缀。
+/// visual_a_move.yaml 的层级是 super_lio → ros__parameters → super_livo_visual_a，
+/// rcl 会把它展开成 "super_livo_visual_a.<name>"。这里优先按该前缀读取；
+/// 前缀不存在时回退到扁平名，保证 -p <name>:=... 的进程级覆盖仍可用。
+constexpr char kVisualParamPrefix[] = "super_livo_visual_a.";
+
+/// 参数是否来自 --params-file / -p 的原始覆盖（未声明也能查到）。
+bool hasParamOverride(rclcpp::Node& node, const std::string& name) {
+  const auto& overrides = node.get_node_parameters_interface()->get_parameter_overrides();
+  return overrides.find(name) != overrides.end();
+}
+
 /// 读取参数：已声明则取值，否则按默认值声明。
 /// 之所以不直接 declare：本节点复用 ROSWrapper（Super-LIO 参数已在 init 里声明），
 /// 个别参数名可能与 LIO 侧重合，直接 declare 会抛 ParameterAlreadyDeclared。
 template <typename T>
 T getOrDeclare(rclcpp::Node& node, const std::string& name, const T& def) {
-  if (node.has_parameter(name)) {
-    return node.get_parameter(name).get_value<T>();
+  const std::string prefixed = std::string(kVisualParamPrefix) + name;
+  const bool use_prefixed = node.has_parameter(prefixed) || hasParamOverride(node, prefixed);
+  const std::string& key = use_prefixed ? prefixed : name;
+  if (node.has_parameter(key)) {
+    return node.get_parameter(key).get_value<T>();
   }
-  return node.declare_parameter<T>(name, def);
+  return node.declare_parameter<T>(key, def);
 }
 
 /// 从 nav_msgs::Odometry 取 T_wl；四元数非法时返回 false。
@@ -202,6 +217,14 @@ superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
   opt.img_save_en = getOrDeclare<bool>(node, "image_save.img_save_en", false);
   opt.img_save_dir = getOrDeclare<std::string>(node, "image_save.dir", "");
   opt.img_save_interval = getOrDeclare<int>(node, "image_save.interval", 1);
+
+  // 启动自检：分支式 YAML 一旦键名/层级写错会静默退回默认值，这里把关键项打出来。
+  RCLCPP_INFO(node.get_logger(),
+              "视觉参数：相机 %dx%d fx=%.2f fy=%.2f cx=%.2f cy=%.2f "
+              "img_time_offset=%.3f pcd=%s",
+              opt.intrinsics.width, opt.intrinsics.height, opt.intrinsics.fx,
+              opt.intrinsics.fy, opt.intrinsics.cx, opt.intrinsics.cy,
+              opt.img_time_offset, opt.pcd_save_dir.c_str());
   return opt;
 }
 

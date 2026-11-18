@@ -87,6 +87,12 @@ class UnifiedEstimator {
   /// LiDAR 更新：残差由 Super-LIO 原有模块以信息形式提供（30 维）。
   void lidarUpdate(const Eigen::MatrixXd& H, const Eigen::VectorXd& b, double cost);
 
+  /// 登记"这段时间没有 IMU、没有传播"的空洞（订阅丢包/回调被阻塞）。
+  /// 时间照常计入下一次 lidarUpdate 的间隔换算：先验的修正上限是按间隔标定的，
+  /// 空洞期间真实运动并没有停，若仍按 0.1 s 限幅逐帧追，状态会长期落后于
+  /// lio/odom，姿态残差在 propagate 里变成 |g|·sinΔθ 的水平伪加速度。
+  void noteSkippedInterval(double dt);
+
   /// 视觉更新：6 维相机位姿法方程，内部映射到统一状态。
   void visualUpdate(const VisualUpdateInput& input);
 
@@ -125,7 +131,8 @@ class UnifiedEstimator {
                               double max_rot = 0.0, double max_pos = 0.0,
                               double max_vel = 0.0, double max_bg = 0.0, double max_ba = 0.0,
                               double max_grav = 0.0, bool pose_only = false,
-                              VisualDiagnostics* diag = nullptr);
+                              VisualDiagnostics* diag = nullptr,
+                              bool freeze_bias = false);
 
   /// 视觉更新单帧步长上限：0.5°、2 cm、5 cm/s、1e-4 rad/s、1e-3 m/s²、5e-3 m/s²(重力)。
   static constexpr double kMaxVisualRotStep = 0.0087;

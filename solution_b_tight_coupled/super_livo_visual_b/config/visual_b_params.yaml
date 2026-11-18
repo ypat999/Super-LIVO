@@ -4,6 +4,9 @@
     # topic 订阅/发布（与 Super-LIO 及 bag 对齐，同方案 A）
     # ========================================================================
     image_topic: "/left_camera/image"
+    # 默认 10 Hz 的 /lio/odom（激光帧后验，与 A 一致）；它是 base_link 系，
+    # app 会用 LIO 的 lio.extrinsic.odom_robo 把它换回 IMU 系再进估计。
+    # 若要绕开该外参可直接填 lio/imu/odom（200 Hz，IMU 系）。
     odom_topic: "lio/odom"
     cloud_topic: "lio/cloud_world"
     body_cloud_topic: "lio/cloud_body_dense"
@@ -179,7 +182,9 @@
     #   节点退出时再存一次。输出：<save_dir>/super_livo_visual_b_colored.pcd
     # ========================================================================
     pcd.save_dir: "/home/ywj/slam_data/pcd"
-    pcd.save_interval_sec: 30.0
+    # 必须 <=0（只在退出时存一次）：周期落盘在单线程 executor 里会阻塞订阅回调，
+    # 百万级点写盘一次约 1 s，实测造成 IMU 丢包/图像丢帧，恢复后轨迹被泵飞。
+    pcd.save_interval_sec: 0.0
     pcd.max_points: 20000000
     # 官方 publish_frame_world 不做任何颜色融合，逐帧逐点保留原始采样。
     # 1cm 体素时间中位回填会把同体素内所有点写成同一颜色（1cm 体素内色标准差

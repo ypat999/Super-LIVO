@@ -93,6 +93,12 @@ class VisualBNode : public rclcpp::Node {
   /// 未设置时节点行为与原先完全一致，只维护自身的统一估计器。
   void setConstraintBridge(const std::shared_ptr<ConstraintBridge>& bridge) { bridge_ = bridge; }
 
+  /// odom_topic 若发布的是 base_link（robot body）系（/lio/odom 就是这样，Super-LIO
+  /// 对它施加了 lio.extrinsic.odom_robo），用本接口把该外参传进来：
+  ///   T_w_body = T_w_imu · T_imu_body  ⇒  T_w_imu = T_w_body · T_imu_body⁻¹
+  /// 不设置时按单位阵处理（NTU 等 odom_robo=0 的数据集）。
+  void setOdomBodyExtrinsic(const Eigen::Matrix4d& T_imu_body) { T_imu_robo_ = T_imu_body; }
+
  private:
   /// 把"本帧实际施加的视觉法方程"转换成 ESKF 的 18 维观测并投递到桥。
   /// 约定：B 的法方程参数是世界系左扰动 ξ，ESKF 的旋转误差是机体系右扰动 δ，
@@ -237,6 +243,8 @@ class VisualBNode : public rclcpp::Node {
   double scale_{0.5};
   Eigen::Matrix4d T_lc_{Eigen::Matrix4d::Identity()};  ///< Camera->LiDAR
   Eigen::Matrix4d T_li_{Eigen::Matrix4d::Identity()};  ///< LiDAR->IMU（用于 T_wl -> T_wi）
+  /// odom_topic 的机体系 -> IMU 外参的逆（T_imu_body）。单位阵表示 odom 本身就在 IMU 系。
+  Eigen::Matrix4d T_imu_robo_{Eigen::Matrix4d::Identity()};
   Eigen::Matrix4d T_wl_{Eigen::Matrix4d::Identity()};  ///< 当前 LiDAR 位姿
   /// 最新一条 lio/odom 自身的时刻：位姿回退到 T_wl_ 时，发布必须按这个时刻打戳。
   double last_odom_stamp_{0.0};
@@ -300,9 +308,13 @@ class VisualBNode : public rclcpp::Node {
 
   // ---- 缓存容量 ------------------------------------------------------------
   std::size_t max_image_cache_{30};
-  std::size_t max_pose_samples_{300};
+  /// 位姿缓存上限：按时间窗而不是条数才有意义。odom 默认是 10 Hz 的 /lio/odom
+  /// （切成 /lio/imu/odom 时是 200 Hz，2000 条只有 10 s），落盘/着色滞后会查不到位姿。
+  std::size_t max_pose_samples_{2000};  ///< 10 Hz ⇒ 200 s；200 Hz ⇒ 10 s
   std::size_t max_map_points_{60000};
-  std::size_t max_imu_samples_{500};  ///< ≈1s（IMU 200Hz）
+  /// IMU 缓存上限：move 的 bag 存在 2.62 s 图像空洞，500 条（200 Hz ⇒ 2.5 s）刚好
+  /// 被裁掉，导致空洞两侧无法用真实 IMU 传播（只能跳过该段等先验追回）。
+  std::size_t max_imu_samples_{1200};  ///< ≈6 s（IMU 200Hz）
   int map_append_stride_{3};
 
   // ---- LiDAR 先验（D2）参数 ------------------------------------------------
@@ -347,6 +359,9 @@ class VisualBNode : public rclcpp::Node {
   double last_trust_stamp_{-1.0};
   std::size_t stat_prior_veto_{0};       ///< Trust 否决激光先验的次数
   std::size_t stat_vel_clamp_{0};        ///< 速度限幅触发次数
+  /// 无 IMU 的退化帧数：IMU 一条都没收到时，每帧按 lio/odom 位姿重置状态。
+  /// 该计数 >0 说明本次运行不是有效的紧耦合 B 结果（跑批脚本会据此判失败）。
+  std::size_t stat_no_imu_{0};
 
   /// IMU 样本缓存 {stamp, acc, gyro}，propagate 时取与图像最近的样本。
   struct ImuSample {
@@ -416,6 +431,11 @@ class VisualBNode : public rclcpp::Node {
   // ---- 彩色着色调度 --------------------------------------------------------
   /// 待着色队列：t_img 时刻的位姿通常要等 0.1 s 才发布，收到后由 drainPendingColorization 处理。
   std::deque<PendingColorFrame> pending_color_;
+
+  /// 彩色排空节流：位姿缓存只在 odom_topic（默认 lio/odom，10 Hz）上推进，
+  /// 没有新位姿时重试必然还是失败，因此按最小间隔限流（原先挂在 200 Hz odom 上，
+  /// 积压时 200 Hz × 每帧重试会把工作线程吃满，见 [PROBE-D]）。
+  std::chrono::steady_clock::time_point last_color_drain_{};
 
   /// 待配对图像的 dense 云队列（大图回调比云慢约 1 帧，云先入队等图）。
   /// 命名注意：`PendingCloud` 已被 MapCommitScheduler 占用（命名空间级），这里用独立名字。
@@ -491,6 +511,8 @@ class VisualBNode : public rclcpp::Node {
     nav_msgs::msg::Odometry::ConstSharedPtr odom;
     sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud;
     sensor_msgs::msg::Imu::ConstSharedPtr imu;
+    /// 入队时刻（回调线程写，工作线程读）：用于度量排队延迟，定位阻塞环节。
+    std::chrono::steady_clock::time_point enqueued{};
   };
 
   /// 启动工作线程与落盘线程（构造函数末尾）。

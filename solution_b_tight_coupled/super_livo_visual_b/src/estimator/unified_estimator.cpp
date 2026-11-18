@@ -108,7 +108,14 @@ void UnifiedEstimator::lidarUpdate(const Eigen::MatrixXd& H, const Eigen::Vector
   const double k = std::min(10.0, std::max(1.0, lidar_dt_accum_ / 0.1));
   lidar_dt_accum_ = 0.0;
   applyInformationUpdate(H, b, 1.0 * k, 0.05 * k, 0.1 * k, 0.5 * k, 1.0e-3, 1.0e-2,
-                         0.01);
+                         0.01, false, nullptr, /*freeze_bias=*/true);
+}
+
+void UnifiedEstimator::noteSkippedInterval(double dt) {
+  if (!std::isfinite(dt) || dt <= 0.0) {
+    return;
+  }
+  lidar_dt_accum_ += dt;
 }
 
 void UnifiedEstimator::visualUpdate(const VisualUpdateInput& input) {
@@ -319,7 +326,8 @@ void UnifiedEstimator::applyInformationUpdate(const Eigen::MatrixXd& H,
                                               double max_ba,
                                               double max_grav,
                                               bool pose_only,
-                                              VisualDiagnostics* diag) {
+                                              VisualDiagnostics* diag,
+                                              bool freeze_bias) {
   if (weight <= 0.0) {
     return;
   }
@@ -348,31 +356,43 @@ void UnifiedEstimator::applyInformationUpdate(const Eigen::MatrixXd& H,
     dx.segment<3>(StateLayout::kGrav).setZero();
   }
 
-  // 步长限幅：对 rot/pos/vel/bg/ba/grav 各块分别检查，超限时 dx **整体**等比缩小
-  // （保持修正方向不变、只缩步长，保守且不会引入方向性错误）。
+  // 零偏/重力冻结（仅 LiDAR 位姿先验）：先验只对 rot/pos/vel 有直接观测，
+  // bg/ba/grav 的 dx 全部来自 P_new 的耦合项，而先验的旋转残差里有系统性成分
+  // （时间同步、外参、LIO 自身几何误差），耦合会把它当成"陀螺零偏"吸收：
+  // move 实测 bg 漂到 ~0.03 rad/s，图像空洞那 2.6 s 没有先验，姿态按该伪零偏
+  // 漂 3.4°，水平伪加速度 |g|·sin3.4°≈0.6 m/s² 把状态在 y 方向推出 1.4 m
+  // （路径 12.5 m / SL 10.4 m）。先验只修正它真正观测到的量。
+  if (freeze_bias) {
+    dx.segment<3>(StateLayout::kBg).setZero();
+    dx.segment<3>(StateLayout::kBa).setZero();
+    dx.segment<3>(StateLayout::kGrav).setZero();
+  }
+
+  // 步长限幅：rot/pos/vel/bg/ba/grav 各块**独立**裁剪（块内等比，块间互不影响）。
   // 关键教训：
   //  1) 必须连速度/零偏一起限——视觉只约束位姿，但 dx 会通过协方差耦合
   //     把巨大跳变灌进速度/零偏块，先验每帧只拉位置，形成"拉扯式游走"。
   //  2) 必须连重力一起限！dx[grav] 不经任何观测约束、完全由 P_new 耦合项决定，
   //     一旦被踢飞，名义传播 v+=(a+g)dt 会在几帧内把状态整体炸掉（实测 y 方向 -1022m）。
+  //  3) 不能"取所有块的最小比例再整体缩放"：bg/ba/grav 的限值极小
+  //     （1e-3 / 1e-2 / 1e-2），它们的 dx 一旦超限就会把位置/速度修正同比例压到
+  //     1%~5%，LiDAR 先验等于失效。move 实测：2.62 s 图像空洞后 |v| 一路涨到
+  //     3 m/s 上限、轨迹 85.9 m / 闭环 18.6 m / z 冲到 10 m，即此模式。
   // max_* <= 0 表示该块不限幅。
-  {
-    const double limits[6][2] = {
-        {max_rot, dx.segment<3>(StateLayout::kRot).norm()},
-        {max_pos, dx.segment<3>(StateLayout::kPos).norm()},
-        {max_vel, dx.segment<3>(StateLayout::kVel).norm()},
-        {max_bg, dx.segment<3>(StateLayout::kBg).norm()},
-        {max_ba, dx.segment<3>(StateLayout::kBa).norm()},
-        {max_grav, dx.segment<3>(StateLayout::kGrav).norm()},
-    };
-    double scale = 1.0;
-    for (const auto& l : limits) {
-      if (l[0] > 0.0 && l[1] > l[0]) {
-        scale = std::min(scale, l[0] / l[1]);
+  auto clampBlock = [&dx](int idx, double limit) {
+    if (limit > 0.0) {
+      const double norm = dx.segment<3>(idx).norm();
+      if (norm > limit) {
+        dx.segment<3>(idx) *= limit / norm;
       }
     }
-    dx *= scale;
-  }
+  };
+  clampBlock(StateLayout::kRot, max_rot);
+  clampBlock(StateLayout::kPos, max_pos);
+  clampBlock(StateLayout::kVel, max_vel);
+  clampBlock(StateLayout::kBg, max_bg);
+  clampBlock(StateLayout::kBa, max_ba);
+  clampBlock(StateLayout::kGrav, max_grav);
 
   // 保持协方差对称，避免数值漂移。
   filter_.covariance = 0.5 * (covariance_new + covariance_new.transpose());

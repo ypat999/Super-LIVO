@@ -54,7 +54,7 @@ super_lio:
     lio.kf.kf_quit_eps: 0.001
 
     # ---------------- 输出（A/B 彩色支路依赖 dense_body + degeneracy 签名） ----------------
-    lio.output.robot: true
+    lio.output.robot: false
     lio.output.plan_env_world: false
     lio.output.plan_env_body: false
     lio.output.ml_map: false

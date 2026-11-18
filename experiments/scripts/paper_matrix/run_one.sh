@@ -12,7 +12,8 @@
 #   sl   官方 Super-LIO（/lio/odom）；RTK/room 用其自带视觉配置，其余数据集为 LIO-only
 #
 # 统一条件：FastDDS、同一 ROS_DOMAIN_ID、1x 实时播放、同一话题过滤、
-# 同一 tools/latency_probe.py 外部探针。产物 <OUTROOT>/<seq>/<arm>/：
+# 同一 tools/latency_probe_cpp 外部探针（C++ generic subscription，不反序列化）。
+# 产物 <OUTROOT>/<seq>/<arm>/：
 #   node.log  play.log  latency.csv  odom/  meta.txt  pcd/  done
 #
 # 环境变量：RATE(默认1.0) SMOKE(秒，>0 只播前 N 秒) FORCE=1 重跑已完成项
@@ -62,7 +63,10 @@ case "$SEQ" in
     SL_CFG=$EXP/livox_360_visa.yaml; SLK_CFG=$EXP/livox_360_visa_off.yaml
     A_CFG=$REPO/solution_a_lightweight/super_livo_visual_a/config/visual_a_rtk.yaml
     B_CFG=$REPO/solution_b_tight_coupled/super_livo_visual_b/config/visual_b_rtk.yaml
-    FL2_BAG=$BAG; FL2_MODE=env; NEED_REPUB=1
+    # 相机参数走 parameter_blackboard：当前 vikit 的 getRemoteParam 没有环境变量
+    # 回退分支（旧 fl2_env.sh 那套 FL2_<NODE>_<PARAM> 不生效），env 模式会直接抛
+    # "Camera model not correctly specified."
+    FL2_BAG=$BAG; FL2_MODE=blackboard; NEED_REPUB=1
     FL2_CFG=/home/ywj/slam_data/rtk_slam/fl2_cfg/rtk_construction_lvi.yaml
     FL2_CAM=/home/ywj/slam_data/rtk_slam/fl2_cfg/camera_rtk_pinhole.yaml
     ;;
@@ -79,15 +83,19 @@ case "$SEQ" in
     FL2_CAM=$BAG/camera_pinhole.yaml
     ;;
   move)
-    BAG=/home/ywj/slam_data/livo_bag/move_livoxclk
+    # 原 paper 轮用 move_livoxclk（图像 header 已改写为 Livox 时钟，A/B 的 yaml 里
+    # img_time_offset 写 0.0），该副本已不在磁盘；现存唯一一份是 move_ros2：
+    # 图像 header 保留主机时钟，与 Livox 时钟差 -204262818.9974 s（与 FL2 配置
+    # config/move_fastcalib.yaml 的实测值同源），A/B 在下面用 -p 覆盖。
+    BAG=/home/ywj/slam_data/livo_bag/move_ros2
     LIDAR=/livox/lidar; LIDAR_TYPE=custom
     IMG=/left_camera/image
     PLAY_TOPICS="/livox/lidar /livox/imu /left_camera/image"
     SL_CFG=$SLCFG/livox_360.yaml; SLK_CFG=$SLCFG/livox_360.yaml
     A_CFG=$REPO/solution_a_lightweight/super_livo_visual_a/config/visual_a_move.yaml
     B_CFG=$REPO/solution_b_tight_coupled/super_livo_visual_b/config/visual_b_move.yaml
-    # FL2 用 move_ros2（同一段数据的另一份 bag，move_livoxclk 的 lidar 时间戳在 FL2 下不连续）
-    FL2_BAG=/home/ywj/slam_data/livo_bag/move_ros2; FL2_MODE=blackboard
+    MOVE_IMG_OFF=-204262818.9974
+    FL2_BAG=$BAG; FL2_MODE=blackboard
     FL2_CFG=$REPO/config/move_fastcalib.yaml
     FL2_CAM=$REPO/config/camera_move.yaml
     ;;
@@ -114,6 +122,12 @@ case "$ARM" in
 esac
 [ "$ARM" = "fl2" ] && [ "$FL2_MODE" = "none" ] && { echo "[skip] $SEQ 不支持官方 FL2（雷达为 PointCloud2）"; exit 0; }
 
+# 图像时间补偿：move 用 move_ros2（图像 header 为主机时钟），A/B 的 yaml 是按
+# move_livoxclk 写的 0.0，这里按实测差值覆盖，否则 t_img 会落到 2026 年。
+VOVER=()
+[ -n "${MOVE_IMG_OFF:-}" ] && [ "$ARM" != "sl" ] && [ "$ARM" != "fl2" ] && \
+  VOVER=(-p img_time_offset:=$MOVE_IMG_OFF)
+
 mkdir -p "$OUT"
 rm -rf "$OUT/odom" "$OUT/pcd" "$OUT/latency.csv" "$OUT/meta.txt" "$OUT/done"
 
@@ -121,6 +135,32 @@ rm -rf "$OUT/odom" "$OUT/pcd" "$OUT/latency.csv" "$OUT/meta.txt" "$OUT/done"
 LOCK=/tmp/ros_batch.lock
 exec 9>"$LOCK"
 flock -n 9 || { echo "拒绝启动：$LOCK 被占用（禁止并行）"; exit 1; }
+
+# ---------------- 上一臂残留清理 ----------------
+# 必须在 ros_batch_guard 之前：guard 见到任何 ROS 节点就拒绝启动，而它拒绝的
+# 往往正是上一臂泄漏的孤儿（rtk/a 的 republish 真身没被杀，rtk/b、rtk/fl2
+# 四连拒就是这么来的）。此刻锁已在手上，别的跑批进不来，场上的都是孤儿，可安全清理。
+#
+# 为什么必须清干净：
+#   1) 泄漏的参与者仍占着 FastDDS 共享内存端口，新参与者 init_port 失败
+#      （rec.log 里 "open_and_lock_file failed"）→ 该臂主干 lidar_buf=0、
+#      frame_num=0，整段 0 odom（retail/b 连续两轮 0 odom 就是这么来的）；
+#   2) 黑板「看得见但不应答」→ FL2 构造期 SyncParametersClient 卡死/抛
+#      "Camera model not correctly specified."。
+# 注意 comm 被截断成 15 字符（parameter_black），pkill -x 匹配不到，只能按命令行匹配。
+# republish 要匹配 ros2 run 的**真身** /opt/ros/humble/lib/image_transport/republish：
+# ros2 run 只是个 wrapper，杀 wrapper 不会带走它 spawn 的子进程。
+LEFTOVER_RE='/demo_nodes_cpp/parameter_[b]lackboard|super_lio_node|visual_a_node|visual_b_node|fastlivo_mapping|latency_probe|image_transport[/ ]republish|ros2 bag play|ros2 bag record'
+pkill -f "$LEFTOVER_RE" 2>/dev/null
+for _ in $(seq 1 15); do
+  pgrep -f "$LEFTOVER_RE" > /dev/null || break
+  sleep 1
+done
+pkill -9 -f "$LEFTOVER_RE" 2>/dev/null
+sleep 1
+
+rm -f /dev/shm/fastrtps_* /dev/shm/fast_datachannel_* /dev/shm/sem.fastrtps_* 2>/dev/null
+
 source "$REPO/tools/ros_batch_guard.sh"
 
 source /opt/ros/humble/setup.bash
@@ -139,27 +179,18 @@ export RMW_IMPLEMENTATION=${RMW_IMPL:-rmw_fastrtps_cpp}
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-93}
 unset ROS_LOCALHOST_ONLY
 
-# 清残留黑板（必须在删 shm 之前：删掉活参与者的 shm 会让它"看得见但不应答"，
-# 表现为 FL2 构造时 SyncParametersClient 无限阻塞、最后抛
-# "Camera model not correctly specified."）。注意 comm 被截断成 15 字符
-# parameter_black，pkill -x parameter_blackboard 匹配不到，必须按可执行路径匹配。
-pkill -f '/demo_nodes_cpp/parameter_[b]lackboard' 2>/dev/null
-for _ in $(seq 1 10); do pgrep -f '/demo_nodes_cpp/parameter_[b]lackboard' >/dev/null || break; sleep 1; done
-pkill -9 -f '/demo_nodes_cpp/parameter_[b]lackboard' 2>/dev/null
-
-rm -f /dev/shm/fastrtps_* /dev/shm/fast_datachannel_* /dev/shm/sem.fastrtps_* 2>/dev/null
-
+# （残留清理已上移到取锁之后、guard 之前，见上方 LEFTOVER_RE）
 PIDS=()
 
 # 任何路径退出都必须收掉子进程：ros2 run 的孤儿子进程会继承锁 fd（9），
 # 让后续所有跑批都「锁被占用」而整段跳过（2026-11-17 rtk 四臂就是这么全丢的）。
 cleanup_children() {
   trap - EXIT
-  pkill -f '/demo_nodes_cpp/parameter_[b]lackboard' 2>/dev/null
   for p in "${PIDS[@]}"; do kill -9 "$p" 2>/dev/null; done
-  pkill -9 -x super_lio_node 2>/dev/null
-  pkill -9 -x visual_a_node 2>/dev/null
-  pkill -9 -x visual_b_node 2>/dev/null
+  # ros2 run 只是 wrapper：kill wrapper 带不走它 spawn 的真身
+  # （super_lio_node / republish / fastlivo_mapping…），必须按 LEFTOVER_RE 再收一遍，
+  # 否则孤儿会占着 FastDDS SHM 端口，并把下一臂的 guard 直接顶回去。
+  pkill -9 -f "$LEFTOVER_RE" 2>/dev/null
 }
 trap cleanup_children EXIT
 
@@ -191,16 +222,16 @@ if [ "$ARM" = "fl2" ]; then
     ros2 run demo_nodes_cpp parameter_blackboard --ros-args \
       --params-file "$FL2_CAM" > "$OUT/blackboard.log" 2>&1 &
     BB=$!; PIDS+=("$BB")
-    # 就绪校验：黑板参数服务必须真的应答，否则 FL2 会在构造里卡死（白跑一整段）
-    BB_OK=0
-    for _ in $(seq 1 30); do
-      if timeout 5 ros2 param get /parameter_blackboard cam_model 2>/dev/null | grep -q Pinhole; then
-        BB_OK=1; break
-      fi
-      sleep 1
-    done
-    if [ "$BB_OK" != "1" ]; then
-      echo "[$SEQ/$ARM] 黑板相机参数不可读（参数服务无应答），放弃本次"; exit 1
+    sleep 3
+    # 就绪检查只作提示，不作门槛：ros2 param get --no-daemon 每次都要新起进程
+    # 重新做一遍 DDS 发现，机器正在收上一臂的尾时 5 s 常常发现不完 → 连续 20 次
+    # 判"不应答"，而 blackboard.log 里黑板其实一直 "serving '17' parameters"。
+    # 之前 retail/fl2、ntu03/fl2 就是这么在起 FL2 之前被误杀的。
+    # 真正的判据是下面 FL2 有没有打印 "^scale:"。
+    if timeout 10 ros2 param get --no-daemon /parameter_blackboard cam_model 2>/dev/null | grep -q Pinhole; then
+      echo "[$SEQ/$ARM] 黑板已就绪"
+    else
+      echo "[$SEQ/$ARM] ros2 param get 未读到黑板（仅提示，继续起 FL2）"
     fi
     # vikit 的 getRemoteParam 只 wait_for_service(100 ms)（params_helper.h:117），
     # 服务没在 100 ms 内被本进程发现就静默退化成默认值 → 立即抛
@@ -210,25 +241,57 @@ if [ "$ARM" = "fl2" ]; then
     FL2_ARGS=(--ros-args --params-file "$FL2_CFG" --params-file "$FL2_CAM")
   fi
   FASTLIVO_BIN=/home/ywj/fastlivo2_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping
+  # 清掉上一轮残留在 FL2 Log/pcd 的落盘文件，避免本轮的 pcd 与旧文件混在一起
+  rm -f /home/ywj/fastlivo2_ws/src/fast_livo/Log/pcd/*.pcd
   FL2_TRIES=3
+  FL2_OK=0
   for FL2_TRY in $(seq 1 $FL2_TRIES); do
+    # interval<0：不在运行中按 N 帧切片，退出时 savePCD() 一次性写
+    # all_raw_points.pcd(+all_downsampled_points.pcd)（LIVMapper.cpp:725）
+    # vio.visual_map_window_sec=60：官方视觉地图点永不删除且每个点持有建点帧的
+    # 整幅图像金字塔（实测 ≈50 MB/s 线性增长），rtk（599 s）峰值 22.9 GB 被 OOM
+    # 杀掉 → 退出时 savePCD() 不执行、该臂 0 pcd。60 s 滚动窗口只为控内存，
+    # 四臂统一口径都用这条参数。
     "$FASTLIVO_BIN" "${FL2_ARGS[@]}" \
-      -p evo.seq_name:="${SEQ}_${ARM}" -p pcd_save.pcd_save_en:=true -p pcd_save.interval:=200 \
+      -p evo.seq_name:="${SEQ}_${ARM}" -p pcd_save.pcd_save_en:=true -p pcd_save.interval:=-1 \
+      -p vio.visual_map_window_sec:=60.0 \
       > "$OUT/node.log" 2>&1 &
     NODE_PID=$!
-    sleep 8
-    if kill -0 "$NODE_PID" 2>/dev/null; then break; fi
-    if grep -q 'Camera model not correctly specified' "$OUT/node.log" && [ "$FL2_MODE" != "env" ]; then
-      echo "[$SEQ/$ARM] FL2 相机内参远程读取竞态（第 $FL2_TRY/$FL2_TRIES 次），重试"
-      sleep 3
-      continue
-    fi
-    break
+    # 成功判定用相机参数是否真的取到：PinholeCamera 构造后立刻打印 "scale: ..."，
+    # 失败是构造期抛异常秒退。只看进程活着会把"还在等黑板"误判成成功。
+    for _ in $(seq 1 25); do
+      if grep -q '^scale:' "$OUT/node.log" 2>/dev/null; then FL2_OK=1; break; fi
+      kill -0 "$NODE_PID" 2>/dev/null || break
+      sleep 1
+    done
+    [ "$FL2_OK" = "1" ] && break
+    kill -9 "$NODE_PID" 2>/dev/null
+    if [ "$FL2_MODE" = "env" ]; then break; fi
+    echo "[$SEQ/$ARM] FL2 没取到相机内参（第 $FL2_TRY/$FL2_TRIES 次），重起黑板后重试"
+    # 黑板可能已「可见但不应答」，连同 ros2 run 的子进程一起重起
+    pkill -f '/demo_nodes_cpp/parameter_[b]lackboard' 2>/dev/null
+    sleep 1
+    pkill -9 -f '/demo_nodes_cpp/parameter_[b]lackboard' 2>/dev/null
+    ros2 run demo_nodes_cpp parameter_blackboard --ros-args \
+      --params-file "$FL2_CAM" > "$OUT/blackboard.log" 2>&1 &
+    BB=$!; PIDS+=("$BB")
+    # 重起后同样只等发现、不拿 ros2 param get 当门槛（原因见上）
+    sleep 5
   done
+  if [ "$FL2_OK" != "1" ]; then
+    echo "[$SEQ/$ARM] FL2 三次都没取到相机内参，放弃本次（见 $OUT/node.log）"
+    exit 1
+  fi
 else
   if [ "$ARM" = "sl" ]; then
+    # save_interval<0：不做 500 帧切片（PCD/scans_*.pcd），改由 /map_save 服务
+    # 调 saveMap() 一次性 voxel 降采样落成 map_name 单文件（livox_360.yaml 注释口径）
+    # 服务名显式统一：各 SL 配置里是 /map_save_lio 或默认 /map_save（NTU.yaml），
+    # 且机器上可能残留同名服务，用专属名字避免调错。
     SL_ARGS=(--ros-args --params-file "$SL_CFG"
-             -p lio.map.save_map:=true -p lio.map.save_map_dir:="$OUT/pcd")
+             -p lio.map.save_map:=true -p lio.map.save_map_dir:="$OUT/pcd"
+             -p lio.map.save_interval:=-1 -p lio.map.map_name:="${SEQ}_${ARM}_map.pcd"
+             -p lio.ros.map_save_service_topic:=/map_save_paper)
   else
     SL_ARGS=(--ros-args --params-file "$SLK_CFG"
              -p lio.sc_pgo.enable:=false -p lio.map.save_map:=false)
@@ -242,7 +305,7 @@ else
   sleep 6
   if [ "$ARM" != "sl" ]; then
     ros2 run "$NODE_PKG" "$NODE_EXE" --ros-args --params-file "$VCFG" \
-      -p pcd.save_dir:="$OUT/pcd" > "$OUT/node.log" 2>&1 &
+      "${VOVER[@]}" -p pcd.save_dir:="$OUT/pcd" > "$OUT/node.log" 2>&1 &
     NODE_PID=$!
   fi
 fi
@@ -256,7 +319,14 @@ if ! kill -0 "$NODE_PID" 2>/dev/null; then
 fi
 
 # ---------------- 探针 + 录 odom ----------------
-python3 "$REPO/tools/latency_probe.py" --lidar-topic "$LIDAR" --lidar-type "$LIDAR_TYPE" \
+# 用 C++ 探针（tools/latency_probe_cpp）：generic subscription 拿序列化字节，
+# 只读 12 字节 header.stamp，单帧开销亚微秒级。Python 版探针在重负载序列上
+# 自身会滞后（lidar recv−stamp 抖动 41 s、odom 90~110 s，algo 出现负值）。
+PROBE_BIN=$REPO/install/latency_probe_cpp/lib/latency_probe_cpp/latency_probe
+if [ ! -x "$PROBE_BIN" ]; then
+  echo "缺少探针 $PROBE_BIN（先 colcon build --packages-select latency_probe_cpp）"; exit 1
+fi
+"$PROBE_BIN" --lidar-topic "$LIDAR" --lidar-type "$LIDAR_TYPE" \
   --odom-topic "$OWN" --out "$OUT/latency.csv" > "$OUT/probe.log" 2>&1 &
 PROBE=$!; PIDS+=("$PROBE")
 
@@ -287,6 +357,17 @@ if [ "$ARM" = "fl2" ]; then
   kill -9 "$NODE_PID" 2>/dev/null
   mkdir -p "$OUT/pcd"
   mv /home/ywj/fastlivo2_ws/src/fast_livo/Log/pcd/*.pcd "$OUT/pcd"/ 2>/dev/null
+  # 只留最终一个 pcd：interval<0 时 FL2 写 all_raw_points.pcd（img_en 时是彩色全量）
+  # 与 all_downsampled_points.pcd（体素降采样）。保留全量并统一命名，其余删除。
+  if [ -f "$OUT/pcd/all_raw_points.pcd" ]; then
+    mv -f "$OUT/pcd/all_raw_points.pcd" "$OUT/pcd/${SEQ}_${ARM}_map.pcd"
+  elif [ -f "$OUT/pcd/all_downsampled_points.pcd" ]; then
+    mv -f "$OUT/pcd/all_downsampled_points.pcd" "$OUT/pcd/${SEQ}_${ARM}_map.pcd"
+  fi
+  for f in "$OUT/pcd"/*.pcd; do
+    [ -e "$f" ] || continue
+    [ "$(basename "$f")" = "${SEQ}_${ARM}_map.pcd" ] || rm -f "$f"
+  done
   # 位姿文件（FL2 自带）
   find /home/ywj/fastlivo2_ws/src/fast_livo/Log -name "*${SEQ}_${ARM}*.txt" -newermt "-2 hours" \
     -exec mv {} "$OUT"/ \; 2>/dev/null
@@ -294,6 +375,14 @@ if [ "$ARM" = "fl2" ]; then
   # 下一轮同名服务就会「可见但不应答」→ 按可执行路径连子进程一起收掉。
   pkill -f '/demo_nodes_cpp/parameter_[b]lackboard' 2>/dev/null
 else
+  # SL 臂：save_interval<0 时地图只在 /map_save 服务里一次性 voxel 降采样落盘
+  # （SuperLIO::saveMap()，super_lio.cpp:1223-1245），必须在节点还活着时调用，
+  # 否则本臂没有任何 pcd 产物。
+  if [ "$ARM" = "sl" ]; then
+    echo "[$(date +%H:%M:%S)] /map_save_paper 合并落盘（全量地图 voxel 降采样，可能数十秒）"
+    timeout 600 ros2 service call /map_save_paper std_srvs/srv/Trigger "{}" > "$OUT/map_save.log" 2>&1 \
+      || echo "[$SEQ/$ARM] /map_save_paper 调用失败，见 $OUT/map_save.log"
+  fi
   # ros2 run 的 wrapper 与真正的节点是父子两个进程：只 kill wrapper 会留下孤儿节点
   # （实测方案A节点在下一轮启动时被 guard 拦下）。按可执行名精确收尾。
   if [ "$ARM" = "sl" ]; then EXE=super_lio_node; else EXE=$NODE_EXE; fi
@@ -304,6 +393,20 @@ else
 fi
 for p in "${PIDS[@]}"; do kill -9 "$p" 2>/dev/null; done
 sleep 2
+
+# SL 的 SC-PGO 还会按帧写 Scans/（每帧一个 pcd）与 PCD/ 分片、odom_poses.txt。
+# 产物只保留一次性合并的 map 单文件，逐帧分片全部删掉，轨迹挪到臂目录。
+if [ "$ARM" = "sl" ]; then
+  rm -rf "$OUT/pcd/Scans" "$OUT/pcd/PCD"
+  [ -f "$OUT/pcd/odom_poses.txt" ] && mv -f "$OUT/pcd/odom_poses.txt" "$OUT/odom_poses.txt"
+fi
+
+# 产物校验：每个臂必须只留一个最终 PCD（A/B 为节点自带的 *_colored.pcd）
+PCD_N=$(find "$OUT/pcd" -name '*.pcd' 2>/dev/null | wc -l)
+if [ "$PCD_N" != "1" ]; then
+  echo "[$SEQ/$ARM] 警告：$OUT/pcd 下有 $PCD_N 个 pcd（预期 1）"
+  find "$OUT/pcd" -name '*.pcd' 2>/dev/null | head
+fi
 
 {
   echo "seq=$SEQ arm=$ARM"
@@ -323,6 +426,13 @@ cat "$OUT/meta.txt"
 ODOM_N=$(sed -n 's/^odom_rows=\([0-9]*\).*/\1/p' "$OUT/meta.txt")
 if [ "${ODOM_N:-0}" = "0" ]; then
   echo "[$SEQ/$ARM] 0 条 odom，未写 done；修复后 FORCE=1 重跑"
+  exit 1
+fi
+# B 臂硬校验：一条 IMU 都没收到时，B 节点只能退化成"跟随 lio/odom"（不是紧耦合结果）。
+# 批量跑批实测出现过 IMU 投递偶发失效，该次 path 1.33 m（单独重跑 9.77 m）。
+# 判据用初始化日志行，它只在 imu_buffer_ 非空时打印；不写 done，断点续跑会自动重跑。
+if [ "$ARM" = "b" ] && ! grep -q 'IMU 加计归一化' "$OUT/node.log" 2>/dev/null; then
+  echo "[$SEQ/$ARM] 未收到 IMU（node.log 无「IMU 加计归一化」），该次不是有效 B 结果，未写 done"
   exit 1
 fi
 [ "$SMOKE" -gt 0 ] && touch "$OUT/smoke"

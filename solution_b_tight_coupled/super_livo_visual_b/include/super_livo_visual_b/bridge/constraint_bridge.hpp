@@ -35,6 +35,11 @@ class ConstraintBridge {
  public:
   void push(VisualObs obs) {
     std::lock_guard<std::mutex> lock(mtx_);
+    if (has_) {
+      // 上一条还没被 LIO 取走就被新的覆盖：说明消费侧（雷达帧节奏）跟不上
+      // 视觉帧产出，视觉支路在堆积。
+      ++overwritten_;
+    }
     slot_ = std::move(obs);
     has_ = true;
     ++pushed_;
@@ -65,12 +70,19 @@ class ConstraintBridge {
     return {pushed_, taken_};
   }
 
+  /// 未被取走即被覆盖的约束条数（探针：消费侧是否跟得上）。
+  long overwritten() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return overwritten_;
+  }
+
  private:
   mutable std::mutex mtx_;
   VisualObs slot_;
   bool has_{false};
   long pushed_{0};
   long taken_{0};
+  long overwritten_{0};
 };
 
 }  // namespace superlivo_b

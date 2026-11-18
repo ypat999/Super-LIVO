@@ -1,5 +1,13 @@
 # move bag（1280x1024 bgr8 全局快门相机 + Livox CustomMsg）——方案 B 支路参数。
 # 外参 Rcl/Pcl 由 FAST-Calib 标定结果回填（标定 bag：livo_bag/all_ros2，RMSE 7.9 mm）。
+#
+# 用法（paper_matrix 口径：LIO 单独进程 + 本节点订阅其 /lio/odom）：
+#   ros2 run super_livo_visual_b visual_b_node --ros-args \
+#     --params-file third_party/Super-LIO/src/super_lio/config/livox_360.yaml \
+#     --params-file solution_b_tight_coupled/super_livo_visual_b/config/visual_b_move.yaml
+#
+# 注意：paper_matrix 的 move 序列回放的是 move_ros2（图像 header 为主机时钟），
+#   启动命令用 `-p img_time_offset:=-204262818.9974` 覆盖本文件的 0.0。
 super_livo_visual_b:
   ros__parameters:
     image_topic: /left_camera/image
@@ -27,5 +35,9 @@ super_livo_visual_b:
     # 彩色点云落盘：<save_dir>/super_livo_visual_b_colored.pcd
     pcd:
       save_dir: "/home/ywj/slam_data/output/move_b"
-      save_interval_sec: 30.0
+      # 必须 <=0（只在退出时存一次）：周期落盘发生在单线程 executor 里，
+      # 200 万点写盘会阻塞约 1 s，实测直接造成 0.92 s IMU 丢包 + 图像帧丢弃，
+      # 恢复后姿态/速度被伪加速度泵飞（|v| 1.69 m/s、路径多 1.2 m）。
+      # 评测运行只需要最终的合并 pcd，退出时存一次即可。
+      save_interval_sec: 0.0
       max_points: 20000000
