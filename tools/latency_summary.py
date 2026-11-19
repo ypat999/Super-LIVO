@@ -6,10 +6,10 @@
 
 也可直接传 run 目录（自动找 latency.csv），或 --json 输出机器可读结果。
 配对规则：各臂 odom.stamp 相对雷达帧的约定不同（帧首 / 帧中 / 帧尾，实测
-SL/A 约 +97 ms 属帧尾、retail 的 b/fl2 约 0 属帧首、ntu 的 b/fl2 约 +45 属帧中）。
-先用「floor 配对」的差值中位数估计本臂偏移，再把 odom.stamp 减去该偏移后
-找最近邻雷达帧——直接用最近邻会被帧尾约定带到下一帧，把 algo 算成负值。
-配对容差 --tol-ms（默认 30 ms）。"""
+SL 约 +97 ms 属帧尾、retail 的 b/fl2 约 0 属帧首、ntu 的 b/fl2 约 +45 属帧中）。
+先用「odom.stamp − floor 雷达帧 stamp 的差值聚类（取最靠前的显著簇）」估计本臂偏移，再把
+odom.stamp 减去该偏移后找最近邻雷达帧——直接用最近邻会被帧尾约定带到下一帧，
+把 algo 算成负值。配对容差 --tol-ms（默认 30 ms）。"""
 
 import argparse
 import bisect
@@ -52,18 +52,51 @@ def nearest_stamp(stamps, x):
     return min(cand, key=lambda v: abs(v - x))
 
 
+def estimate_offset(l_stamps, odom_stamps, span_ns=150_000_000, cluster_gap_ns=20_000_000):
+    """估计 odom.stamp 相对雷达帧起点的约定偏移（帧首≈0、帧尾≈+100 ms、帧中≈+45 ms）。
+
+    做法：只取 floor 差值（odom.stamp − 其之前最近一帧雷达 stamp，恒 ≥0），按
+    gap > cluster_gap 聚成若干簇，再取「样本占比 ≥20% 且偏移最小」的簇中位数。
+
+    为什么用 floor 差值聚类，而不是 ±window 内全部差值的直方图主峰：
+    后者每帧 odom 会给前后三帧各贡献一个差值，三个簇计数几乎相等，主峰基本随机
+    （实测把 room/b 的 0 判成 −99.8、move/sl 的 +97.6 判成 −2.4）。
+
+    为什么取偏移最小的显著簇：帧首约定下 odom.stamp 有 ±3 ms 抖动，落到前一帧
+    的那一半样本差值会变成 ≈+100 ms，于是出现 0 与 +100 两簇并存；真正对应的
+    是偏移最小的一簇（帧尾/帧中约定只有一个簇，取它自身即可）。
+    """
+    diffs = []
+    for s in odom_stamps:
+        i = bisect.bisect_right(l_stamps, s) - 1
+        if i < 0:
+            continue
+        d = s - l_stamps[i]
+        # 时钟域不同（如设备时钟 vs 墙钟）时差值极大，直接丢弃，与旧行为一致：
+        # 不产生偏移、后续最近邻全部超容差 → matched=0。
+        if d <= span_ns:
+            diffs.append(d)
+    if not diffs:
+        return 0.0
+    diffs.sort()
+    clusters, start = [], 0
+    for i in range(1, len(diffs) + 1):
+        if i == len(diffs) or diffs[i] - diffs[i - 1] > cluster_gap_ns:
+            clusters.append(diffs[start:i])
+            start = i
+    n = len(diffs)
+    strong = [c for c in clusters if len(c) >= 0.2 * n]
+    if not strong:
+        strong = [max(clusters, key=len)]
+    return st.median(min(strong, key=lambda c: st.median(c)))
+
+
 def summarize(lidar, odom, tol_ms):
     l_stamps = [s for s, _ in lidar]
     l_recv = {s: r for s, r in lidar}
 
-    # 第一步：用「floor 配对」的差值中位数估计本臂 odom.stamp 相对雷达帧起点的
-    # 约定偏移（帧首≈0、帧尾≈+100 ms、帧中≈+45 ms）。
-    floor_off = []
-    for st_, _ in odom:
-        i = bisect.bisect_right(l_stamps, st_)
-        if i > 0:
-            floor_off.append(st_ - l_stamps[i - 1])
-    med_off = st.median(floor_off) if floor_off else 0
+    # 第一步：估计本臂 odom.stamp 相对雷达帧起点的约定偏移。
+    med_off = estimate_offset(l_stamps, [s for s, _ in odom])
 
     # 第二步：减去偏移后找最近邻，等价于「落在哪一帧的积分窗口里就配哪一帧」。
     algo, e2e, off, matched = [], [], [], 0

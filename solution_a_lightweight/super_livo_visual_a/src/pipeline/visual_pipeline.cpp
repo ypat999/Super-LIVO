@@ -443,26 +443,23 @@ void VisualPipeline::processVisualFrame(const cv::Mat& gray, double stamp) {
   //    2.8 px、门控（阈值 3.0）整帧全拒的主要原因。
   const double t_capture = stamp + img_time_offset_;
   Eigen::Matrix4d T_wl_img = Eigen::Matrix4d::Identity();
-  double pose_stamp = t_capture;
   if (opt_.reinject) {
     // 回灌模式：基准位姿直接取修正轨迹在曝光时刻的插值，不叠加 pose_offset_。
-    if (!poseAtStampCorrected(t_capture, T_wl_img)) {
-      if (!own_pose_cache_.empty()) {
-        T_wl_img = own_pose_cache_.back().T_wl;
-        pose_stamp = own_pose_cache_.back().stamp;
-      } else {
-        T_wl_img = T_wl_;  // 启动初期尚无采样
-        if (last_odom_stamp_ > 0.0) {
-          pose_stamp = last_odom_stamp_;
-        }
-      }
+    if (!poseAtStampCorrected(t_capture, T_wl_img, /*clamp_future=*/true)) {
+      // 只有启动初期还没有任何采样才会走到这里。
+      T_wl_img = own_pose_cache_.empty() ? T_wl_ : own_pose_cache_.back().T_wl;
     }
-  } else if (!opt_.use_exposure_pose || !poseAtStamp(t_capture, T_wl_img)) {
-    T_wl_img = T_wl_;  // 关闭开关 / 启动初期缓存还不够 / 未来时刻无采样，退回最新值
-    if (last_odom_stamp_ > 0.0) {
-      pose_stamp = last_odom_stamp_;
+  } else if (!opt_.use_exposure_pose) {
+    T_wl_img = T_wl_;
+  } else {
+    (void)poseAtStamp(t_capture, T_wl_img, /*clamp_future=*/true);
+    if (pose_cache_.empty()) {
+      T_wl_img = T_wl_;  // 启动初期尚无采样
     }
   }
+  // 相机与雷达是硬件级触发同步（同一时刻曝光/扫描），输出**一律**按图像采集时刻
+  // 打戳；不允许回退到"最新采样自身的时刻"。
+  const double pose_stamp = t_capture;
   // 2.1) 叠加此前视觉修正的持久偏移：T_wl_base = pose_offset_ · T_wl_lio。
   //      回灌模式下修正已沉淀进 own_pose_cache_，不再维护持久偏移。
   const Eigen::Matrix4d T_wl_base = opt_.reinject ? T_wl_img : pose_offset_ * T_wl_img;
@@ -847,15 +844,26 @@ bool VisualPipeline::colorizeFrame(const PendingColorFrame& frame) {
 // 位姿查询
 // ============================================================================
 
-bool VisualPipeline::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
+bool VisualPipeline::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl,
+                                 bool clamp_future) const {
   const std::vector<colorizer::PoseSample>& cache =
       opt_.color_use_own_odom ? own_pose_cache_ : pose_cache_;
-  double newest = -std::numeric_limits<double>::max();
-  for (const auto& sample : cache) {
-    newest = std::max(newest, sample.stamp);
-  }
-  if (stamp > newest) {
+  if (cache.empty()) {
     return false;
+  }
+  const colorizer::PoseSample* newest = &cache.front();
+  for (const auto& sample : cache) {
+    if (sample.stamp > newest->stamp) {
+      newest = &sample;
+    }
+  }
+  if (stamp > newest->stamp) {
+    if (!clamp_future) {
+      return false;
+    }
+    // 硬件级触发同步：最新采样就是当前可用位姿，直接取，绝不推迟到下一帧。
+    T_wl = newest->T_wl;
+    return true;
   }
 
   colorizer::LidarPoseInterpolator interpolator(
@@ -885,13 +893,23 @@ bool VisualPipeline::camPoseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
   return interpolator.poseAt(stamp, T_wl);
 }
 
-bool VisualPipeline::poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl) const {
-  double newest = -std::numeric_limits<double>::max();
-  for (const auto& sample : own_pose_cache_) {
-    newest = std::max(newest, sample.stamp);
-  }
-  if (own_pose_cache_.empty() || stamp > newest) {
+bool VisualPipeline::poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl,
+                                          bool clamp_future) const {
+  if (own_pose_cache_.empty()) {
     return false;
+  }
+  const colorizer::PoseSample* newest = &own_pose_cache_.front();
+  for (const auto& sample : own_pose_cache_) {
+    if (sample.stamp > newest->stamp) {
+      newest = &sample;
+    }
+  }
+  if (stamp > newest->stamp) {
+    if (!clamp_future) {
+      return false;
+    }
+    T_wl = newest->T_wl;
+    return true;
   }
   colorizer::LidarPoseInterpolator interpolator(
       colorizer::LidarPoseInterpolator::Options{kPoseHistoryMaxGapSec});

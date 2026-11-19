@@ -120,6 +120,17 @@ VisualANode::VisualANode(const rclcpp::NodeOptions& options)
   // ---- 读取其余参数并初始化算法模块 ---------------------------------------
   loadParameters();
 
+  // 启动对齐的时钟桥：IMU 与雷达同钟域、报文只有几百字节、200 Hz 且几乎不积压，
+  // 比"图像/点云谁先到"可靠得多（实测大报文链路延迟差可达 ~0.9 个雷达周期）。
+  // 对齐完成后回调里直接返回，不再做任何配对。
+  if (align_enable_) {
+    const std::string imu_topic =
+        this->declare_parameter<std::string>("imu_topic", "/livox/imu");
+    imu_align_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
+        imu_topic, rclcpp::QoS(rclcpp::KeepLast(200)).best_effort(),
+        std::bind(&VisualANode::onAlignImu, this, std::placeholders::_1));
+  }
+
   // 周期性把累积的彩色地图落盘（默认 10 s 一次，覆盖写同一个文件）。
   // 落盘放在独立定时器里，避免在图像回调中做文件 IO 而拖慢视觉帧率。
   // <=0 视为"只在退出时存一次"：中位数地图的落盘是全表遍历，
@@ -172,6 +183,18 @@ void VisualANode::loadParameters() {
   // 图像真实采集时刻 = header.stamp + 该偏移（秒），仅用于取相机位姿。
   // 默认值与官方 avia.yaml 一致（0.1 s），本数据集已通过 offset 扫描验证最优。
   img_time_offset_ = this->declare_parameter<double>("img_time_offset", 0.1);
+
+  // 启动时间对齐：off = −(D + a)，D 由 IMU 桥每次会话现测，a 为相机打戳延迟标定值。
+  // align.enable=false 时退回上面手填的 img_time_offset。
+  align_enable_ = this->declare_parameter<bool>("align.enable", true);
+  align_samples_ = static_cast<std::size_t>(
+      this->declare_parameter<int>("align.samples", 20));
+  align_window_ms_ = this->declare_parameter<double>("align.window_ms", 50.0);
+  align_img_stamp_latency_s_ =
+      this->declare_parameter<double>("align.img_stamp_latency_s", 0.111);
+  align_clock_lag_max_s_ =
+      this->declare_parameter<double>("align.clock_lag_max_s", 2.0);
+  align_timeout_s_ = this->declare_parameter<double>("align.timeout_s", 10.0);
 
   // ==========================================================================
   // 前端 KltFrontend
@@ -326,6 +349,21 @@ void VisualANode::onImage(const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
   if (!params_loaded_) {
     return;
   }
+  // 回调内分段计时：odom 输出时刻 = 图像到达 + 这里全部开销，必须能逐段看到。
+  const auto t_enter = std::chrono::steady_clock::now();
+  // 图像 header 时刻：与 dense 点云 header 处于同一时钟基准（实测差 < 7 ms），
+  // 因此**只**用它做"图像-点云配对"。图像真实采集时刻（header + img_time_offset_）
+  // 由 runColorizer 单独计算，仅用于取相机位姿，绝不能把两者混成一个时间戳。
+  const double stamp = rclcpp::Time(msg->header.stamp).seconds();
+
+  // 启动时间对齐期间该帧只当样本、不进视觉流程（对齐完成前一律丢弃）。
+  if (align_enable_ && !align_done_ && !align_failed_) {
+    feedAlignSample(kAlignImage, stamp, t_enter);
+    if (!align_done_) {
+      return;
+    }
+  }
+
   // ---- 图像 -> BGR -> 去畸变 ----------------------------------------------
   // 用 toCvCopy 拿到「拥有数据」的 Mat：toCvShare 得到的 Mat 只是引用了消息缓冲区，
   // 直接把 Mat 存进缓存会变成悬垂指针（消息释放后图像数据失效）。
@@ -340,17 +378,15 @@ void VisualANode::onImage(const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
   if (bgr.empty()) {
     return;
   }
+  const auto t_copy = std::chrono::steady_clock::now();
   const cv::Mat rectified = rectifyBgr(bgr);
   if (rectified.empty()) {
     return;
   }
+  const auto t_rect = std::chrono::steady_clock::now();
   cv::Mat gray;
   cv::cvtColor(rectified, gray, cv::COLOR_BGR2GRAY);
-
-  // 图像 header 时刻：与 dense 点云 header 处于同一时钟基准（实测差 < 7 ms），
-  // 因此**只**用它做"图像-点云配对"。图像真实采集时刻（header + img_time_offset_）
-  // 由 runColorizer 单独计算，仅用于取相机位姿，绝不能把两者混成一个时间戳。
-  const double stamp = rclcpp::Time(msg->header.stamp).seconds();
+  const auto t_gray = std::chrono::steady_clock::now();
 
   // 缓存图像帧，供彩色点云对齐使用（缓存去畸变后的彩色图，尺寸与内参一致）。
   colorizer::TimedImage timed;
@@ -365,9 +401,20 @@ void VisualANode::onImage(const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
   }
 
   processVisualFrame(gray, stamp);
+  const auto t_exit = std::chrono::steady_clock::now();
+  auto ms = [](const std::chrono::steady_clock::time_point& a,
+               const std::chrono::steady_clock::time_point& b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+  RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "图像回调 ms: 拷贝=%.1f 去畸变=%.1f 灰度=%.1f 视觉=%.1f 合计=%.1f（%dx%d）",
+      ms(t_enter, t_copy), ms(t_copy, t_rect), ms(t_rect, t_gray), ms(t_gray, t_exit),
+      ms(t_enter, t_exit), rectified.cols, rectified.rows);
 }
 
 void VisualANode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
+  const auto t_arrive = std::chrono::steady_clock::now();
   // ---- 解析 T_wl（child_frame_id 标 "imu"，但 Super-LIO 状态就是 LiDAR 位姿） --
   const auto& pose = msg->pose.pose;
   Eigen::Quaterniond q(pose.orientation.w, pose.orientation.x,
@@ -383,6 +430,11 @@ void VisualANode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
   T_wl(2, 3) = pose.position.z;
   T_wl_ = T_wl;
   last_odom_stamp_ = rclcpp::Time(msg->header.stamp).seconds();
+
+  // 启动时间对齐：这条 odom 的 (帧戳, 系统到达时刻) 作为一个雷达样本。
+  if (align_enable_ && !align_done_ && !align_failed_) {
+    feedAlignSample(kAlignLidar, last_odom_stamp_, t_arrive);
+  }
 
   // 累积位姿采样供彩色点云运动补偿。
   colorizer::PoseSample sample;
@@ -423,6 +475,202 @@ void VisualANode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
   if (!pending_color_.empty()) {
     drainPendingColorization();
   }
+}
+
+// ============================================================================
+// 启动时间对齐
+// ----------------------------------------------------------------------------
+// 相机与雷达各自打戳，两者可能相差一整个时钟域（livo_bag 相差 2×10^8 s），
+// 且 10 Hz 下"取哪一帧"的整数周期无法只靠时刻分辨（相位每 100 ms 重复一次，
+// 差一帧的两种配对残差一样小）。因此启动对齐 = 一个绝对锚点 + 一个标定常量：
+//   D   = 系统钟 − 雷达钟。IMU 与雷达同一钟域、报文只有几百字节、200 Hz 且几乎
+//         不积压，用它的 (到达, header) 逐样本测 D，取最近窗口的中位数。
+//   a   = 相机打戳延迟（一次性标定：图像 header 比真实曝光早多少，见
+//         align.img_stamp_latency_s；本机实测 ≈111 ms，大于一个雷达周期）。
+//   off = −(D + a)，即「图像 header → 雷达帧时刻」，冻结后严格按它取时刻。
+// 图像/雷达的到达时刻只用于校验：按 D 把它们配成对后，残差应为 0。
+// 若系统钟与图像 header 相差过大，说明节点跑在离线回放上（now() 不是传感器主机钟），
+// D 不可用，直接退回配置 img_time_offset 并告警。
+// ============================================================================
+void VisualANode::feedAlignSample(AlignKind kind, double header,
+                                  std::chrono::steady_clock::time_point arrival) {
+  auto& buf = (kind == kAlignImage) ? align_images_
+                                    : (kind == kAlignLidar ? align_lidar_ : align_imu_);
+  buf.push_back(AlignSample{header, arrival});
+  // 只留最近若干条：对齐窗口不需要历史，长期对不上时也避免无限增长。
+  // IMU 是桥接用的连续采样，留得比图像/雷达更多（200 Hz × 5 s）。
+  const std::size_t cap = (kind == kAlignImu)
+                              ? 1000
+                              : std::max<std::size_t>(4 * align_samples_, 80);
+  while (buf.size() > cap) {
+    buf.pop_front();
+  }
+  if (align_t0_ == std::chrono::steady_clock::time_point{}) {
+    align_t0_ = arrival;
+  }
+  tryAlign();
+}
+
+void VisualANode::onAlignImu(const sensor_msgs::msg::Imu::ConstSharedPtr& msg) {
+  if (!align_enable_ || align_done_ || align_failed_) {
+    return;
+  }
+  const double hdr = rclcpp::Time(msg->header.stamp).seconds();
+  // D = 系统钟 − 雷达钟。IMU 报文小、几乎不积压，单样本偏差只有 ms 量级，
+  // 留最近 2 s（200 Hz）样本，取中位数压掉抖动。
+  // 注意：这里用节点时钟（默认即系统钟；若 bag 带 /clock 并开 use_sim_time，
+  // 则等于录制时刻，离线回放也能得到正确的 D）。
+  align_d_samples_.push_back(this->now().seconds() - hdr);
+  if (align_d_samples_.size() > 400) {
+    align_d_samples_.pop_front();
+  }
+  feedAlignSample(kAlignImu, hdr, std::chrono::steady_clock::now());
+}
+
+void VisualANode::tryAlign() {
+  if (align_done_ || align_failed_) {
+    return;
+  }
+  auto median_of = [](std::vector<double> v) {
+    const std::size_t mid = v.size() / 2;
+    std::nth_element(v.begin(), v.begin() + mid, v.end());
+    return v[mid];
+  };
+
+  const double elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - align_t0_).count();
+  if (elapsed > align_timeout_s_) {
+    align_failed_ = true;
+    RCLCPP_WARN(this->get_logger(),
+                "启动时间对齐失败（%.1f s 内样本不足：图像 %zu 帧、IMU %zu 条），继续使用配置 "
+                "img_time_offset=%+.6f s",
+                elapsed, align_images_.size(), align_d_samples_.size(), img_time_offset_);
+    return;
+  }
+  // 等够样本：align.samples 张图像（默认 20 帧 ≈2 s）+ 0.25 s 的 IMU。
+  if (align_images_.size() < align_samples_ || align_lidar_.empty() ||
+      align_d_samples_.size() < 50) {
+    return;
+  }
+
+  // ---- 1) 系统钟是否仍是传感器主机钟 --------------------------------------
+  // 离线回放时 now() 是"今天"的墙钟，而图像 header 是录制时的墙钟（可差几天），
+  // 由此算出的 D 完全失真；且差值通常是 0.1 s 的整数倍，相位校验也看不出来。
+  std::vector<double> lags;
+  lags.reserve(align_images_.size());
+  for (const auto& im : align_images_) {
+    lags.push_back(this->now().seconds() - im.header);
+  }
+  const double lag = median_of(lags);
+  if (std::abs(lag) > align_clock_lag_max_s_) {
+    align_failed_ = true;
+    RCLCPP_WARN(this->get_logger(),
+                "启动时间对齐放弃：系统钟与图像 header 相差 %.1f s（离线回放，系统钟不是"
+                "传感器主机钟），无法恢复雷达钟域；沿用配置 img_time_offset=%+.6f s",
+                lag, img_time_offset_);
+    align_images_.clear();
+    align_lidar_.clear();
+    align_imu_.clear();
+    align_d_samples_.clear();
+    return;
+  }
+
+  // ---- 2) 冻结 off = −(D + a) ---------------------------------------------
+  const std::vector<double> dv(align_d_samples_.begin(), align_d_samples_.end());
+  const double D = median_of(dv);
+  const double off = -(D + align_img_stamp_latency_s_);
+
+  // ---- 3) 校验：按到达时刻（能桥接则先桥接到雷达钟域）配对，残差应≈0 ------
+  // 把系统接收时刻翻译成雷达钟域时刻（用 IMU 的 (接收, header) 采样线性插值）。
+  // 返回 false 表示该时刻不在 IMU 覆盖范围内，调用方退回接收时刻配对。
+  auto imuClockAt = [this](std::chrono::steady_clock::time_point t, double& out) {
+    if (align_imu_.size() < 2) {
+      return false;
+    }
+    std::size_t i = 0;
+    while (i < align_imu_.size() && align_imu_[i].arrival < t) {
+      ++i;
+    }
+    if (i == 0) {
+      const double d =
+          std::chrono::duration<double>(align_imu_.front().arrival - t).count();
+      if (d > 0.1) {
+        return false;
+      }
+      out = align_imu_.front().header;
+      return true;
+    }
+    if (i == align_imu_.size()) {
+      const double d =
+          std::chrono::duration<double>(t - align_imu_.back().arrival).count();
+      if (d > 0.1) {
+        return false;
+      }
+      out = align_imu_.back().header;
+      return true;
+    }
+    const auto& a = align_imu_[i - 1];
+    const auto& b = align_imu_[i];
+    const double dt = std::chrono::duration<double>(b.arrival - a.arrival).count();
+    if (dt <= 0.0 || dt > 0.5) {
+      return false;
+    }
+    const double alpha =
+        std::chrono::duration<double>(t - a.arrival).count() / dt;
+    out = a.header + alpha * (b.header - a.header);
+    return true;
+  };
+
+  const double win_s = align_window_ms_ * 1e-3;
+  const bool use_imu = align_imu_.size() >= 4;
+  std::vector<double> cand;
+  cand.reserve(align_images_.size());
+  for (const auto& im : align_images_) {
+    const AlignSample* best = nullptr;
+    double best_ns = 0.0;
+    double t_lid = 0.0;
+    if (use_imu && imuClockAt(im.arrival, t_lid)) {
+      for (const auto& ld : align_lidar_) {
+        if (best == nullptr || std::abs(ld.header - t_lid) < std::abs(best->header - t_lid)) {
+          best = &ld;
+        }
+      }
+      if (best != nullptr && std::abs(best->header - t_lid) > win_s) {
+        best = nullptr;  // 该图不落在任何雷达帧附近（多速率相机 / 启动错位）
+      }
+    }
+    if (best == nullptr) {
+      for (const auto& ld : align_lidar_) {
+        const double d =
+            std::chrono::duration<double, std::nano>(im.arrival - ld.arrival).count();
+        if (best == nullptr || std::abs(d) < std::abs(best_ns)) {
+          best = &ld;
+          best_ns = d;
+        }
+      }
+      if (best == nullptr || std::abs(best_ns) > align_window_ms_ * 1e6) {
+        continue;
+      }
+    }
+    cand.push_back(best->header - im.header);
+  }
+  double resid_ms = std::numeric_limits<double>::quiet_NaN();
+  if (!cand.empty()) {
+    resid_ms = (off - median_of(cand)) * 1e3;
+  }
+
+  const double old = img_time_offset_;
+  img_time_offset_ = off;
+  align_done_ = true;
+  RCLCPP_INFO(this->get_logger(),
+              "启动时间对齐完成：D(系统钟−雷达钟)=%+.6f s，相机打戳延迟=%.1f ms "
+              "⇒ img_time_offset=%+.6f s（配置值 %+.6f；%zu 帧校验残差中位 %+.1f ms，桥接=%s）",
+              D, align_img_stamp_latency_s_ * 1e3, off, old, cand.size(), resid_ms,
+              use_imu ? "IMU" : "接收时刻");
+  align_images_.clear();
+  align_lidar_.clear();
+  align_imu_.clear();
+  align_d_samples_.clear();
 }
 
 void VisualANode::onCamOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
@@ -525,30 +773,23 @@ void VisualANode::processVisualFrame(const cv::Mat& gray, double stamp) {
   //    2.8 px、门控（阈值 3.0）整帧全拒的主要原因。
   const double t_capture = stamp + img_time_offset_;
   Eigen::Matrix4d T_wl_img = Eigen::Matrix4d::Identity();
-  // 实际用到的位姿所对应的时刻：插值成功就是 t_capture，否则是"最新采样自身的时刻"。
-  // 发布时必须按这个时刻打戳，否则等于把旧位姿标成新时刻（隐含 0.1~0.2 s 的系统性
-  // 时间错位，直接抬高 ATE）。实测在该数据集上，A 的轨迹与 lio/odom 的最佳对齐滞后
-  // 恰为 img_time_offset_，就是这个回退路径造成的。
-  double pose_stamp = t_capture;
   if (reinject_) {
     // 回灌模式：基准位姿直接取修正轨迹在曝光时刻的插值，不叠加 pose_offset_。
-    if (!poseAtStampCorrected(t_capture, T_wl_img)) {
-      if (!own_pose_cache_.empty()) {
-        T_wl_img = own_pose_cache_.back().T_wl;
-        pose_stamp = own_pose_cache_.back().stamp;
-      } else {
-        T_wl_img = T_wl_;  // 启动初期尚无采样
-        if (last_odom_stamp_ > 0.0) {
-          pose_stamp = last_odom_stamp_;
-        }
-      }
+    if (!poseAtStampCorrected(t_capture, T_wl_img, /*clamp_future=*/true)) {
+      // 只有启动初期还没有任何采样才会走到这里。
+      T_wl_img = own_pose_cache_.empty() ? T_wl_ : own_pose_cache_.back().T_wl;
     }
-  } else if (!use_exposure_pose_ || !poseAtStamp(t_capture, T_wl_img)) {
-    T_wl_img = T_wl_;  // 关闭开关 / 启动初期缓存还不够 / 未来时刻无采样，退回最新值
-    if (last_odom_stamp_ > 0.0) {
-      pose_stamp = last_odom_stamp_;
+  } else if (!use_exposure_pose_) {
+    T_wl_img = T_wl_;
+  } else {
+    (void)poseAtStamp(t_capture, T_wl_img, /*clamp_future=*/true);
+    if (pose_cache_.empty()) {
+      T_wl_img = T_wl_;  // 启动初期尚无采样
     }
   }
+  // 相机与雷达是硬件级触发同步（同一时刻曝光/扫描），输出**一律**按图像采集时刻
+  // 打戳；绝不允许"回退到最新采样自身的时刻"或用最新采样顶替后仍标旧时刻。
+  const double pose_stamp = t_capture;
   // 2.1) 叠加此前视觉修正的持久偏移：T_wl_base = pose_offset_ · T_wl_lio。
   //      没有这一步，每帧修正都会被下一条 lio/odom 覆盖，视觉永远只是"单帧探针"，
   //      在 LiDAR 退化时完全无法把约束累积成位姿。
@@ -714,9 +955,8 @@ void VisualANode::processVisualFrame(const cv::Mat& gray, double stamp) {
     T_wl_ = T_wl_out;  // 回灌模式 T_wl_ 保持最新原始 lio/odom，供 onOdom 挂链接量
   }
 
-  // 8) 发布修正后里程计与轨迹。时间基准：T_wl_out 对应 **实际取用的位姿时刻**
-  //    pose_stamp（插值成功即曝光时刻 t_capture；回退到最新采样时就是该采样的时刻），
-  //    必须按它打戳，不能用图像 header.stamp 也不能无条件用 t_capture。
+  // 8) 发布修正后里程计与轨迹。时间基准：T_wl_out 对应图像采集时刻 t_capture，
+  //    与点云同源（硬件级触发同步），一律按它打戳。
   publishOdomAndPath(T_wl_out, toRosStamp(pose_stamp));
   const auto t_pub = std::chrono::steady_clock::now();
 
@@ -984,20 +1224,30 @@ bool VisualANode::colorizeFrame(const PendingColorFrame& frame) {
   return true;
 }
 
-bool VisualANode::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
-  // 关键：t_img 常常晚于当前已收到的最新 odom（offset 造成的"未来时刻"）。
-  // Interpolator 在查询时刻晚于最新采样时会直接返回最后一个采样，那等于把
-  // t_img 的位姿退化成 t_cloud 的位姿，offset 就白加了。这里显式拒绝未来查询，
-  // 由调用方延后重试。
+bool VisualANode::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl,
+                              bool clamp_future) const {
   // 轨迹源由 color.use_own_odom 决定：默认 /lio/odom；true 时用本节点视觉修正后的位姿。
   const std::vector<colorizer::PoseSample>& cache =
       color_use_own_odom_ ? own_pose_cache_ : pose_cache_;
-  double newest = -std::numeric_limits<double>::max();
-  for (const auto& sample : cache) {
-    newest = std::max(newest, sample.stamp);
-  }
-  if (stamp > newest) {
+  if (cache.empty()) {
     return false;
+  }
+  const colorizer::PoseSample* newest = &cache.front();
+  for (const auto& sample : cache) {
+    if (sample.stamp > newest->stamp) {
+      newest = &sample;
+    }
+  }
+  if (stamp > newest->stamp) {
+    if (!clamp_future) {
+      // 着色路径：t_img 尚未被位姿覆盖，等下一帧 odom 再配（返回 false 表示稍后重试）。
+      return false;
+    }
+    // 视觉定位路径：相机与雷达硬件级触发同步，图像与点云同一时刻产生；
+    // LIO 位姿戳在扫描末，按图像时刻查询时最新采样通常只早几毫秒。
+    // 直接取最新采样，绝不把整帧推迟到下一周期；时间戳由调用方按 t_capture 打。
+    T_wl = newest->T_wl;
+    return true;
   }
 
   // 与彩色流水线 / 累积逻辑保持同一套插值规则和同一个采样间隔上限。
@@ -1028,14 +1278,25 @@ bool VisualANode::camPoseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
   return interpolator.poseAt(stamp, T_wl);
 }
 
-bool VisualANode::poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl) const {
+bool VisualANode::poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl,
+                                       bool clamp_future) const {
   // 与 poseAtStamp 同一套插值规则，但只查修正轨迹缓存 own_pose_cache_（状态回灌模式）。
-  double newest = -std::numeric_limits<double>::max();
-  for (const auto& sample : own_pose_cache_) {
-    newest = std::max(newest, sample.stamp);
-  }
-  if (own_pose_cache_.empty() || stamp > newest) {
+  if (own_pose_cache_.empty()) {
     return false;
+  }
+  const colorizer::PoseSample* newest = &own_pose_cache_.front();
+  for (const auto& sample : own_pose_cache_) {
+    if (sample.stamp > newest->stamp) {
+      newest = &sample;
+    }
+  }
+  if (stamp > newest->stamp) {
+    if (!clamp_future) {
+      return false;
+    }
+    // 同 poseAtStamp：硬件同步下最新采样就是当前可用位姿，直接取，不等下一帧。
+    T_wl = newest->T_wl;
+    return true;
   }
   colorizer::LidarPoseInterpolator interpolator(
       colorizer::LidarPoseInterpolator::Options{kPoseHistoryMaxGapSec});

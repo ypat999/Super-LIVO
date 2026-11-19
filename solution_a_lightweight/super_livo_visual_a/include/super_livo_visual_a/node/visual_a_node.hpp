@@ -11,6 +11,7 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <builtin_interfaces/msg/time.hpp>
@@ -82,6 +83,18 @@ class VisualANode : public rclcpp::Node {
   /// 只累积到 cam_pose_cache_，仅用于给图像取相机位姿，不参与点云世界变换。
   void onCamOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg);
 
+  // ---- 启动时间对齐 --------------------------------------------------------
+  /// 对齐样本类型。imu 不参与配对本身，只用来把「图像系统接收时刻」翻译成
+  /// 雷达钟域的物理时刻（IMU 与雷达同钟域、报文小、不受大点云积压影响）。
+  enum AlignKind { kAlignImage = 0, kAlignLidar = 1, kAlignImu = 2 };
+  /// 喂入一条 (header 时刻, 系统接收时刻) 样本，凑够配对后固化 img_time_offset_。
+  void feedAlignSample(AlignKind kind, double header,
+                       std::chrono::steady_clock::time_point arrival);
+  /// 启动对齐专用的 IMU 回调（imu_topic，雷达同钟域，作为跨时钟域的时间桥）。
+  void onAlignImu(const sensor_msgs::msg::Imu::ConstSharedPtr& msg);
+  /// 用系统接收时间做粗配对、用雷达帧戳做精配，估计并冻结相对延迟。
+  void tryAlign();
+
   /// 退化签名回调：Super-LIO 每帧观测 Hessian 的退化条件数与最弱方向（世界系）。
   /// 布局：[cond6, axes, active, cond_t, evt_min, ux, uy, uz]
   void onDegeneracy(const std_msgs::msg::Float64MultiArray::ConstSharedPtr& msg);
@@ -128,14 +141,18 @@ class VisualANode : public rclcpp::Node {
   bool colorizeFrame(const PendingColorFrame& frame);
 
   /// 在位姿缓存中按时间插值出 T_wl（与彩色流水线使用同一套插值规则）。
-  /// 注意：不允许"用最新采样顶替未来时刻"，否则 t_img = t_cloud + 0.1 s 会退化成
-  /// 用 t_cloud 的位姿，等于白改。故查询时刻晚于最新采样时直接返回 false。
-  /// @return 缓存不足 / 相邻采样间隔超限 / 未来时刻无采样时返回 false
-  bool poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const;
+  /// 默认不允许"用最新采样顶替未来时刻"：着色时 t_img 可能晚于最新 odom，
+  /// 此时直接返回 false 由调用方延后重试。
+  /// @param clamp_future 视觉定位专用。相机与雷达是硬件级触发同步（同一时刻曝光/
+  ///        扫描），LIO 位姿时间戳在扫描末，按图像时刻查询时最新采样通常只早几毫秒。
+  ///        true 时直接取最新采样，避免"等下一帧 odom"把整帧推到下一个周期。
+  /// @return 缓存不足 / 相邻采样间隔超限 / 未来时刻无采样（clamp_future=false）时 false
+  bool poseAtStamp(double stamp, Eigen::Matrix4d& T_wl, bool clamp_future = false) const;
 
   /// 同 poseAtStamp 的插值规则，但只查修正轨迹缓存 own_pose_cache_
   /// （状态回灌 update.reinject=true 时用作视觉基准位姿）。
-  bool poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl) const;
+  bool poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl,
+                            bool clamp_future = false) const;
 
   /// 相机位姿插值。官方 publish_frame_world 的口径是"点云世界变换用 LIO 位姿，
   /// 相机位姿用 VIO 光度修正后的位姿"，两者不是同一路轨迹。配置了
@@ -225,6 +242,33 @@ class VisualANode : public rclcpp::Node {
   /// 只用于取相机位姿，不参与图像-点云配对。
   double img_time_offset_{0.0};
 
+  // ---- 启动时间对齐 --------------------------------------------------------
+  /// 相机与雷达各有自己的时间戳，两者可能相差一整个时钟域（livo_bag 差 2×10^8 s）。
+  /// 待求量 off = 雷达帧戳 − 图像 header。10 Hz 下"取哪一帧"的整数周期无法只靠
+  /// 时刻分辨（相位每 100 ms 重复一次），必须有一个绝对锚点：
+  ///   D   = 系统钟 − 雷达钟（IMU 与雷达同钟域、报文小、不积压，用 (到达, header) 测）
+  ///   a   = 相机打戳延迟（一次性标定，见 align.img_stamp_latency_s）
+  ///   off = −(D + a)
+  /// 因此对齐完成前只累积样本；图像/雷达到达时刻仅用于**校验**配对是否合理。
+  struct AlignSample {
+    double header{0.0};
+    std::chrono::steady_clock::time_point arrival;
+  };
+  std::deque<AlignSample> align_images_;
+  std::deque<AlignSample> align_lidar_;
+  std::deque<AlignSample> align_imu_;
+  /// D 的样本：系统钟(now) − IMU header。只在系统钟仍是传感器主机钟时才有意义。
+  std::deque<double> align_d_samples_;
+  double align_img_stamp_latency_s_{0.111};  ///< 相机打戳延迟标定值（秒）
+  double align_clock_lag_max_s_{2.0};        ///< 系统钟与图像 header 的最大允许差（秒）
+  bool align_enable_{true};
+  bool align_done_{false};
+  bool align_failed_{false};
+  std::size_t align_samples_{20};   ///< 需要的图像样本数（10 Hz 下约 2 s）
+  double align_window_ms_{50.0};    ///< 校验配对的半窗（半个雷达周期）
+  double align_timeout_s_{10.0};    ///< 超时放弃，退回配置的 img_time_offset
+  std::chrono::steady_clock::time_point align_t0_{};  ///< 首个对齐样本的到达时刻
+
   // ---- 数据缓存 ------------------------------------------------------------
   /// 图像缓存（最近 N 帧），供彩色点云按扫描窗口对齐。
   std::vector<colorizer::TimedImage> image_cache_;
@@ -255,6 +299,7 @@ class VisualANode : public rclcpp::Node {
 
   // ---- 订阅器 / 发布器 -----------------------------------------------------
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_align_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr cam_odom_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
@@ -288,7 +333,7 @@ class VisualANode : public rclcpp::Node {
   bool lio_prev_raw_valid_{false};
   double offset_decay_rate_{1.0};   ///< 健康方向/旋转的衰减率（1/s，τ≈1 s）
   double last_visual_stamp_{-1.0};  ///< 上次视觉帧时刻（算衰减 dt 用）
-  double last_odom_stamp_{-1.0};    ///< 最新一条 lio/odom 的时刻（回退取位姿时用于打戳）
+  double last_odom_stamp_{-1.0};    ///< 最新一条 lio/odom 的时刻（位姿采样打戳用）
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr colored_cloud_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;

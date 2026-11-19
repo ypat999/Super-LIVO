@@ -199,8 +199,11 @@ class VisualPipeline {
   bool colorizeFrame(const PendingColorFrame& frame);
 
   // ---- 位姿查询 ----
-  bool poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const;
-  bool poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl) const;
+  /// clamp_future：视觉定位路径专用。相机与雷达硬件级触发同步，按图像时刻查询时
+  /// 最新采样通常只早几毫秒，直接取最新采样而不是等下一帧 odom。
+  bool poseAtStamp(double stamp, Eigen::Matrix4d& T_wl, bool clamp_future = false) const;
+  bool poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl,
+                            bool clamp_future = false) const;
   bool camPoseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const;
 
   // ---- 辅助 ----

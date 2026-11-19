@@ -2,7 +2,7 @@
 # 论文对比矩阵：单序列 × 单前端的一次完整 1x 实时跑批。
 #
 #   bash experiments/scripts/paper_matrix/run_one.sh <seq> <arm>
-#   seq: ntu01 ntu03 rtk retail move room
+#   seq: ntu01 ntu03 rtk retail move test4 room
 #   arm: fl2 a b sl
 #
 # 四臂定义：
@@ -82,19 +82,28 @@ case "$SEQ" in
     FL2_CFG=$OUT/fl2_wrapped.yaml
     FL2_CAM=$BAG/camera_pinhole.yaml
     ;;
-  move)
+  move|test4)
     # 原 paper 轮用 move_livoxclk（图像 header 已改写为 Livox 时钟，A/B 的 yaml 里
-    # img_time_offset 写 0.0），该副本已不在磁盘；现存唯一一份是 move_ros2：
-    # 图像 header 保留主机时钟，与 Livox 时钟差 -204262818.9974 s（与 FL2 配置
-    # config/move_fastcalib.yaml 的实测值同源），A/B 在下面用 -p 覆盖。
-    BAG=/home/ywj/slam_data/livo_bag/move_ros2
+    # img_time_offset 写 0.0），该副本已不在磁盘；现存的是 move_ros2 与 test4_move：
+    # 图像 header 均保留主机时钟，需用 -p 覆盖 img_time_offset。
+    #   move_ros2：偏移 -204262818.9974 s（与 FL2 config/move_fastcalib.yaml 同源）
+    #   test4_move：偏移 -204701439.4937 s（实测图像帧戳与雷达帧戳常量差，
+    #               全段漂移 < 5 ms，即硬件触发同步成立，只是时钟域不同）
+    if [ "$SEQ" = "test4" ]; then
+      # 源 bag 是 mcap，本机没装 mcap 存储插件（无 root 不能 apt），ros2 bag play 打不开，
+      # 故用 rosbags 无损转成 sqlite3（仅三路传感器话题，消息字节原样搬运）。
+      BAG=/home/ywj/slam_data/livo_bag/test4_move_ros2
+      MOVE_IMG_OFF=-204701439.4937
+    else
+      BAG=/home/ywj/slam_data/livo_bag/move_ros2
+      MOVE_IMG_OFF=-204262818.9974
+    fi
     LIDAR=/livox/lidar; LIDAR_TYPE=custom
     IMG=/left_camera/image
     PLAY_TOPICS="/livox/lidar /livox/imu /left_camera/image"
     SL_CFG=$SLCFG/livox_360.yaml; SLK_CFG=$SLCFG/livox_360.yaml
     A_CFG=$REPO/solution_a_lightweight/super_livo_visual_a/config/visual_a_move.yaml
     B_CFG=$REPO/solution_b_tight_coupled/super_livo_visual_b/config/visual_b_move.yaml
-    MOVE_IMG_OFF=-204262818.9974
     FL2_BAG=$BAG; FL2_MODE=blackboard
     FL2_CFG=$REPO/config/move_fastcalib.yaml
     FL2_CAM=$REPO/config/camera_move.yaml
