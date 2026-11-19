@@ -1593,3 +1593,34 @@ B 的 `est.visual_info_ratio(_degen)`（信息矩阵比例）、B 的 `guard.*`�
 短名 `-p img_time_offset:=…`），未回填改写；涉及处已就地标注"该记录为改名前命名"。
 `paper_20261119`、`test4_check_b*` 等历史结果如需复现，按旧名写 `-p` 不会生效，须用 §40.3 的新名。
 
+---
+
+## 41. A 完成 S2 + 标定源覆盖 + 轻量图像入队（2026-11-19）
+
+在 §40 统一参数格式（`de32a32`）之上，本地 WIP 与其冲突合并，**参数格式一律以 §40 为准**
+（`/**` + `super_livo_visual:` 分支、`vp()` 前缀、新名 `embed`/`inject` 等），本轮改动：
+
+1. **A 的 S2**：删除 `visual_a_node.{hpp,cpp}`、`visual_a_node_main.cpp` 与
+   `super_livo_visual.lio_source` 对照开关，单体 `visual_a_app` 为唯一模式；`vp()` helper
+   搬入 `visual_a_app.cpp`（§40.2 表中 A 侧位置自此失效）。A 配置三份（move/room/rtk）
+   取 §40 分支格式。
+2. **A pipeline 三线程化**：回调入队（有界 2048，满丢最旧计数）/ 工作 / 落盘分离，
+   `flush()` barrier promise 30 s，幂等 `shutdownAndSave()` 统一退出（对齐 B §38 的做法）。
+3. **标定源覆盖（各取所长，最高优先级）**：A/B 分支内 `calib.camera_intrinsic_yaml` /
+   `calib.fast_calib_result`（全名 `super_livo_visual.calib.*`）指向
+   `config/camera_intrinsic.yaml`（内参+畸变）与 `third_party/FAST-Calib-ROS2/output/calib_result.txt`
+   （外参 Rcl/Pcl；内参仅作后备），读取成功覆盖数据集 yaml 的 `cam_*`/`Rcl`/`Pcl`，
+   留空/失败沿用 yaml（非标数据集兜底）。共用 loader：
+   `common/super_livo_common/include/super_livo_common/calibration_source.hpp`（header-only，
+   A 在 `loadPipelineOptions` 末尾接线，B 以 `CalibrationOverlayParamSource` 装饰器拦
+   pipeline→ParamSource 层）。move 两份 yaml 已配默认路径；注意 FAST-Calib 文件生效时
+   会覆盖 yaml 内 RMSE 更优的 holefix 外参（3.2 mm vs 7.9 mm），此为既定决策。
+4. **图像回调轻量传递**：A/B 回调对 bgr8 用零拷贝浅拷贝 Mat + 消息 `ConstSharedPtr`
+   keepalive 随事件入队（不整帧 toCvCopy），非 bgr8 退化一次拷贝；pipeline 消费端
+   `rectifyBgr` 恒 remap 到自有缓冲，事件出队即可释放。
+5. **run_one.sh 回归修复**：`bf916ef` 重构时 sl 臂丢失 `ros2 run super_lio super_lio_node`
+   启动行（只构造了 `SL_ARGS` 未执行），本轮补回；a 臂改单体。
+6. 钩子（`onLioOutput`/`onDenseCloud`/`degeneracySnapshot`）按既定决策保留。
+
+验证：`colcon build` 三包全过（super_livo_common / visual_a / visual_b）。
+

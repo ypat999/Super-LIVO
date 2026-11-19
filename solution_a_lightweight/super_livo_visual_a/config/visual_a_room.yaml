@@ -1,10 +1,10 @@
 # 自采 room bag（Livox Mid-360 + 1280x800 彩色相机）的相机参数覆盖项。
 # 用法：
-#   ros2 run super_livo_visual_a visual_a_node --ros-args \
+#   ros2 run super_livo_visual_a visual_a_app --ros-args \
 #     --params-file $(ros2 pkg prefix super_livo_visual_a)/share/super_livo_visual_a/config/visual_a_room.yaml
 # 说明：本包默认值对应 avia + OAK（640x512、img_time_offset=0.1），
 #   直接用于 room bag 会因内参/外参不匹配导致 0 点着色。
-# 顶层键统一用 /** 通配（双节点 visual_a_node 与单体 visual_a_app 都命中，
+# 顶层键统一用 /** 通配（官方 super_lio_node 与单体 visual_a_app 都命中，
 #   写具体节点名会在另一条路径上整块静默失效）。
 /**:
   ros__parameters:

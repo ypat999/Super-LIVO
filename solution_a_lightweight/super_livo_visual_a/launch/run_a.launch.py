@@ -1,16 +1,15 @@
 # ============================================================================
-# 方案 A 启动脚本（ROS2 launch）
+# 方案 A 启动脚本（ROS2 launch，单体模式）
 # ----------------------------------------------------------------------------
-# 只启动 super_livo_visual_a 视觉节点并加载参数。运行前必须先让 Super-LIO
-# 处理同一份 bag 得到 T_wl 与 lio/cloud_world（否则本节点拿不到里程计与地图）。
+# 启动 visual_a_app：同一进程内运行 Super-LIO 主干 + 方案 A 视觉支路，
+# 不再需要单独起 super_lio_node（旧多 node 代码已删除）。
 #
-# 典型运行顺序（终端 1 起 Super-LIO，终端 2 回放 bag，终端 3 起本节点）：
-#   ros2 launch super_lio <对应 launch>.py        # 起 Super-LIO，参数用 Retail_Street 配置
-#   ros2 bag play /home/ywj/slam_data/Retail_Street --rate 1.0   # 回放 bag
-#   ros2 launch super_livo_visual_a run_a.launch.py              # 起本节点
+# 典型运行顺序（终端 1 回放 bag，终端 2 起本 launch）：
+#   ros2 bag play <bag> --rate 1.0
+#   ros2 launch super_livo_visual_a run_a.launch.py params_file:=<数据集yaml>
 #
-# 注：Super-LIO 的 launch 文件名与 config 需按实际安装位置核对；bag 回放若
-# 用 livox 时间戳需注意 use_local_timestamp:=false 等参数（见项目 memory）。
+# params_file 需要同时包含 LIO 参数（如 livox_360.yaml）与视觉参数
+# （如 visual_a_room.yaml），顶层键用 /** 通配。
 # ============================================================================
 from launch import LaunchDescription
 from launch_ros.actions import Node
@@ -30,11 +29,10 @@ def generate_launch_description():
         description='方案 A 视觉节点参数文件路径',
     )
 
-    # 视觉辅助节点
-    visual_a_node = Node(
+    # 方案 A 单体（Super-LIO 主干 + 视觉支路同进程）
+    visual_a_app = Node(
         package='super_livo_visual_a',
-        executable='visual_a_node',
-        name='super_livo_visual_a',
+        executable='visual_a_app',
         output='screen',
         parameters=[params_file],
         # TODO(flash)：若需要，可在此追加 remappings 覆盖 topic（如 image_topic 不同）
@@ -42,5 +40,5 @@ def generate_launch_description():
 
     return LaunchDescription([
         declare_params,
-        visual_a_node,
+        visual_a_app,
     ])

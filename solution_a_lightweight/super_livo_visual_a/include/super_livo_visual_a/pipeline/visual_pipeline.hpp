@@ -3,9 +3,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -36,16 +38,20 @@ namespace superlivo_a {
 // 本类是 VisualANode 的"去 ROS 化"等价实现：所有输入都是普通类型（cv::Mat /
 // Eigen::Matrix4d / std::vector），所有输出走 std::function 回调。
 //
-// 单体化后的数据流（进程内、无 DDS）：
-//   SuperLIO 各输出线程 ──(submit*)──► 内部任务队列 ──► 单工作线程串行执行
-//   图像（外部 ROS 输入）─(submitImage)─┘
+// 单体化后的数据流（进程内、无 DDS），内部三条线程（与方案 B 同构）：
+//   ① submit*（ROS 回调 / SuperLIO 输出线程）：只把带类型的 InputEvent 放进
+//      input_queue_，零算法、立即返回；
+//   ② 工作线程：按 FIFO 串行执行全部算法（所有算法状态仅此线程访问），
+//      并把彩色地图新增段按 ColorSegment 增量移交给落盘线程；
+//   ③ 落盘线程：只做彩色地图增量段合并 + PCD 写盘，落盘不再阻塞计算。
 //   工作线程 ──► ColoredCloudCallback / OdomCallback ──► ROS 发布（对外输出）
 //
-// 为什么用单工作线程：
+// 为什么算法保持单工作线程：
 //   * 原始 VisualANode 的状态（frontend_/pose_cache_/pending_*/pose_offset_ 等）
 //     全部依赖回调串行访问；原实现靠 MultiThreadedExecutor + 逻辑上的先后关系，
 //     实际存在数据竞争窗口。这里显式串行化，行为更严格且可复现。
 //   * SuperLIO 的 OutputThread/DenseThread 只做 memcpy + 入队，不会被视觉处理阻塞。
+//   * 整图 PCD 重写从工作线程挪到独立落盘线程，计算与 IO 互不阻塞。
 //
 // 算法模块（KLT/深度关联/重投影/门控/更新/上色）一行未改，全部沿用原参数语义。
 // ============================================================================
@@ -143,7 +149,10 @@ class VisualPipeline {
   void setLogCallback(LogCallback cb);
 
   // ---- 输入（线程安全，入队后立即返回；BGR 图像内部完成去畸变+灰度） ----
-  void submitImage(const cv::Mat& bgr, double stamp);
+  /// keepalive：允许调用方传入浅拷贝 Mat（如直接引用 ROS 消息内存）时保活
+  /// 底层缓冲；事件消费完即释放。深拷贝可不传（与方案 B 同口径）。
+  void submitImage(const cv::Mat& bgr, double stamp,
+                   std::shared_ptr<const void> keepalive = nullptr);
   /// T_wl = LIO 位姿（原 lio/odom；child_frame_id 标 imu 但实为 LiDAR 位姿）。
   void submitOdom(const Eigen::Matrix4d& T_wl, double stamp);
   /// 独立的相机位姿源（原 color.cam_odom_topic）；不配置时与 submitOdom 同源。
@@ -156,10 +165,16 @@ class VisualPipeline {
   void submitDegeneracy(const superlivo_common::DegeneracySignature& sig);
 
   // ---- 控制 ----
-  /// 请求一次彩色地图落盘（在内部工作线程执行，不阻塞调用方）。
+  /// 请求一次彩色地图落盘（投 kSaveSnapshot 事件：工作线程切增量段移交
+  /// 落盘线程写盘，不阻塞调用方）。
   void requestSaveColoredMap();
-  /// 阻塞直到已入队任务全部处理完（退出前调用，保证队列里的帧不被丢弃）。
+  /// 等待已入队事件全部处理完（投 barrier 事件，30 s 超时打 WARN；
+  /// 用于退出前补完尾段）。
   void flush();
+  /// 停机并**同步**写出最终彩色地图（幂等，可重复调用，std::call_once）。
+  /// 退出前必须调用：异步 save 线程会随进程结束被直接杀掉，长序列上
+  /// 大图还没写完进程就退出了，产物会整个丢失。
+  void shutdownAndSave();
   /// 统计摘要（与原节点的退出日志同口径）。
   std::string statsString() const;
 
@@ -180,16 +195,13 @@ class VisualPipeline {
     std::chrono::steady_clock::time_point queued_at;
   };
 
-  // ---- 工作线程 ----
-  void workerLoop();
-  void enqueue(std::function<void()> task, std::size_t cost = 1);
-
   // ---- 输入处理（仅工作线程执行） ----
   void handleImage(const cv::Mat& bgr, double stamp);
   void handleOdom(const Eigen::Matrix4d& T_wl, double stamp);
   void handleCamOdom(const Eigen::Matrix4d& T_wl, double stamp);
   void handleWorldCloud(const std::vector<Eigen::Vector3d>& points_world);
   void handleBodyCloud(const std::vector<Eigen::Vector3f>& points_lidar, double stamp);
+  void handleDegeneracy(const superlivo_common::DegeneracySignature& sig);
 
   // ---- 主流程 ----
   void processVisualFrame(const cv::Mat& gray, double stamp);
@@ -226,17 +238,66 @@ class VisualPipeline {
                     const std::string& msg) const;
   static double steadyNowSec();
 
-  // ---- 工作线程状态 ----
-  mutable std::mutex queue_mutex_;
-  std::condition_variable queue_cv_;
-  std::condition_variable idle_cv_;
-  std::deque<std::function<void()>> tasks_;
-  std::size_t pending_cost_{0};
-  bool stop_{false};
+  // ==========================================================================
+  // 线程化设施（与方案 B 的 VisualPipeline 同构）
+  // ==========================================================================
+  struct InputEvent {
+    enum class Kind : std::uint8_t {
+      kImage,
+      kOdom,
+      kCamOdom,
+      kCloud,
+      kBodyCloud,
+      kDegeneracy,
+      kSaveSnapshot,
+      kBarrier,
+      kQuit
+    };
+    Kind kind{Kind::kQuit};
+    cv::Mat image;                            ///< BGR（可能是引用消息内存的浅拷贝）
+    std::shared_ptr<const void> image_keepalive;  ///< 浅拷贝时保活底层缓冲（如 ROS 消息）
+    double stamp{0.0};
+    Eigen::Matrix4d T{Eigen::Matrix4d::Identity()};
+    std::vector<Eigen::Vector3d> points_world;
+    std::vector<Eigen::Vector3f> points_body;
+    superlivo_common::DegeneracySignature degen;
+    std::shared_ptr<std::promise<void>> barrier;
+    std::chrono::steady_clock::time_point enqueued{};
+  };
+
+  void startWorkerThreads();
+  void stopWorkerThreads();
+  bool pushInputEvent(InputEvent event);
+  void workerLoop();
+  void saveLoop();
+
+  struct ColorSegment {
+    pcl::PointCloud<pcl::PointXYZRGB> points;
+    std::shared_ptr<colorizer::VoxelColorMedian> median;
+  };
+
+  void requestColoredMapSave();
+  void writeColoredSnapshot(std::deque<ColorSegment> segments);
+
+  std::deque<InputEvent> input_queue_;
+  std::mutex input_mutex_;
+  std::condition_variable input_cv_;
+  bool input_stop_{false};
+  std::atomic<std::size_t> stat_input_dropped_{0};
   std::thread worker_;
-  /// 「待处理工作量」上限：图像/点云帧按 1 计。超过时丢弃最老任务会破坏状态机，
-  /// 因此这里只做告警不丢帧（QoS 端已经限深）。
-  std::size_t queue_high_water_{64};
+
+  std::size_t save_handed_points_{0};
+  std::deque<ColorSegment> save_segments_;
+  bool save_pending_{false};
+  std::mutex save_mutex_;
+  std::condition_variable save_cv_;
+  bool save_stop_{false};
+  std::thread save_thread_;
+  pcl::PointCloud<pcl::PointXYZRGB> save_buffer_;
+  std::shared_ptr<colorizer::VoxelColorMedian> save_median_;
+  /// shutdownAndSave() 只执行一次；并发调用者（shutdown 钩子 / 主线程 /
+  /// 析构）会阻塞到那次执行完成，保证进程退出前文件已落盘。
+  std::once_flag shutdown_once_;
 
   // ---- 输出回调 ----
   mutable std::mutex cb_mutex_;
@@ -244,7 +305,8 @@ class VisualPipeline {
   OdomCallback odom_cb_;
   LogCallback log_cb_;
 
-  // ---- 日志节流（仅工作线程写） ----
+  // ---- 日志节流（工作线程与落盘线程都会写，需加锁） ----
+  mutable std::mutex log_last_mutex_;
   mutable std::map<std::string, std::chrono::steady_clock::time_point> log_last_;
 
   // ---- 配置与算法模块（构造后不变） ----

@@ -39,9 +39,12 @@ solution_a_lightweight/
 │   │   ├── constraint/depth_association.hpp      # LidarDepthAssociation：特征 ↔ LiDAR 深度
 │   │   ├── constraint/reprojection_constraint.hpp # ReprojectionConstraint：残差与 H/b
 │   │   ├── constraint/degeneracy_gate.hpp         # DegeneracyGate：退化等级 → 视觉权重
-│   │   └── update/visual_update.hpp               # VisualUpdate：仅适配，不持有滤波器
+│   │   ├── update/visual_update.hpp               # VisualUpdate：仅适配，不持有滤波器
+│   │   └── pipeline/visual_pipeline.hpp           # VisualPipeline：ROS 无关的单体流水线
 │   ├── src/                              # 与头文件一一对应的实现
-│   └── src/node/visual_a_node.cpp        # ROS2 接线节点（含状态回灌，见 §8）
+│   ├── src/app/visual_a_app.cpp          # 单体入口：LIO 主干 + 视觉支路同进程
+│   ├── config/                           # 各数据集支路参数（/** + super_livo_visual 分支）
+│   └── launch/run_a.launch.py            # 单体启动
 └── README.md
 ```
 
@@ -82,19 +85,34 @@ Super-LIO 主干 + 视觉支路），与纯 LIO 的 `super_lio_node` 互不影�
 
 不通过话题把位姿"灌回" LIO：那是外部回灌，会破坏 LIO 自己的观测更新语义。
 
-## 6. ROS2 接口（实际接入，NTU 配置 `config/visual_a_ntu.yaml`）
+## 6. ROS2 接口（单体 `visual_a_app`）
+
+单体进程只有一个节点（ROSWrapper，节点名 `super_lio`）。LIO 主干→视觉支路通过
+`SuperLIO::onLioOutput` / `onDenseCloud` 钩子与 `degeneracySnapshot()` 快照**进程内直推**
+（位姿、世界系云、当帧体素云、退化签名），不存在任何 `lio/*` 话题回环；旧多 node
+（`visual_a_node`）与 `super_livo_visual.lio_source` 对照开关已删除。
 
 | Topic | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `/left/image_raw`（`image_topic`） | `sensor_msgs/Image` | 订阅 | 去畸变后驱动主流程 |
-| `lio/odom` | `nav_msgs/Odometry` | 订阅 | Super-LIO 位姿 T_wl（child_frame_id 标 "imu" 但状态实为 LiDAR 位姿） |
-| `lio/cloud_world` | `sensor_msgs/PointCloud2` | 订阅 | 世界系点云（深度关联） |
-| `lio/cloud_body_dense` | `sensor_msgs/PointCloud2` | 订阅 | 当帧去畸变扫描（着色用） |
-| `/imu/imu` | `sensor_msgs/Imu` | 订阅 | |
-| `/lio/degeneracy` | `std_msgs/Float64MultiArray` | 订阅 | Super-LIO 退化签名 `[cond6, axes, active, cond_t, evt_min, ux, uy, uz]`（§8.1） |
+| `/left/image_raw`（`image_topic`） | `sensor_msgs/Image` | 订阅 | 唯一外部视觉输入；bgr8 零拷贝浅拷贝 Mat + 消息 ConstSharedPtr keepalive 入队，其他编码退化为一次 toCvCopy |
+| `/imu/imu` | `sensor_msgs/Imu` | 订阅 | LIO 主干输入（Super-LIO 自带） |
 | `super_livo_visual_a/odom` | `nav_msgs/Odometry` | 发布 | 修正后轨迹 |
 | `super_livo_visual_a/path` | `nav_msgs/Path` | 发布 | |
 | `super_livo_visual_a/colored_cloud` | `sensor_msgs/PointCloud2` | 发布 | Colorizer 输出 |
+
+线程化（参照原版 Super-LIO 的 IO/计算分离，避免回调阻塞）：
+
+- **ROS 回调线程**：只做消息→事件转换，`submit*` 入有界队列（cap 2048，满则丢最旧并计数）；
+- **流水线工作线程**：去畸变/KLT/深度关联/更新/着色全部在此；`flush()` 走 barrier promise（30 s 超时）；
+- **落盘线程**：彩色地图增量分段（ColorSegment）移交独立线程写盘，不阻塞计算；
+- 退出统一走 `shutdownAndSave()`（幂等 call_once：停线程→排空→同步存盘→关轨迹文件），
+  `on_shutdown` 钩子与 `spin()` 返回后各调一次兜底。
+
+标定源覆盖：`loadPipelineOptions` 末尾按 `calib.camera_intrinsic_yaml` /
+`calib.fast_calib_result`（全名 `super_livo_visual.calib.*`）读取共用 loader
+（`../common/super_livo_common/include/super_livo_common/calibration_source.hpp`），
+intrinsic.yaml 内参+畸变、FAST-Calib 外参 Rcl/Pcl 成功则覆盖数据集 yaml 的
+`cam_*`/`Rcl`/`Pcl`，留空/失败沿用本文件。规则见根 README「参数文件规范」。
 
 ## 7. 实施阶段与验收
 
@@ -113,8 +131,8 @@ Super-LIO 主干 + 视觉支路），与纯 LIO 的 `super_lio_node` 互不影�
 
 ## 8. 退化对抗（当前实现与结论）
 
-纪律：不自造退化检测，只消费 Super-LIO（ros2 分支 `exp/degeneracy-adaptive`）发布的
-`/lio/degeneracy`；Super-LIO 在裁剪输入下不可复现（B 侧 8 次重复跑实测 LIO 终点
+纪律：不自造退化检测，只消费 Super-LIO（ros2 分支 `exp/degeneracy-adaptive`）的退化签名
+（旧 `/lio/degeneracy` 话题，单体化后经 `degeneracySnapshot()` 钩子进程内直取）；Super-LIO 在裁剪输入下不可复现（B 侧 8 次重复跑实测 LIO 终点
 14~794 m），一切对照只看同 bag 内逐点 |VIS−LIO| 与多跑分布，不引用单次绝对值。
 
 与官方 FAST-LIVO2 的逐维度差异、以及 RK3588 实机上怎么绑核/比指标，见根

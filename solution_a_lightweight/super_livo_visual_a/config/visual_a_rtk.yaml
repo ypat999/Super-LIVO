@@ -2,7 +2,7 @@
 # 外参由 experiments/config/livox_360_visa.yaml 的 T_cam_lidar 转置得到（p_lidar = Rcl*p_cam + Pcl）：
 #   Rcl(cam->lidar) = R(L->C)^T，Pcl = -R(L->C)^T * t(L->C)
 # 数值与 fl2_cfg/rtk_construction_lvi.yaml 的 Rcl(L->C)/Pcl(L->C) 互为逆。
-# 顶层键统一用 /** 通配（双节点与单体 app 都命中，写节点名会在另一条路径静默失效）。
+# 顶层键统一用 /** 通配（官方 super_lio_node 与单体 app 都命中，写节点名会在另一条路径静默失效）。
 /**:
   ros__parameters:
     # ---- 视觉支路参数（方案 A / 方案 B 共用同一套名字）----

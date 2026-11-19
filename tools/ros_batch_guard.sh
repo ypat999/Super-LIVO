@@ -22,7 +22,7 @@
 #   /home/.../fast_livo/fastlivo_mapping --ros-args      （真节点）
 #   /usr/bin/python3 /opt/ros/humble/bin/ros2 bag play   （真播包）
 # 这类以可执行文件路径开头的 cmdline。
-_LIVEPAT='^(/home/[^ ]+/)?(fastlivo_mapping|super_lio_node|visual_a_node|visual_b_app|visual_b_node)( |$)'
+_LIVEPAT='^(/home/[^ ]+/)?(fastlivo_mapping|super_lio_node|visual_a_app|visual_a_node|visual_b_app|visual_b_node)( |$)'
 _LIVEPAT="$_LIVEPAT|^(/usr/bin/)?python3? /tmp/cloud_crop.py"
 _LIVEPAT="$_LIVEPAT|^(/usr/bin/)?python3? (/opt/ros/humble/bin/)?ros2 bag (play|record)"
 _LIVEPAT="$_LIVEPAT|^/opt/ros/humble/lib/image_transport/republish"

@@ -134,26 +134,11 @@ VisualPipeline::VisualPipeline(const VisualPipelineOptions& options) : opt_(opti
   }
 
   colored_map_.reserve(1024);
-  worker_ = std::thread(&VisualPipeline::workerLoop, this);
+  startWorkerThreads();
   log(LogLevel::kInfo, "VisualPipeline 初始化完成（进程内流水线，无 DDS）");
 }
 
-VisualPipeline::~VisualPipeline() {
-  // 退出前把队列里剩余的帧尽量处理完（对应原节点析构里的两次 drain）。
-  flush();
-  {
-    std::lock_guard<std::mutex> lk(queue_mutex_);
-    stop_ = true;
-  }
-  queue_cv_.notify_all();
-  if (worker_.joinable()) {
-    worker_.join();
-  }
-  if (pose_file_.is_open()) {
-    pose_file_.flush();
-    pose_file_.close();
-  }
-}
+VisualPipeline::~VisualPipeline() { shutdownAndSave(); }
 
 // ============================================================================
 // 公共接口
@@ -174,58 +159,77 @@ void VisualPipeline::setLogCallback(LogCallback cb) {
   log_cb_ = std::move(cb);
 }
 
-void VisualPipeline::submitImage(const cv::Mat& bgr, double stamp) {
+void VisualPipeline::submitImage(const cv::Mat& bgr, double stamp,
+                                 std::shared_ptr<const void> keepalive) {
   if (bgr.empty()) {
     return;
   }
-  // 浅拷贝（引用计数），代价与指针拷贝相同。
-  enqueue([this, bgr, stamp]() { handleImage(bgr, stamp); });
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kImage;
+  ev.image = bgr;  // 浅拷贝（引用计数），代价与指针拷贝相同。
+  ev.image_keepalive = std::move(keepalive);
+  ev.stamp = stamp;
+  pushInputEvent(std::move(ev));
 }
 
 void VisualPipeline::submitOdom(const Eigen::Matrix4d& T_wl, double stamp) {
-  enqueue([this, T_wl, stamp]() { handleOdom(T_wl, stamp); });
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kOdom;
+  ev.T = T_wl;
+  ev.stamp = stamp;
+  pushInputEvent(std::move(ev));
 }
 
 void VisualPipeline::submitCamOdom(const Eigen::Matrix4d& T_wl, double stamp) {
-  enqueue([this, T_wl, stamp]() { handleCamOdom(T_wl, stamp); });
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kCamOdom;
+  ev.T = T_wl;
+  ev.stamp = stamp;
+  pushInputEvent(std::move(ev));
 }
 
 void VisualPipeline::submitWorldCloud(const std::vector<Eigen::Vector3d>& points_world) {
-  enqueue([this, points_world]() { handleWorldCloud(points_world); });
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kCloud;
+  ev.points_world = points_world;
+  pushInputEvent(std::move(ev));
 }
 
 void VisualPipeline::submitBodyCloud(const std::vector<Eigen::Vector3f>& points_lidar,
                                      double stamp) {
-  enqueue([this, points_lidar, stamp]() { handleBodyCloud(points_lidar, stamp); });
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kBodyCloud;
+  ev.points_body = points_lidar;
+  ev.stamp = stamp;
+  pushInputEvent(std::move(ev));
 }
 
 void VisualPipeline::submitDegeneracy(const superlivo_common::DegeneracySignature& sig) {
-  // 只存一份最新签名，不排队：视觉线程每帧读最新值即可（与原节点语义一致）。
-  bool first = false;
-  {
-    std::lock_guard<std::mutex> lk(degen_mutex_);
-    degen_sig_ = sig;
-    degen_recv_time_ = steadyNowSec();
-    if (!degen_seen_) {
-      degen_seen_ = true;
-      first = true;
-    }
-  }
-  if (first) {
-    char buf[160];
-    std::snprintf(buf, sizeof(buf), "收到退化签名(进程内): cond=%.2f axes=%d active=%d",
-                  sig.cond_t, sig.axes, sig.active ? 1 : 0);
-    log(LogLevel::kInfo, buf);
-  }
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kDegeneracy;
+  ev.degen = sig;
+  pushInputEvent(std::move(ev));
 }
 
 void VisualPipeline::requestSaveColoredMap() {
-  enqueue([this]() { saveColoredMap(); });
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kSaveSnapshot;
+  pushInputEvent(std::move(ev));
 }
 
 void VisualPipeline::flush() {
-  std::unique_lock<std::mutex> lk(queue_mutex_);
-  idle_cv_.wait(lk, [this]() { return tasks_.empty() && pending_cost_ == 0; });
+  auto promise = std::make_shared<std::promise<void>>();
+  auto future = promise->get_future();
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kBarrier;
+  ev.barrier = promise;
+  // 停机后 pushInputEvent 会拒收：此时不再等待（否则会白等 30 s）。
+  if (!pushInputEvent(std::move(ev))) {
+    return;
+  }
+  if (future.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+    log(LogLevel::kWarn, "flush 超时：工作线程可能已停止");
+  }
 }
 
 std::string VisualPipeline::statsString() const {
@@ -233,62 +237,233 @@ std::string VisualPipeline::statsString() const {
   std::snprintf(buf, sizeof(buf),
                 "调用=%zu 实际着色帧=%zu 丢弃(无图像)=%zu 丢弃(等位姿超时)=%zu "
                 "丢弃(累积无位姿)=%zu 跳过(重复帧)=%zu 延后等待次数=%zu 未完成=%zu "
-                "地图点数=%zu",
+                "地图点数=%zu 输入丢弃=%zu",
                 stat_colorizer_calls_, stat_colored_frames_, stat_drop_no_image_,
                 stat_drop_pose_, stat_drop_accum_, stat_skip_duplicate_, stat_deferred_,
-                pending_color_.size(), colored_map_.size());
+                pending_color_.size(), colored_map_.size(),
+                stat_input_dropped_.load(std::memory_order_relaxed));
   return std::string(buf);
 }
 
 // ============================================================================
-// 工作线程
+// 线程化设施（worker 消费 InputEvent 队列；save 线程只做彩色地图增量写盘）
 // ============================================================================
 
-void VisualPipeline::workerLoop() {
-  for (;;) {
-    std::function<void()> task;
-    {
-      std::unique_lock<std::mutex> lk(queue_mutex_);
-      queue_cv_.wait(lk, [this]() { return stop_ || !tasks_.empty(); });
-      if (tasks_.empty()) {
-        if (stop_) {
-          return;
-        }
-        continue;
-      }
-      task = std::move(tasks_.front());
-      tasks_.pop_front();
+void VisualPipeline::startWorkerThreads() {
+  save_thread_ = std::thread(&VisualPipeline::saveLoop, this);
+  worker_ = std::thread(&VisualPipeline::workerLoop, this);
+}
+
+void VisualPipeline::stopWorkerThreads() {
+  {
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    if (input_stop_) {
+      return;
     }
-    task();
-    {
-      std::lock_guard<std::mutex> lk(queue_mutex_);
-      if (pending_cost_ > 0) {
-        --pending_cost_;
-      }
-    }
-    idle_cv_.notify_all();
+    input_stop_ = true;
+  }
+  input_cv_.notify_one();
+  if (worker_.joinable()) {
+    worker_.join();  // 先排空输入队列，剩余事件照常处理完（不丢尾段）
+  }
+  {
+    std::lock_guard<std::mutex> lock(save_mutex_);
+    save_stop_ = true;
+  }
+  save_cv_.notify_one();
+  if (save_thread_.joinable()) {
+    save_thread_.join();  // 落盘线程写完手上剩余的段再退出
   }
 }
 
-void VisualPipeline::enqueue(std::function<void()> task, std::size_t cost) {
-  bool warn = false;
-  std::size_t backlog = 0;
+bool VisualPipeline::pushInputEvent(InputEvent event) {
+  event.enqueued = std::chrono::steady_clock::now();
   {
-    std::lock_guard<std::mutex> lk(queue_mutex_);
-    tasks_.push_back(std::move(task));
-    pending_cost_ += cost;
-    if (pending_cost_ > queue_high_water_) {
-      // 队列积压说明视觉处理追不上输入；只告警不丢帧（丢帧会破坏状态机）。
-      queue_high_water_ = pending_cost_ * 2;
-      warn = true;
-      backlog = pending_cost_;
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    if (input_stop_) {
+      return false;  // 停机后不再接收，避免向已退出的 worker 投递
+    }
+    // 上限兜底：真积压说明 CPU 被抢或算法退化，此时丢最旧事件以守住内存上界
+    // （一帧原图 4 MB，不设限会直接吃掉几十 GB）。
+    constexpr std::size_t kMaxInputEvents = 2048;
+    while (input_queue_.size() >= kMaxInputEvents) {
+      input_queue_.pop_front();
+      stat_input_dropped_.fetch_add(1, std::memory_order_relaxed);
+    }
+    input_queue_.push_back(std::move(event));
+  }
+  input_cv_.notify_one();
+  return true;
+}
+
+void VisualPipeline::workerLoop() {
+  for (;;) {
+    InputEvent ev;
+    {
+      std::unique_lock<std::mutex> lock(input_mutex_);
+      input_cv_.wait(lock, [this] { return input_stop_ || !input_queue_.empty(); });
+      if (input_queue_.empty()) {
+        if (input_stop_) {
+          break;
+        }
+        continue;
+      }
+      ev = std::move(input_queue_.front());
+      input_queue_.pop_front();
+    }
+    // 全部算法状态只在这条线程上访问，因此 handleXxx 内部无需任何锁。
+    switch (ev.kind) {
+      case InputEvent::Kind::kImage:
+        handleImage(ev.image, ev.stamp);
+        break;
+      case InputEvent::Kind::kOdom:
+        handleOdom(ev.T, ev.stamp);
+        break;
+      case InputEvent::Kind::kCamOdom:
+        handleCamOdom(ev.T, ev.stamp);
+        break;
+      case InputEvent::Kind::kCloud:
+        handleWorldCloud(ev.points_world);
+        break;
+      case InputEvent::Kind::kBodyCloud:
+        handleBodyCloud(ev.points_body, ev.stamp);
+        break;
+      case InputEvent::Kind::kDegeneracy:
+        handleDegeneracy(ev.degen);
+        break;
+      case InputEvent::Kind::kSaveSnapshot:
+        requestColoredMapSave();
+        break;
+      case InputEvent::Kind::kBarrier:
+        if (ev.barrier) {
+          ev.barrier->set_value();
+        }
+        break;
+      case InputEvent::Kind::kQuit:
+        return;
     }
   }
-  queue_cv_.notify_one();
-  if (warn) {
-    logThrottled("queue", 5000, LogLevel::kWarn,
-                 "视觉流水线积压 " + std::to_string(backlog) + " 帧");
+}
+
+void VisualPipeline::saveLoop() {
+  for (;;) {
+    std::deque<ColorSegment> segments;
+    {
+      std::unique_lock<std::mutex> lock(save_mutex_);
+      save_cv_.wait(lock, [this] { return save_stop_ || save_pending_; });
+      if (!save_pending_) {
+        if (save_stop_) {
+          break;
+        }
+        continue;
+      }
+      save_pending_ = false;
+      segments.swap(save_segments_);  // 整队取走，工作线程随后照常往空队列追加
+    }
+    writeColoredSnapshot(std::move(segments));
   }
+}
+
+void VisualPipeline::requestColoredMapSave() {
+  const std::size_t n = colored_map_.size();
+  if (n <= save_handed_points_) {
+    return;  // 无新增
+  }
+  // 只切"上次移交以来新增的那一段"：彩色地图是 append-only（accumulateColoredMap
+  // 只有 push_back，达到上限后直接 return），所以按下标切段等价于整图快照，
+  // 但工作线程的代价从 O(全图) 降到 O(一个保存周期新增)。
+  ColorSegment seg;
+  seg.points.assign(colored_map_.points.begin() +
+                        static_cast<std::ptrdiff_t>(save_handed_points_),
+                    colored_map_.points.end());
+  seg.points.width = static_cast<std::uint32_t>(seg.points.size());
+  seg.points.height = 1;
+  seg.points.is_dense = false;
+  if (median_map_.enabled()) {
+    seg.median = std::make_shared<colorizer::VoxelColorMedian>(median_map_);
+  }
+  save_handed_points_ = n;
+  {
+    std::lock_guard<std::mutex> lock(save_mutex_);
+    save_segments_.push_back(std::move(seg));
+    save_pending_ = true;
+  }
+  save_cv_.notify_one();
+}
+
+void VisualPipeline::writeColoredSnapshot(std::deque<ColorSegment> segments) {
+  std::error_code ec;
+  std::filesystem::create_directories(opt_.pcd_save_dir, ec);
+  if (ec) {
+    logThrottled("pcd_dir", 5000, LogLevel::kWarn,
+                 "无法创建 PCD 输出目录 " + opt_.pcd_save_dir + ": " + ec.message());
+    return;
+  }
+  const std::string path =
+      (std::filesystem::path(opt_.pcd_save_dir) / "super_livo_visual_a_colored.pcd")
+          .string();
+
+  // 合并增量段到常驻缓冲。正常一个保存周期只有一段；落盘慢于移交时会有多段。
+  for (auto& seg : segments) {
+    save_buffer_.points.insert(save_buffer_.points.end(), seg.points.points.begin(),
+                               seg.points.points.end());
+    if (seg.median) {
+      save_median_ = seg.median;
+    }
+  }
+  if (save_buffer_.empty()) {
+    return;
+  }
+
+  // 时间中位数：只回填颜色，几何/点数完全不动（避免体素化把点云变稀）。
+  if (save_median_ && save_median_->enabled()) {
+    const auto c8 = [](double v) {
+      return static_cast<std::uint8_t>(std::clamp(v, 0.0, 255.0));
+    };
+    for (auto& p : save_buffer_.points) {
+      Eigen::Vector3d rgb;
+      if (save_median_->colorAt(Eigen::Vector3f(p.x, p.y, p.z), rgb)) {
+        p.r = c8(rgb.x());
+        p.g = c8(rgb.y());
+        p.b = c8(rgb.z());
+      }
+    }
+  }
+  save_buffer_.width = static_cast<std::uint32_t>(save_buffer_.size());
+  save_buffer_.height = 1;
+  save_buffer_.is_dense = false;
+  if (pcl::io::savePCDFileBinary(path, save_buffer_) == 0) {
+    log(LogLevel::kInfo, "彩色地图已保存: " + path + "（" +
+                             std::to_string(save_buffer_.size()) + " 点，世界系" +
+                             ((save_median_ && save_median_->enabled())
+                                  ? "，时间中位数回填色"
+                                  : "") +
+                             "）");
+  } else {
+    logThrottled("pcd_save", 5000, LogLevel::kWarn, "保存 PCD 失败: " + path);
+  }
+}
+
+void VisualPipeline::shutdownAndSave() {
+  // 用 call_once 保证只执行一次：shutdown 钩子跑在信号线程，主线程在
+  // executor.spin() 返回后也会调一次，两者可能并发；后到者阻塞到那次执行
+  // 结束，从而保证进程退出前文件已经落盘。
+  std::call_once(shutdown_once_, [this]() {
+    // 先停线程：worker 排空输入队列后退出，落盘线程写完手上剩余的段。
+    // join 之后本函数独占全部状态，下面的收尾可以直接同步调用算法。
+    stopWorkerThreads();
+    // 收尾：bag 结束时队列里可能还有等图像/等位姿的帧，尽量补完再落盘
+    // （配不到图/位的按超时丢弃并计数，与运行期口径一致）。
+    drainPendingClouds();
+    drainPendingColorization();
+    // 同步写出整张彩色地图。长序列（几百万点 + 中位数回填）要几秒，
+    // 这一步必须在本进程内完成，不能交给 save 线程（进程退出时线程被杀）。
+    saveColoredMap();
+    if (pose_file_.is_open()) {
+      pose_file_.flush();
+      pose_file_.close();
+    }
+  });
 }
 
 // ============================================================================
@@ -423,6 +598,25 @@ void VisualPipeline::handleBodyCloud(const std::vector<Eigen::Vector3f>& points_
 
   // 新扫描到达即入队等图像/位姿（bag2 的图像回调比云慢约 1 帧，不能等图像回调才入队）。
   runColorizer();
+}
+
+void VisualPipeline::handleDegeneracy(const superlivo_common::DegeneracySignature& sig) {
+  bool first = false;
+  {
+    std::lock_guard<std::mutex> lk(degen_mutex_);
+    degen_sig_ = sig;
+    degen_recv_time_ = steadyNowSec();
+  }
+  if (!degen_seen_) {
+    degen_seen_ = true;
+    first = true;
+  }
+  if (first) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "收到退化签名(进程内): cond=%.2f axes=%d active=%d",
+                  sig.cond_t, sig.axes, sig.active ? 1 : 0);
+    log(LogLevel::kInfo, buf);
+  }
 }
 
 // ============================================================================
@@ -1236,14 +1430,17 @@ void VisualPipeline::log(LogLevel level, const std::string& msg) const {
 void VisualPipeline::logThrottled(const std::string& key, int period_ms, LogLevel level,
                                   const std::string& msg) const {
   const auto now = std::chrono::steady_clock::now();
-  auto it = log_last_.find(key);
-  if (it != log_last_.end()) {
-    const double dt = std::chrono::duration<double>(now - it->second).count();
-    if (dt * 1000.0 < static_cast<double>(period_ms)) {
-      return;
+  {
+    std::lock_guard<std::mutex> lk(log_last_mutex_);
+    auto it = log_last_.find(key);
+    if (it != log_last_.end()) {
+      const double dt = std::chrono::duration<double>(now - it->second).count();
+      if (dt * 1000.0 < static_cast<double>(period_ms)) {
+        return;
+      }
     }
+    log_last_[key] = now;
   }
-  log_last_[key] = now;
   log(level, msg);
 }
 

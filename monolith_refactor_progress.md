@@ -3,15 +3,18 @@
 > 配套方案文档：[monolith_refactor_plan.md](monolith_refactor_plan.md)
 > 本文只记录"做到哪儿了、验证过什么、换机器要做什么"。
 > 最后更新：2026-11-19（B 完成 S2：抽出 `VisualPipeline`、删除 `visual_b_node`，`visual_b_app` 单进程单节点；
-> 退出改为同步落盘 `shutdownAndSave()`，跑批脚本与配置顶层键同步；A/B 启动时间对齐在离线回放下按设计回退配置值）
+> 退出改为同步落盘 `shutdownAndSave()`，跑批脚本与配置顶层键同步；A/B 启动时间对齐在离线回放下按设计回退配置值。
+> 同日 A 完成 S2：删除 `visual_a_node` 与 `lio_source` 对照开关、pipeline 线程化为
+> 回调入队/工作/落盘三线程；A/B 接入标定源覆盖（`calib.*` 各取所长）与 bgr8 零拷贝图像入队）
 
 ---
 
 ## 1. 一句话状态
 
-- **方案 A**：进程内单体接线（S1）已完成、编译并跑通。Super-LIO 通过
-  `onLioOutput` / `onDenseCloud` 两个虚钩子把位姿、世界云、机体系全量云、退化快照
-  直推 `VisualPipeline`，视觉支路不再有任何 DDS 回环。旧 `visual_a_node`（S0 对照）保留。
+- **方案 A**：**S2 已完成（2026-11-19）**——`VisualPipeline` 线程化为回调入队/工作/落盘
+  三线程（参照原版 Super-LIO 的 IO 与计算隔离），退出统一走幂等 `shutdownAndSave()`；
+  旧 `visual_a_node` 与 `lio_source` 对照开关已删除，单体 `visual_a_app` 为唯一模式；
+  图像回调改 bgr8 零拷贝浅拷贝 Mat + 消息 keepalive 入队。
 - **方案 B**：**S2 已完成（2026-11-19）**——`VisualPipeline`（ROS 无关）已抽出，
   `visual_b_app` 单进程单节点：`ROSWrapper` + `VisualPipeline`，LIO→视觉改由
   `onLioOutput` / `onDenseCloud` / `degeneracySnapshot` 直推，旧 `visual_b_node` 与其
@@ -25,6 +28,11 @@
   文件也能直接喂官方 `super_lio_node` 跑纯 LIO。规范、改名表与实测验收见根
   [README「参数文件规范」](README.md#参数文件规范ros-2-params-yaml) 与
   [exp_records §40](experiments/exp_records.md)。
+- **标定源覆盖（各取所长，2026-11-19）**：A/B 支路配置分支内 `calib.camera_intrinsic_yaml` /
+  `calib.fast_calib_result` 指向 `config/camera_intrinsic.yaml`（内参+畸变）与
+  `third_party/FAST-Calib-ROS2/output/calib_result.txt`（外参 Rcl/Pcl），读取成功覆盖数据集
+  yaml，留空/失败沿用 yaml（非标兜底）；共用 loader 在 `super_livo_common/calibration_source.hpp`。
+  move 两份 yaml 已配默认路径（注意：FAST-Calib 文件生效时会覆盖 yaml 里更优的 holefix 外参）。
 - **未开始**：A 的视觉回灌 ESKF（§6.5 的 8 个参数）、B 直吃 `last_HTVH`、单测。
 
 ---
@@ -61,12 +69,11 @@ A 最终没有用它——`VisualPipeline` 内部是"任务队列 + 单工作线
 | --- | --- |
 | `solution_a_lightweight/super_livo_visual_a/include/super_livo_visual_a/pipeline/visual_pipeline.hpp` | `VisualPipelineOptions` + `VisualPipeline`，**不依赖 rclcpp** |
 | `.../src/pipeline/visual_pipeline.cpp` | 原 `VisualANode` 的逻辑逐项迁移：去畸变、KLT、曝光时刻插值、深度关联、重投影法方程、退化门控、`VisualUpdate`、持久偏移/回灌、上色、落盘 |
-| `.../src/app/visual_a_app.cpp` | `VisualASuperLIO` 覆写两个钩子直推 pipeline；`setupMonolithIo()` 只保留图像订阅 + 彩色云/odom/path 发布 + 落盘定时器；`super_livo_visual.lio_source` 开关 |
+| `.../src/app/visual_a_app.cpp` | `VisualASuperLIO` 覆写两个钩子直推 pipeline；`setupMonolithIo()` 只保留图像订阅 + 彩色云/odom/path 发布 + 落盘定时器；`vp()` 前缀 helper（原在 `visual_a_node.hpp`，节点删除后搬入） |
 
-- 线程模型：`VisualPipeline` 内**单工作线程 + 任务队列**，`OutputThread`/`DenseThread`
-  只做拷贝入队，不会被视觉阻塞；退化快照读取单独加锁。
+- ~~线程模型：单工作线程 + 任务队列~~ → **回调入队 / 工作 / 落盘三线程**（见 §2.6）。
 - 远端新增输出（commit `d66beb6`）：TUM 轨迹 `evo.*`、PNG 图像 `image_save.*`，默认关。
-- `super_livo_visual.lio_source`：`internal`（默认，单体）/ `topic`（S0 双节点对照）。
+- ~~`super_livo_visual.lio_source`：`internal` / `topic`~~ —— S2 已删除，单体为唯一模式（见 §2.6）。
 
 ### 2.4 方案 B：进程内注入 + 三线程（commit `b0f5adc` + 本地未提交修正，过渡形态）
 
@@ -123,6 +130,18 @@ executor 上，是唯一没进 `input_queue_` 的回调。`degen_sig_` 有独立
 - `config/retail_lio.yaml`、`visual_b_params.yaml`、`experiments/`、`tools/` 下的若干调参。
 
 > 如果这些改动需要同步到另一台机器，先提交再 push；否则另一台机器只拿到 `b0f5adc` 的版本。
+
+### 2.6 方案 A：S2 清理 + 三线程 + 标定覆盖 + 轻量图像入队（2026-11-19）
+
+| 文件 | 说明 |
+| --- | --- |
+| `.../src/node/visual_a_node.{hpp,cpp}`、`visual_a_node_main.cpp` | **已删除**（S2）；`vp()` helper 搬入 `visual_a_app.cpp` |
+| `.../include/.../pipeline/visual_pipeline.hpp` + `.cpp` | 三线程化：`InputEvent` 有界队列（cap 2048，满则丢最旧并计数）；工作线程消费；彩色地图 `ColorSegment` 增量移交独立 save 线程；`flush()` barrier promise（30 s）；`shutdownAndSave()` 幂等 call_once（停线程→排空→同步存盘→关轨迹文件） |
+| `.../src/app/visual_a_app.cpp` | 删 `lio_source`/`VisualANode` 对照路径；`embed` 读 `super_livo_visual.embed`；`loadPipelineOptions` 末尾接入标定覆盖；bgr8 零拷贝 + keepalive；`on_shutdown` 与 spin 返回后双重 `shutdownAndSave()` 兜底 |
+| `common/super_livo_common/include/super_livo_common/calibration_source.hpp` | A/B 共用 loader：`loadCameraIntrinsic`（cv::FileStorage，平铺 fx/k1… 回退 camera_matrix/dist_coeffs）、`loadFastCalib`（key: value 文本，Rcl/Pcl 跨行，cam_* 内参后备）、`mergeCalibration`（preferred 覆盖 fallback） |
+| `.../config/visual_a_move.yaml`、`../super_livo_visual_b/config/visual_b_move.yaml` | 分支内新增 `calib:` 默认路径（其余数据集留空） |
+| `experiments/scripts/paper_matrix/run_one.sh` | a 臂改单体 `visual_a_app`；**修复 bf916ef 回归**：sl 臂丢掉的 `ros2 run super_lio super_lio_node` 启动行补回 |
+| `tools/ros_batch_guard.sh`、`launch/run_a.launch.py` | `_LIVEPAT` 加 `visual_a_app`；launch 改单体 |
 
 ---
 
@@ -275,12 +294,11 @@ source install/setup.bash
 ### 4.2 跑方案 A
 
 ```bash
-# S1：单体（默认 super_livo_visual.lio_source=internal）
+# 单体（唯一模式，S0 双节点对照已删除）
 ros2 run super_livo_visual_a visual_a_app --ros-args \
   --params-file config/retail_lio.yaml \
   --params-file solution_a_lightweight/super_livo_visual_a/config/visual_a_params.yaml
 
-# S0：旧双节点对照，追加 -p super_livo_visual.lio_source:=topic
 # 两份 params 均为 /** → ros__parameters → (lio.* | super_livo_visual.) 统一格式，
 # 纯 LIO 时用同一份文件直接起 super_lio_node 即可。
 ```
@@ -348,8 +366,8 @@ ros2 bag play /home/ywj/slam_data/Retail_Street --rate 1.0
    `ROSWrapper` 一个节点，图像与 IMU 订阅、输出发布与周期落盘都挂上去；
    `VisualBNode` 及其 DDS 订阅已删除（S2）。
 3. **B 直吃 `last_HTVH`**：`UnifiedEstimator::lidarUpdate` 由合成强先验改为消费快照 `info`。
-4. **S2 清理（剩余）**：删除 `super_livo_visual.lio_source=topic` 对照路径与 A 的旧 `visual_a_node`
-   （B 的 `visual_b_node` 已随 S2 删除）。
+4. ~~**S2 清理（剩余）**：删除 `super_livo_visual.lio_source=topic` 对照路径与 A 的旧
+   `visual_a_node`~~ —— **已完成（2026-11-19）**：A/B 旧节点与 `lio_source` 均已删除（见 §2.6）。
 
 ### 5.3 标定前置数据（A 已具备，B 仍缺）
 
@@ -398,15 +416,11 @@ ros2 bag play /home/ywj/slam_data/Retail_Street --rate 1.0
 
 ```bash
 #!/usr/bin/env bash
-# 用法: smoke.sh internal|topic
+# 用法: smoke.sh（单体为唯一模式，旧 topic 对照已随 S2 删除）
 cd ~/git/Super-LIVO
 set +u; source /opt/ros/humble/setup.bash; source install/setup.bash; set -u
 pkill -f 'lib/super_livo_visual_a/visual_a_app' >/dev/null 2>&1
 sleep 1
-
-MODE="${1:-internal}"
-EXTRA=""
-[ "$MODE" = "topic" ] && EXTRA="-p super_livo_visual.lio_source:=topic"
 
 ros2 run super_livo_visual_a visual_a_app --ros-args \
   --params-file config/retail_lio.yaml \
@@ -415,17 +429,17 @@ ros2 run super_livo_visual_a visual_a_app --ros-args \
   -p lio.sensor.lidar_type:=0 \
   -p lio.ros.lidar_topic:=/livox/lidar \
   -p lio.ros.imu_topic:=/livox/imu \
-  $EXTRA > "/tmp/a_${MODE}.log" 2>&1 &
+  > "/tmp/a.log" 2>&1 &
 APP=$!
 sleep 6
 
-timeout -s INT 45 ros2 bag play <你的 bag 路径> --rate 1.0 > "/tmp/bag_${MODE}.log" 2>&1
+timeout -s INT 45 ros2 bag play <你的 bag 路径> --rate 1.0 > "/tmp/bag.log" 2>&1
 sleep 2
 kill -INT "$APP" 2>/dev/null; sleep 3; pkill -f 'lib/super_livo_visual_a/visual_a_app'
 
-grep -E '视觉帧' "/tmp/a_${MODE}.log" | tail -3
-grep -E '彩色统计' "/tmp/a_${MODE}.log" | tail -1
-grep -iE 'error|terminate|what\(\)' "/tmp/a_${MODE}.log" | head -3
+grep -E '视觉帧' "/tmp/a.log" | tail -3
+grep -E '彩色统计' "/tmp/a.log" | tail -1
+grep -iE 'error|terminate|what\(\)' "/tmp/a.log" | head -3
 ```
 
 对拍时固定同一份 bag、同一份参数，只改一个开关。

@@ -98,9 +98,15 @@ Super-LIO 主干 + B 视觉支路，视觉约束通过 `super_lio` 暴露的通�
 > （`-p super_livo_visual.inject:=true`）。下文参数名一律是**分支内短名**（省略前缀）。
 > 同一份文件也可直接喂官方 `super_lio_node` 跑纯 LIO（未声明的 override 被静默忽略）。
 > 规范全文与 B 旧名 → 新名对照表见根 [README「参数文件规范」](../README.md#参数文件规范ros-2-params-yaml)。
+>
+> **标定源覆盖（各取所长，最高优先级）**：分支内 `calib.camera_intrinsic_yaml` /
+> `calib.fast_calib_result` 给出路径且读取成功时，intrinsic.yaml 内参+畸变与 FAST-Calib
+> 外参 Rcl/Pcl 覆盖数据集 yaml 的 `cam_*`/`Rcl`/`Pcl`（`CalibrationOverlayParamSource`
+> 装饰器拦在 pipeline→ParamSource 层，A/B 共用 `super_livo_common/calibration_source.hpp`
+> loader）；留空/失败沿用 yaml。
 
 ```
-图像 / IMU 订阅（app）→ VisualPipeline::submitImage / submitImu
+图像 / IMU 订阅（app，bgr8 零拷贝浅拷贝 Mat + 消息 keepalive 入队）→ VisualPipeline::submitImage / submitImu
 SuperLIO::onLioOutput / onDenseCloud / degeneracySnapshot → submitOdom / submitWorldCloud
         → VisualPipeline（前端 + 约束）→ UnifiedEstimator::visualUpdate
         → 记录本帧等效法方程（6×6 相机位姿 H、b）

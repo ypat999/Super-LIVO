@@ -44,10 +44,10 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
   ${OpenCV_LIBS}
 )
 
-# ---- 方案 A 单体流水线（ROS 无关，纯新增） --------------------------------
-# 把原 VisualANode 的处理逻辑抽成不依赖 rclcpp 的类：输入是普通类型，输出走
-# std::function 回调。这样 Super-LIO 可以在同一进程内直接"推"数据给它，
-# 完全绕开 DDS 话题回环。原有的 visual_a_node / visual_a_app 行为不变。
+# ---- 方案 A 单体流水线（ROS 无关） ----------------------------------------
+# 处理逻辑全部在这个不依赖 rclcpp 的类里：输入是普通类型，输出走 std::function
+# 回调。Super-LIO 在同一进程内直接"推"数据给它，完全绕开 DDS 话题回环。
+# （旧多 node 时代的 visual_a_node / visual_a_node_main 已删除。）
 add_library(${PROJECT_NAME}_pipeline SHARED
   src/pipeline/visual_pipeline.cpp
 )
@@ -63,19 +63,9 @@ target_link_libraries(${PROJECT_NAME}_pipeline
 )
 ament_target_dependencies(${PROJECT_NAME}_pipeline pointcloud_colorizer)
 
-# ---- 方案 A ROS2 节点 ------------------------------------------------------
-add_executable(visual_a_node src/node/visual_a_node_main.cpp src/node/visual_a_node.cpp)
-target_include_directories(visual_a_node PRIVATE
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  ${PCL_INCLUDE_DIRS}
-  ${super_livo_common_INCLUDE_DIRS}
-)
-target_link_libraries(visual_a_node ${PROJECT_NAME} ${PCL_LIBRARIES})
-ament_target_dependencies(visual_a_node rclcpp sensor_msgs nav_msgs geometry_msgs cv_bridge pcl_conversions pointcloud_colorizer)
-
-# ---- 方案 A 独立可执行入口 -------------------------------------------------
+# ---- 方案 A 独立可执行入口（单体） -----------------------------------------
 # 同一进程内运行 Super-LIO 主干（super_lio::lio）与方案 A 视觉支路。
-add_executable(visual_a_app src/app/visual_a_app.cpp src/node/visual_a_node.cpp)
+add_executable(visual_a_app src/app/visual_a_app.cpp)
 target_include_directories(visual_a_app PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   ${PCL_INCLUDE_DIRS}
@@ -88,7 +78,7 @@ install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME}
 )
-install(TARGETS ${PROJECT_NAME} ${PROJECT_NAME}_pipeline visual_a_node visual_a_app
+install(TARGETS ${PROJECT_NAME} ${PROJECT_NAME}_pipeline visual_a_app
   EXPORT ${PROJECT_NAME}Targets
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib

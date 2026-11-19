@@ -104,7 +104,10 @@ class VisualPipeline {
 
   // ---- 输入（线程安全，入队后立即返回） ----
   /// BGR 图像；内部完成去畸变 + 灰度。
-  void submitImage(const cv::Mat& bgr, double stamp);
+  /// keepalive：允许调用方传入浅拷贝 Mat（如 cv_bridge::toCvShare 直接引用
+  /// ROS 消息内存）时保活底层缓冲；事件消费完即释放。深拷贝可不传。
+  void submitImage(const cv::Mat& bgr, double stamp,
+                   std::shared_ptr<const void> keepalive = nullptr);
   /// T_w = LIO 位姿（原 lio/odom 的 pose 部分；单体钩子直供 IMU 系位姿）。
   void submitOdom(const Eigen::Matrix4d& T_w, double stamp);
   /// 独立的相机位姿源（原 color.cam_odom_topic）；不配置时与 submitOdom 同源。
@@ -416,7 +419,8 @@ class VisualPipeline {
       kQuit
     };
     Kind kind{Kind::kQuit};
-    cv::Mat image;                            ///< BGR
+    cv::Mat image;                            ///< BGR（可能是引用消息内存的浅拷贝）
+    std::shared_ptr<const void> image_keepalive;  ///< 浅拷贝时保活底层缓冲（如 ROS 消息）
     double stamp{0.0};
     Eigen::Matrix4d T{Eigen::Matrix4d::Identity()};
     std::vector<Eigen::Vector3d> points_world;

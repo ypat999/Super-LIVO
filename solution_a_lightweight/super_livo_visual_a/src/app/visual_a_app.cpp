@@ -6,16 +6,12 @@
 //     在编译期链接；
 //   * 通过继承 LI2Sup::SuperLIO 保留代码级扩展点 ExternalObserve()。
 //
-// 单体化（app.lio_source=内部推送，默认）：
+// 单体化（唯一模式，旧多 node 对照路径已删除）：
 //   * 整个进程只有一个 rclcpp::Node（ROSWrapper）；
 //   * Super-LIO 的位姿/点云/退化签名通过 SuperLIO::onLioOutput / onDenseCloud
 //     钩子直接推给 VisualPipeline，**不经过任何 DDS 话题**；
 //   * 图像仍然从 ROS 话题订阅（相机是外部输入，必须走 ROS）；
 //   * 视觉输出（colored_cloud / odom / path）由同一节点对外发布。
-//
-// 对照观察窗口（app.lio_source=topic）：
-//   * 仍然创建旧的 VisualANode 子节点，走 lio/odom、lio/cloud_world 等话题，
-//     用于 S0（DDS 回环）与 S1（进程内）逐位对比，确认无误后再删除。
 // ============================================================================
 
 #include <algorithm>
@@ -44,12 +40,15 @@
 #include "lio/super_lio.h"
 #include "ros/ROSWrapper.h"
 
-#include "super_livo_visual_a/node/visual_a_node.hpp"
+#include "super_livo_common/calibration_source.hpp"
 #include "super_livo_visual_a/pipeline/visual_pipeline.hpp"
 
 namespace {
 
-using superlivo_a::vp;
+// YAML 的视觉参数统一收进 `super_livo_visual:` 分支（见 config/*.yaml），
+// rcl 会摊平成 super_livo_visual.<name>，故读取时统一加这个前缀。
+// 与方案 B（visual_b_app 的 kVisualParamPrefix）保持同一套键名。
+inline std::string vp(const std::string& name) { return "super_livo_visual." + name; }
 
 /// 秒 -> ROS 时间戳（bag 的时间戳为传感器时钟，秒值 ~9.4e8，仍在 int32 内）。
 builtin_interfaces::msg::Time toRosStamp(double sec) {
@@ -59,7 +58,7 @@ builtin_interfaces::msg::Time toRosStamp(double sec) {
   return stamp;
 }
 
-/// 读取参数：已声明则取值，否则按默认值声明。
+/// 读取参数：已声明（--params-file 的 /** 通配块 / -p 覆盖）则取值，否则按默认值声明。
 /// 之所以不直接 declare：本节点复用 ROSWrapper（Super-LIO 参数已在 init 里声明），
 /// 个别参数名可能与 LIO 侧重合，直接 declare 会抛 ParameterAlreadyDeclared。
 /// name 必须是 super_livo_visual.<参数名>（调用点用 vp 生成），与节点路径完全一致。
@@ -88,8 +87,8 @@ bool odomToMatrix(const nav_msgs::msg::Odometry& msg, Eigen::Matrix4d& T_wl) {
   return true;
 }
 
-/// 把 VisualANode::loadParameters() 的声明映射成普通配置结构体。
-/// 参数名与默认值与原节点逐项一致，因此同一份 yaml 可以直接复用。
+/// 把 ROS 参数映射成普通配置结构体。
+/// 参数名与默认值与已删除的旧 VisualANode 逐项一致，因此同一份 yaml 可以直接复用。
 superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
   superlivo_a::VisualPipelineOptions opt;
 
@@ -205,6 +204,52 @@ superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
   opt.img_save_en = getOrDeclare<bool>(node, vp("image_save.img_save_en"), false);
   opt.img_save_dir = getOrDeclare<std::string>(node, vp("image_save.dir"), "");
   opt.img_save_interval = getOrDeclare<int>(node, vp("image_save.interval"), 1);
+
+  // ---- 标定源覆盖（各取所长，最高优先级）----
+  // camera_intrinsic.yaml 提供内参+畸变，FAST-Calib 结果提供外参 Rcl/Pcl；
+  // 读取成功则覆盖上面数据集 yaml 的对应项，失败/路径为空则沿用 yaml（非标数据集兜底）。
+  {
+    const std::string intr_path =
+        getOrDeclare<std::string>(node, vp("calib.camera_intrinsic_yaml"), "");
+    const std::string fast_path =
+        getOrDeclare<std::string>(node, vp("calib.fast_calib_result"), "");
+    superlivo_common::CalibrationData intr_data;
+    superlivo_common::CalibrationData fast_data;
+    if (!intr_path.empty()) {
+      std::string err;
+      if (!superlivo_common::loadCameraIntrinsic(intr_path, intr_data, err)) {
+        RCLCPP_WARN(node.get_logger(), "标定：读取 %s 失败（%s），内参回退数据集 yaml",
+                    intr_path.c_str(), err.c_str());
+      }
+    }
+    if (!fast_path.empty()) {
+      std::string err;
+      if (!superlivo_common::loadFastCalib(fast_path, fast_data, err)) {
+        RCLCPP_WARN(node.get_logger(), "标定：读取 %s 失败（%s），外参回退数据集 yaml",
+                    fast_path.c_str(), err.c_str());
+      }
+    }
+    const auto calib = superlivo_common::mergeCalibration(intr_data, fast_data);
+    if (calib.has_intrinsics) {
+      if (calib.width > 0) opt.intrinsics.width = calib.width;
+      if (calib.height > 0) opt.intrinsics.height = calib.height;
+      opt.intrinsics.fx = calib.fx;
+      opt.intrinsics.fy = calib.fy;
+      opt.intrinsics.cx = calib.cx;
+      opt.intrinsics.cy = calib.cy;
+      opt.distortion = calib.distortion;
+      RCLCPP_INFO(node.get_logger(),
+                  "标定：内参生效于 %s（%dx%d fx=%.2f fy=%.2f cx=%.2f cy=%.2f）",
+                  intr_data.has_intrinsics ? intr_path.c_str() : fast_path.c_str(),
+                  opt.intrinsics.width, opt.intrinsics.height, opt.intrinsics.fx,
+                  opt.intrinsics.fy, opt.intrinsics.cx, opt.intrinsics.cy);
+    }
+    if (calib.has_extrinsics) {
+      opt.Rcl = calib.Rcl;
+      opt.Pcl = calib.Pcl;
+      RCLCPP_INFO(node.get_logger(), "标定：外参 Rcl/Pcl 生效于 %s", fast_path.c_str());
+    }
+  }
 
   // 启动自检：分支式 YAML 一旦键名/层级写错会静默退回默认值，这里把关键项打出来。
   RCLCPP_INFO(node.get_logger(),
@@ -391,13 +436,22 @@ std::shared_ptr<MonolithVisualIo> setupMonolithIo(
       image_topic, image_qos,
       [pipeline, image_logger](const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
         try {
-          const cv_bridge::CvImagePtr cv_ptr =
-              cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
-          if (!cv_ptr || cv_ptr->image.empty()) {
-            return;
+          // 轻量传递：bgr8 消息零拷贝，直接构造引用消息内存的浅拷贝 Mat，
+          // 把消息 ConstSharedPtr 作为 keepalive 交给 pipeline（随事件消费完释放）；
+          // 其他编码退化为一次 toCvCopy（Mat 自有缓冲，无需 keepalive）。
+          if (msg->encoding == sensor_msgs::image_encodings::BGR8) {
+            cv::Mat view(static_cast<int>(msg->height), static_cast<int>(msg->width),
+                         CV_8UC3, const_cast<uint8_t*>(msg->data.data()), msg->step);
+            pipeline->submitImage(view, rclcpp::Time(msg->header.stamp).seconds(), msg);
+          } else {
+            const cv_bridge::CvImagePtr cv_ptr =
+                cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+            if (!cv_ptr || cv_ptr->image.empty()) {
+              return;
+            }
+            pipeline->submitImage(cv_ptr->image,
+                                  rclcpp::Time(msg->header.stamp).seconds());
           }
-          pipeline->submitImage(cv_ptr->image,
-                                rclcpp::Time(msg->header.stamp).seconds());
         } catch (const cv_bridge::Exception& e) {
           static rclcpp::Clock throttle_clock;
           RCLCPP_WARN_THROTTLE(image_logger, throttle_clock, 5000,
@@ -449,31 +503,19 @@ int main(int argc, char** argv) {
   wrapper->setSuperLIO(lio);
   lio->init();
 
-  // ---- 选择 LIO 数据来源 -------------------------------------------------
-  // internal：进程内钩子直推（默认，无 DDS 回环）
-  // topic   ：保留旧 VisualANode 子节点，走 lio/* 话题（S0 对照，验证后删除）
+  // ---- 视觉支路开关 ------------------------------------------------------
+  // 进程内钩子直推（唯一模式，无 DDS 回环；旧 topic 对照路径已删除）
   const bool embed_visual = getOrDeclare<bool>(*wrapper, vp("embed"), true);
-  const std::string lio_source =
-      getOrDeclare<std::string>(*wrapper, vp("lio_source"), "internal");
 
-  std::shared_ptr<superlivo_a::VisualANode> visual_node;
   std::shared_ptr<MonolithVisualIo> io;
   if (!embed_visual) {
-    RCLCPP_INFO(wrapper->get_logger(), "app.embed_visual=false：只运行纯 LIO");
-  } else if (lio_source == "topic") {
-    RCLCPP_WARN(wrapper->get_logger(),
-                "app.lio_source=topic：使用旧 VisualANode（DDS 回环），仅用于对照验证");
-    visual_node = std::make_shared<superlivo_a::VisualANode>();
+    RCLCPP_INFO(wrapper->get_logger(), "super_livo_visual.embed=false：只运行纯 LIO");
   } else {
-    if (lio_source != "internal") {
-      RCLCPP_WARN(wrapper->get_logger(), "未知 app.lio_source='%s'，回退 internal",
-                  lio_source.c_str());
-    }
     pipeline = std::make_shared<superlivo_a::VisualPipeline>(loadPipelineOptions(*wrapper));
     io = setupMonolithIo(*wrapper, pipeline);
     lio->setPipeline(pipeline.get());
     RCLCPP_INFO(wrapper->get_logger(),
-                "app.lio_source=internal：Super-LIO → VisualPipeline 进程内直连（无 DDS）");
+                "Super-LIO → VisualPipeline 进程内直连（无 DDS）");
   }
 
   auto process_timer = wrapper->create_wall_timer(
@@ -489,10 +531,10 @@ int main(int argc, char** argv) {
   rclcpp::on_shutdown([lio, pipeline]() {
     lio->printTimeRecord();
     if (pipeline) {
-      // bag 结束时队列里可能还有等图像/等位姿的帧，尽量补完再落盘。
+      // 先排空队列，再**同步**停机落盘：退出时的保存不能交给异步 save 线程，
+      // 长序列的大图还没写完进程就退出了，线程被杀、产物全部丢失。
       pipeline->flush();
-      pipeline->requestSaveColoredMap();
-      pipeline->flush();
+      pipeline->shutdownAndSave();
       RCLCPP_INFO(rclcpp::get_logger("visual_a_app"), "[彩色统计] %s",
                   pipeline->statsString().c_str());
     }
@@ -500,13 +542,17 @@ int main(int argc, char** argv) {
 
   rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 6);
   executor.add_node(wrapper);
-  if (visual_node) {
-    executor.add_node(visual_node);
-  }
   executor.spin();
 
   // 断开钩子，避免 lio 线程在 pipeline 析构后仍访问它。
   lio->setPipeline(nullptr);
+
+  // 兜底：shutdown 钩子挂在全局 context 上，与主线程的退出时序不保证有序
+  // （实测两者可能并发）。这里再同步保存一次；shutdownAndSave() 幂等且
+  // 会让后到者阻塞到落盘完成，确保进程退出前文件已经写好。
+  if (pipeline) {
+    pipeline->shutdownAndSave();
+  }
 
   rclcpp::shutdown();
   return 0;

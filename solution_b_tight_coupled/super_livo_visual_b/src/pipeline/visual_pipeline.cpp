@@ -304,10 +304,12 @@ void VisualPipeline::setLogCallback(LogCallback cb) {
   log_cb_ = std::move(cb);
 }
 
-void VisualPipeline::submitImage(const cv::Mat& bgr, double stamp) {
+void VisualPipeline::submitImage(const cv::Mat& bgr, double stamp,
+                                 std::shared_ptr<const void> keepalive) {
   InputEvent ev;
   ev.kind = InputEvent::Kind::kImage;
   ev.image = bgr;
+  ev.image_keepalive = std::move(keepalive);
   ev.stamp = stamp;
   pushInputEvent(std::move(ev));
 }
@@ -997,7 +999,8 @@ void VisualPipeline::onImage(const cv::Mat& bgr_in, double stamp) {
     }
   }
 
-  // app 传入的 Mat 已转成 bgr8 且拥有数据所有权，可直接放进 image_cache_。
+  // 传入的 Mat 可能是引用消息内存的浅拷贝（事件 keepalive 保活到本函数返回）；
+  // 下面 rectifyBgr 恒走 remap，进 image_cache_ 的是自有缓冲。
   cv::Mat bgr = bgr_in;
   if (bgr.empty()) {
     return;

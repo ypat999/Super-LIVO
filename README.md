@@ -98,9 +98,9 @@ colcon build --packages-select super_livo_common pointcloud_colorizer \
 
 - **摊平机制**：Humble 的 rcl 会把 `ros__parameters:` 下的嵌套 map 摊平成点号参数名，落到参数服务
   上的真实名字是 `super_livo_visual.cam_width`、`super_livo_visual.pcd.save_dir`。代码侧读取必须带
-  这个前缀：A 侧集中在
-  `solution_a_lightweight/super_livo_visual_a/include/super_livo_visual_a/node/visual_a_node.hpp`
-  的 `vp("name")` helper；B 侧在
+  这个前缀：A 侧在
+  `solution_a_lightweight/super_livo_visual_a/src/app/visual_a_app.cpp`
+  的 `vp("name")` helper（旧多 node 已删除，helper 从原 `visual_a_node.hpp` 搬入）；B 侧在
   `solution_b_tight_coupled/super_livo_visual_b/src/app/visual_b_app.cpp` 的 `getOrDeclare` 内用
   `kVisualParamPrefix` 统一加。**文档里写分支内短名（`gate.*`、`pcd.save_dir` 等）时一律省略前缀；
   命令行 `-p` 覆盖必须写全名**（`-p super_livo_visual.pcd.save_dir:=…`）。
@@ -108,6 +108,13 @@ colcon build --packages-select super_livo_common pointcloud_colorizer \
   rclcpp 对未声明的 override 静默忽略，因此不必再为"纯 LIO / 带视觉"维护两份配置。
 - **消灭的历史坑**：此前 B 的三份配置顶层写死 `super_livo_visual_b:`，而单体进程里节点名是
   `super_lio`，整块参数不匹配 ⇒ 内参、时延、各开关全部回落代码默认值且**不报错**。
+- **标定源覆盖（各取所长，最高优先级）**：A/B 支路配置分支内的 `calib.camera_intrinsic_yaml` /
+  `calib.fast_calib_result` 若给出路径且读取成功，则用 `config/camera_intrinsic.yaml` 的
+  内参+畸变与 `third_party/FAST-Calib-ROS2/output/calib_result.txt` 的外参 Rcl/Pcl 覆盖本文件的
+  `cam_*`/`Rcl`/`Pcl`（内参以 intrinsic.yaml 优先，FAST-Calib 内参仅作后备）；路径为空或读取失败
+  沿用数据集 yaml——非标数据集只改 yaml 即可。共用 loader 在
+  `common/super_livo_common/include/super_livo_common/calibration_source.hpp`，move 数据集 yaml
+  已配置默认路径（其余数据集留空）。
 
 ### A/B 同类参数的合并改名
 
@@ -129,7 +136,7 @@ B 的 `est.visual_info_ratio(_degen)`（信息矩阵比例）、B 的 `guard.*`�
 
 | 归属 | 参数族 |
 | --- | --- |
-| A 独有 | `gate.*`、`klt.*`、`evo.*`、`image_save.*`、`odom_topic`、`cloud_topic`、`body_cloud_topic`、`degen_topic`、`lio_source` |
+| A 独有 | `gate.*`、`klt.*`、`evo.*`、`image_save.*`、`calib.*`（`lio_source` 随 S2 清理删除） |
 | B 独有 | `est.*`、`msckf.*`、`photo.*`、`rot_refine.*`、`scheduler.*`、`lifecycle.*`、`kf.*`、`guard.*`、`patch.*`、`e2.*` |
 | A/B 同名 | `cam_*`、`Rcl`、`Pcl`、`scale`、`image_topic`、`imu_topic`、`align.*`、`color.*`、`pcd.*`、`image.qos_reliable` |
 
@@ -296,7 +303,7 @@ FAST-Calib 直出 1.26/2.17 px、旧 holefix 1.25/1.65 px、**新 holefix 1.00/1
 | `ros2 bag play`（顶替 Livox 驱动） | `taskset -c 4` |
 | `super_lio_node` | `taskset -c 7` + `lio.single_core:=true` |
 | `fastlivo_mapping` | `taskset -c 7` + `OMP_NUM_THREADS=1` |
-| `visual_a_node` / `visual_b_app` | `taskset -c 7`（**与 LIO 同挤一个大核**；B 单体化后视觉支路已在 LIO 同进程内，历史双节点数据见 [speed_test.md](speed_test.md)） |
+| `visual_a_app` / `visual_b_app` | `taskset -c 7`（**与 LIO 同挤一个大核**；A/B 单体化后视觉支路已在 LIO 同进程内，历史双节点数据见 [speed_test.md](speed_test.md)） |
 | `parameter_blackboard`（FL2 相机参数托管） | `taskset -c 0` |
 
 组间留 ≥15 s 间隔降温；每组**至少重复 3 次**（本仓库已实测：裁剪输入下 Super-LIO 本身

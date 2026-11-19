@@ -35,6 +35,7 @@
 #include "lio/params.h"
 #include "lio/super_lio.h"
 #include "ros/ROSWrapper.h"
+#include "super_livo_common/calibration_source.hpp"
 #include "super_livo_common/degeneracy_signature.hpp"
 
 #include "super_livo_visual_b/bridge/constraint_bridge.hpp"
@@ -86,6 +87,95 @@ class RosParamSource : public superlivo_b::ParamSource {
  private:
   rclcpp::Node& node_;
 };
+
+/// 标定源覆盖装饰器（各取所长，最高优先级）：
+/// 命中相机内参/畸变/外参时返回 camera_intrinsic.yaml / FAST-Calib 的值，
+/// 其余参数原样委托给底层 ParamSource（即数据集 yaml）。
+/// calib 的 has_* 全为 false 时等价于直通。
+class CalibrationOverlayParamSource : public superlivo_b::ParamSource {
+ public:
+  CalibrationOverlayParamSource(superlivo_b::ParamSource& base,
+                                const superlivo_common::CalibrationData& calib)
+      : base_(base), calib_(calib) {}
+
+  bool getBool(const std::string& n, bool d) override { return base_.getBool(n, d); }
+  float getFloat(const std::string& n, float d) override { return base_.getFloat(n, d); }
+  std::string getString(const std::string& n, const std::string& d) override {
+    return base_.getString(n, d);
+  }
+
+  int getInt(const std::string& n, int d) override {
+    if (calib_.has_intrinsics) {
+      if (n == "cam_width" && calib_.width > 0) return calib_.width;
+      if (n == "cam_height" && calib_.height > 0) return calib_.height;
+    }
+    return base_.getInt(n, d);
+  }
+
+  double getDouble(const std::string& n, double d) override {
+    if (calib_.has_intrinsics) {
+      if (n == "cam_fx") return calib_.fx;
+      if (n == "cam_fy") return calib_.fy;
+      if (n == "cam_cx") return calib_.cx;
+      if (n == "cam_cy") return calib_.cy;
+    }
+    return base_.getDouble(n, d);
+  }
+
+  std::vector<double> getDoubleArray(const std::string& n,
+                                     const std::vector<double>& d) override {
+    if (calib_.has_intrinsics && n == "cam_d" && !calib_.distortion.empty()) {
+      return calib_.distortion;
+    }
+    if (calib_.has_extrinsics && n == "Rcl" && calib_.Rcl.size() == 9) {
+      return calib_.Rcl;
+    }
+    if (calib_.has_extrinsics && n == "Pcl" && calib_.Pcl.size() == 3) {
+      return calib_.Pcl;
+    }
+    return base_.getDoubleArray(n, d);
+  }
+
+ private:
+  superlivo_b::ParamSource& base_;
+  superlivo_common::CalibrationData calib_;
+};
+
+/// 读取两份标定文件并合并（A/B 同口径）：
+/// intrinsic.yaml 内参优先、FAST-Calib 后备；外参只有 FAST-Calib 提供。
+/// 路径为空或读取失败只打 WARN，回退数据集 yaml（非标数据集兜底）。
+inline superlivo_common::CalibrationData loadCalibrationOverlay(rclcpp::Node& node) {
+  const std::string intr_path =
+      getOrDeclare<std::string>(node, "calib.camera_intrinsic_yaml", "");
+  const std::string fast_path =
+      getOrDeclare<std::string>(node, "calib.fast_calib_result", "");
+  superlivo_common::CalibrationData intr_data;
+  superlivo_common::CalibrationData fast_data;
+  if (!intr_path.empty()) {
+    std::string err;
+    if (!superlivo_common::loadCameraIntrinsic(intr_path, intr_data, err)) {
+      RCLCPP_WARN(node.get_logger(), "标定：读取 %s 失败（%s），内参回退数据集 yaml",
+                  intr_path.c_str(), err.c_str());
+    }
+  }
+  if (!fast_path.empty()) {
+    std::string err;
+    if (!superlivo_common::loadFastCalib(fast_path, fast_data, err)) {
+      RCLCPP_WARN(node.get_logger(), "标定：读取 %s 失败（%s），外参回退数据集 yaml",
+                  fast_path.c_str(), err.c_str());
+    }
+  }
+  const auto calib = superlivo_common::mergeCalibration(intr_data, fast_data);
+  if (calib.has_intrinsics) {
+    RCLCPP_INFO(node.get_logger(), "标定：内参生效于 %s（%dx%d fx=%.2f fy=%.2f）",
+                intr_data.has_intrinsics ? intr_path.c_str() : fast_path.c_str(),
+                calib.width, calib.height, calib.fx, calib.fy);
+  }
+  if (calib.has_extrinsics) {
+    RCLCPP_INFO(node.get_logger(), "标定：外参 Rcl/Pcl 生效于 %s", fast_path.c_str());
+  }
+  return calib;
+}
 
 /// double 秒 -> ROS 时间戳。
 builtin_interfaces::msg::Time toRosStamp(double sec) {
@@ -392,13 +482,22 @@ std::shared_ptr<MonolithVisualIo> setupMonolithIo(
       image_topic, image_qos,
       [pipeline, image_logger](const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
         try {
-          const cv_bridge::CvImagePtr cv_ptr =
-              cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
-          if (!cv_ptr || cv_ptr->image.empty()) {
-            return;
+          // 轻量传递：bgr8 消息零拷贝，直接构造引用消息内存的浅拷贝 Mat，
+          // 把消息 ConstSharedPtr 作为 keepalive 交给 pipeline（随事件消费完释放）；
+          // 其他编码退化为一次 toCvCopy（Mat 自有缓冲，无需 keepalive）。
+          if (msg->encoding == sensor_msgs::image_encodings::BGR8) {
+            cv::Mat view(static_cast<int>(msg->height), static_cast<int>(msg->width),
+                         CV_8UC3, const_cast<uint8_t*>(msg->data.data()), msg->step);
+            pipeline->submitImage(view, rclcpp::Time(msg->header.stamp).seconds(), msg);
+          } else {
+            const cv_bridge::CvImagePtr cv_ptr =
+                cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+            if (!cv_ptr || cv_ptr->image.empty()) {
+              return;
+            }
+            pipeline->submitImage(cv_ptr->image,
+                                  rclcpp::Time(msg->header.stamp).seconds());
           }
-          pipeline->submitImage(cv_ptr->image,
-                                rclcpp::Time(msg->header.stamp).seconds());
         } catch (const cv_bridge::Exception& e) {
           static rclcpp::Clock throttle_clock;
           RCLCPP_WARN_THROTTLE(image_logger, throttle_clock, 5000,
@@ -494,7 +593,10 @@ int main(int argc, char** argv) {
                 "super_livo_visual.embed=false：只运行纯 LIO");
   } else {
     RosParamSource param_source(*wrapper);
-    pipeline = std::make_shared<superlivo_b::VisualPipeline>(param_source, bridge);
+    // 标定源覆盖：camera_intrinsic.yaml 内参 + FAST-Calib 外参优先于数据集 yaml。
+    const auto calib = loadCalibrationOverlay(*wrapper);
+    CalibrationOverlayParamSource overlay_source(param_source, calib);
+    pipeline = std::make_shared<superlivo_b::VisualPipeline>(overlay_source, bridge);
     io = setupMonolithIo(*wrapper, pipeline);
     lio->setVisualPipeline(pipeline.get());
     RCLCPP_INFO(wrapper->get_logger(),
