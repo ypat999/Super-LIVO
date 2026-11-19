@@ -1,6 +1,104 @@
 # freqcmd.txt — Super-LIVO 换机/换环境常用命令（标定 / 跑批 / 测速）
 # 适用：Ubuntu 20.04/22.04 + ROS2 Humble，Livox Avia + 集成 IMU + 相机（MV-CB013，1280x1024）
-# 换环境只需改 §0 的路径变量，其余命令原样可用。最近核对：2026-11-17（holefix 外参重写 + move 三臂重跑，命令见 §4.3）
+# 换环境只需改 §0 的路径变量，其余命令原样可用。最近核对：2026-11-19（A/B 单体化 + test4 双臂跑批）
+
+# ============================================================
+# A. 编译 + A/B 启动（速查，先看这一节）
+# ============================================================
+# 结构：A/B 均为「单进程单节点」可执行文件——
+#   visual_a_app / visual_b_app 一个进程里同时跑 Super-LIO 主干与视觉支路，
+#   不再需要单独起 super_lio_node（旧的 visual_a_node 已删除）。
+# 参数：每个 app 吃两份 yaml（LIO 主干 + 视觉支路），顶层均为 /** + ros__parameters。
+# 前置：先按 §0 导出 REPO / DATA / MOVE_RAW（A/B 的 bag；move 另可用见 §0 的 MOVE_CLK）。
+
+# --- A.1 编译（仓库根，必须 Release）---
+source /opt/ros/humble/setup.bash
+cd ~/git/Super-LIVO
+git submodule update --init --recursive                    # 首次克隆后一次即可
+(cd third_party/Super-LIO && \
+  colcon build --packages-select super_lio --cmake-args -DCMAKE_BUILD_TYPE=Release)
+source third_party/Super-LIO/install/setup.bash
+colcon build --packages-select super_livo_common pointcloud_colorizer \
+  super_livo_visual_a super_livo_visual_b --cmake-args -DCMAKE_BUILD_TYPE=Release
+# 日志：log/latest_build/<pkg>/stdout_stderr.log；增量重编只跑最后一条 colcon build
+
+# --- A.2 启动方案 A（轻量：LIO 主干 + 视觉后处理，不写回 ESKF）---
+source /opt/ros/humble/setup.bash
+source $REPO/third_party/Super-LIO/install/setup.bash
+source $REPO/install/setup.bash
+export ROS_DOMAIN_ID=93
+OUT=$DATA/output/move_a; mkdir -p $OUT
+ros2 run super_livo_visual_a visual_a_app --ros-args \
+  --params-file $REPO/common/super_livo_common/config/lio_move.yaml \
+  --params-file $REPO/solution_a_lightweight/super_livo_visual_a/config/visual_a_move.yaml \
+  -p super_livo_visual.pcd.save_dir:=$OUT/pcd \
+  -p super_livo_visual.timing:=true > /tmp/move_a.log 2>&1 &
+sleep 5
+ros2 bag play $MOVE_RAW --rate 1.0 --disable-keyboard-controls < /dev/null > /tmp/play_a.log 2>&1
+sleep 3; pkill -INT -f visual_a_app                        # SIGINT 触发退出同步落盘
+for i in $(seq 1 30); do pgrep -f visual_a_app >/dev/null || break; sleep 1; done
+ls -l $OUT/pcd/*.pcd; grep -a 'run time' /tmp/move_a.log | tail -3
+
+# --- A.3 启动方案 B（紧耦合：视觉约束写回 ESKF）---
+# 与 A 的差异只有包名/可执行/yaml 三处；inject 默认 true（super_livo_visual.inject）
+OUT=$DATA/output/move_b; mkdir -p $OUT
+ros2 run super_livo_visual_b visual_b_app --ros-args \
+  --params-file $REPO/common/super_livo_common/config/lio_move.yaml \
+  --params-file $REPO/solution_b_tight_coupled/super_livo_visual_b/config/visual_b_move.yaml \
+  -p super_livo_visual.pcd.save_dir:=$OUT/pcd \
+  -p super_livo_visual.timing:=true > /tmp/move_b.log 2>&1 &
+sleep 5
+ros2 bag play $MOVE_RAW --rate 1.0 --disable-keyboard-controls < /dev/null > /tmp/play_b.log 2>&1
+sleep 3; pkill -INT -f visual_b_app
+for i in $(seq 1 30); do pgrep -f visual_b_app >/dev/null || break; sleep 1; done
+ls -l $OUT/pcd/*.pcd; grep -a 'run time' /tmp/move_b.log | tail -3
+
+# --- A.4 推荐：用统一跑批脚本（含互斥、清理、产物归集；禁止并行）---
+OUTROOT=$DATA/pcd_time_$(date +%Y%m%d) SMOKE=0 RATE=1.0 \
+  bash $REPO/experiments/scripts/paper_matrix/run_one.sh test4 a
+OUTROOT=$DATA/pcd_time_$(date +%Y%m%d) SMOKE=0 RATE=1.0 \
+  bash $REPO/experiments/scripts/paper_matrix/run_one.sh test4 b
+# 产物：<OUTROOT>/<seq>/<arm>/{node.log,play.log,latency.csv,odom/,pcd/,meta.txt,done}
+# 序列可选：ntu01 ntu03 rtk retail move test4 room；臂可选：a b sl fl2
+
+# ============================================================
+# B. 环境部署（新机器一次性）
+# ============================================================
+# B.1 系统与 ROS 2
+#   Ubuntu 22.04 + ROS 2 Humble（x86 开发机 / RK3588S 实机同一套）
+sudo apt update && sudo apt install -y ros-humble-desktop ros-humble-cv-bridge \
+  ros-humble-image-transport ros-humble-pcl-ros ros-humble-tf2-ros \
+  libeigen3-dev libpcl-dev libopencv-dev libboost-all-dev \
+  libgoogle-glog-dev libgflags-dev libyaml-cpp-dev python3-numpy python3-pip
+pip3 install --user rosbags                                # mcap -> sqlite3 转换（本机无 mcap 插件）
+# B.2 代码与子模块
+cd ~/git && git clone --recursive https://github.com/ypat999/Super-LIVO.git
+cd Super-LIVO && git submodule update --init --recursive
+# B.3 外部 ROS 包（仅 FL2 对照臂需要）
+#   livox_ros_driver2 的 typesupport：编译 FL2 前必须先 source 它
+cd ~/git/3d_dog_navi_ros2 && colcon build --packages-select livox_ros_driver2
+#   官方 FAST-LIVO2：
+cd ~/fastlivo2_ws && colcon build --packages-select fast_livo
+# B.4 通信环境（WSL/单机必设）
+export ROS_DOMAIN_ID=93                 # 节点/bag/探针必须一致
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp   # 本机 WSL 用 CycloneDDS 回放会掉到 4.5 Hz
+unset ROS_LOCALHOST_ONLY
+# 每次跑批前清残留（孤儿节点会占 FastDDS 共享内存端口，导致下一臂 0 odom）
+pkill -f 'super_lio_node|visual_a_app|visual_b_app|fastlivo_mapping|latency_probe|ros2 bag play'
+rm -f /dev/shm/fastrtps_* /dev/shm/fast_datachannel_* /dev/shm/sem.fastrtps_*
+bash $REPO/tools/ros_batch_guard.sh     # 检查场上是否有 ROS 进程，有则拒绝启动
+# B.5 WSL 专用
+#   127.0.0.1 的 UDP 单播路由会让 DDS 只剩多播发现 → 跑批前删掉：
+ip route del 127.0.0.1 via 169.254.73.152 dev loopback0 table 127 2>/dev/null
+#   mcap bag 需转换（无 root 装不了 mcap 插件）：
+#   python3 -m rosbags.rosbag2 convert <in.mcap> <out_dir> 后把 metadata.yaml 改成 v4 结构
+# B.6 标定文件落位
+#   config/camera_intrinsic.yaml                    相机内参+畸变（海康 MV-CB013）
+#   third_party/FAST-Calib-ROS2/output/calib_result.txt   标定板外参 Rcl/Pcl
+#   A/B 的 yaml 里 calib.camera_intrinsic_yaml / calib.fast_calib_result 指向上面两项即自动覆盖
+# B.7 自检
+ros2 topic list                          # 起 app 后应能看到 /livox/lidar、/livox/imu、/left_camera/image
+bash $REPO/tools/ros_batch_guard.sh      # 应输出“干净”
 
 # ============================================================
 # 0. 路径与环境变量（按需修改）
@@ -56,7 +154,7 @@ cd $FL2_WS && colcon build --packages-select fast_livo
 cd $PL_WS && colcon build --packages-select point_lio
 
 # ============================================================
-# 3. 旧两进程链路（Super-LIO + 方案A 上色，Retail_Street；现推荐 §4 单进程 app）
+# 3. 旧两进程链路（已废弃：visual_a_node 在 S2 删除，单进程 app 见 §A.2）
 # ============================================================
 source /opt/ros/humble/setup.bash
 source $REPO/third_party/Super-LIO/install/setup.bash

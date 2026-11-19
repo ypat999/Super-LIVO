@@ -40,7 +40,7 @@
 - 误差预算闭合：静止段 IMU 零偏 gz≈−0.42°/s、gy≈−0.88°/s；17.2°/147 s ≈ 0.12°/s，与零偏+无回环纠正的量级一致。
 - 判定：**数据侧问题**（IMU 陀螺零偏未被回环纠正），非算法缺陷；LIVO 保存的 `all_raw_points.pcd`（72 MB / 4,514,544 点）远少于纯 LIO（927 MB / 28,969,845 点）是 `img_en=1` 时只存被着色点的保存策略所致。Super-LIO：`test_ori.pcd` 662 MB / 41,374,634 点、`filtered_test_ori.pcd` 244 MB / 15,260,712 点、PCD/scans_0~3。
 
-**产物**：输出目录见上（均在 `/home/ywj/slam_data/pcd/`）；预览图 10 张在仓库根目录（已镜像 `D:\traetmp\`）；诊断报告 [fastlivo2_bag_yaw_drift_report.html](fastlivo2_bag_yaw_drift_report.html)、`third_party/Super-LIO/stairwell_drift_diagnosis.txt`。
+**产物**：输出目录见上（均在 `/home/ywj/slam_data/pcd/`）；预览图 10 张在仓库根目录（已镜像 `D:\traetmp\`）；诊断报告 `fastlivo2_bag_yaw_drift_report.html`（历史产物，已不在仓库）、`third_party/Super-LIO/stairwell_drift_diagnosis.txt`。
 
 ---
 
@@ -1584,12 +1584,12 @@ B 的 `est.visual_info_ratio(_degen)`（信息矩阵比例）、B 的 `guard.*`�
 `tools/run_ntu.sh`。
 
 文档同步：根 `README.md`（新增「参数文件规范」小节）、`solution_b_tight_coupled/README.md`、
-`monolith_refactor_plan.md`、`monolith_refactor_progress.md`、`experiments/paper_compare/REPORT.md`。
+`docs/monolith_refactor.md`、`experiments/paper_compare/REPORT.md`。
 
 ### 40.6 历史口径提醒
 
-本文档 §1–§39 与 `solution_b_tight_coupled/README.md` §9、`monolith_refactor_progress.md` §2
-中已跑完的实验记录**保留当时的旧参数名与数值**（`lv.*` / `app.*` / `est.enable_visual` /
+本文档 §1–§39 与 `solution_b_tight_coupled/README.md` §9 中已跑完的实验记录
+**保留当时的旧参数名与数值**（`lv.*` / `app.*` / `est.enable_visual` /
 短名 `-p img_time_offset:=…`），未回填改写；涉及处已就地标注"该记录为改名前命名"。
 `paper_20261119`、`test4_check_b*` 等历史结果如需复现，按旧名写 `-p` 不会生效，须用 §40.3 的新名。
 
@@ -1708,4 +1708,105 @@ ros2 bag play <转换后的bag> --topics /livox/lidar /livox/imu /left_camera/im
   （`visual_a_app.cpp`）计时接线，共 6 个文件；编译已验证。
 - 参数：`super_livo_visual.timing`（A/B 同名，默认 false）。
 - 日志：`/tmp/t20261118_{a,b}.log`（本机临时，不入库）。
+
+---
+
+## 43. test4 全 bag 双臂 1x 实时跑批：单体化后端到端延时与产物（2026-11-19）
+
+**前提/动机**：S2 单体化（A/B 均为 1 进程 1 节点，LIO→视觉进程内直推）落地后，
+用同一 bag、同机、同 `ROS_DOMAIN_ID=93` 完整跑一遍，验证单进程形态下产物齐全、
+视觉端到端延时可比，并用统一跑批脚本消除并行/残留进程的干扰。
+
+**数据与配置**：
+- bag：`/home/ywj/slam_data/livo_bag/test4_move_ros2`（mcap→sqlite3），**90.5 s / 19,846 条**，
+  topics `/livox/lidar /livox/imu /left_camera/image`，`-r 1.0` 实时。
+- 参数：LIO 主干 `common/super_livo_common/config/lio_move.yaml`；视觉支路
+  `visual_a_move.yaml` / `visual_b_move.yaml`。
+- 标定覆盖（两臂同）：内参 `config/camera_intrinsic.yaml`（1280×1024, fx=708.63, fy=708.72,
+  cx=644.49, cy=495.88），外参 `third_party/FAST-Calib-ROS2/output/calib_result.txt`，
+  `img_time_offset=-204701439.494`（启动日志有 `视觉参数：…` 行可核对）。
+- 计时：§42 的 `latency_timer` 在 `super_livo_visual.timing=true` 下生效；
+  统一跑批脚本 `experiments/scripts/paper_matrix/run_one.sh` 已对 A/B 臂统一追加
+  `-p super_livo_visual.timing:=true`，无需手工加。
+
+**命令**：
+
+```bash
+OUTROOT=/home/ywj/slam_data/pcd_time_20261119_timing RATE=1.0 \
+  bash experiments/scripts/paper_matrix/run_one.sh test4 a
+OUTROOT=/home/ywj/slam_data/pcd_time_20261119_timing RATE=1.0 \
+  bash experiments/scripts/paper_matrix/run_one.sh test4 b
+```
+
+**结果（两臂同一 bag、串行执行）**：
+
+| 项 | A 臂 `visual_a_app` | B 臂 `visual_b_app` |
+| --- | --- | --- |
+| 彩色 PCD | 58,987,290 B（57 MB）/ **3,686,694 点** | 58,299,690 B（56 MB）/ **3,643,719 点** |
+| `/super_livo_visual_{a,b}/odom` | 829 行（90.5 s 内 ≈9.2 Hz） | 502 行（≈5.5 Hz） |
+| 单帧视觉合计（采样行） | avg **10.5** ms / p50 8.8 / max 28.4（n=82） | avg **44.0** ms / p50 42.7 / max 69.9（n=52） |
+| `[Img->VisOdom]` 全量 | avg 12.0 / max 83.7（566 次） | avg 109.4 / max 780.3（236 次） |
+| `[Img->VisCloud]` 全量 | avg 91.6 / max 763.5（561 次） | avg 110.1 / max 890.3（547 次） |
+| `[Img->VisOdom]` 末窗口 | avg 11.4 / max 82.2（263 次） | avg 83.8 / max 436.8（266 次） |
+| `[Img->VisCloud]` 末窗口 | avg 59.5 / max 402.3（266 次） | avg 102.6 / max 517.4（271 次） |
+| 整轮墙钟（含启动/落盘） | ≈115 s（18:35:27 → 18:37:22） | ≈113 s（18:37:22 → 18:39:15） |
+
+- 两臂均正常走到 `彩色地图已保存`（SIGINT 优雅退出，`shutdownAndSave()` 落盘），产物齐全。
+- A 臂 `[彩色统计]`：调用 1711 / 实际着色 827 帧 / 延迟等待 1091 / 未完成 0 / 输入丢弃 0。
+- B 臂 `[注入]`：push=502 / take=474 / 生效=469 / 过期=5，取用时差 avg 186.8 ms（§42 那轮
+  过期 1172 的情况在本轮未复现；本轮串行、无并行负载）。
+- 首窗口（前 60 s，含建图冷启动）：A `VisCloud` avg 91.6 / max 763.5、`VisOdom` avg 12.0 / max 83.7；
+  B `VisCloud` avg 110.1 / max 890.3、`VisOdom` avg 109.4 / max 780.3 —— 与 §42 量级一致，
+  B 仍为 A 的 3–8 倍，差异来自 KLT + 锚点更新 + MSCKF + 写回同一图像周期内完成。
+- PCD 两臂点数差 1.2%（3,686,694 vs 3,643,719），与 §38 中 A/B 逐点差 5.0 mm 的结论一致：
+  两臂几何一致，差异来自接入点不同导致的轻微建图分支差异。
+
+**产出物**：
+- `/home/ywj/slam_data/pcd_time_20261119_timing/test4/{a,b}/`
+  （`pcd/*.pcd`、`odom/odom_0.db3`、`node.log`、`latency.csv`、`meta.txt`、`play.log`、`done`）。
+- `meta.txt` 已内含 `odom_rows`、`latency_lines`、`pcd=57M/56M`、结束时刻，便于批量汇总。
+- 与设计文档的对应：`docs/monolith_refactor.md` §8.6。
+
+## 44. 过曝/镜面高光（会议室白点）过滤试验：像素颜色域不可行（2026-11-19）
+
+**问题**：`test4_move_ros2`（会议室）的 B 臂彩色 PCD 中，电视边缘成片白色点、桌面少量白色点，
+实物上不存在，判断为扫描时灯光/屏幕反光被相机拍到并赋给了颜色（原图对应像素饱和）。
+
+**先做几何侧排除**（对 §43 的 B 基线 PCD，3,643,719 点）：
+- 纯白 131,936（3.62%），min(R,G,B)≥235 为 139,685（3.83%）；
+- 白点在 6 cm 邻域内的近邻中位 **791** 个，孤立点比例 0.01%，与普通点完全相同；
+- 3 cm 连通块最大 10,129 个体素 → 白点是贴在真实表面上的密集点，**不是几何离群点**，
+  SOR/ROR 等基于邻域距离的滤波无效；问题只在颜色域。
+
+**试验的三个变体**（同一 bag、`run_one.sh test4 {a,b}`、1x 实时、输出
+`/home/ywj/slam_data/pcd_time_20261119_glare`）：
+
+| 变体 | 判据/策略 | 臂 | 点数 | 纯白(255,255,255) | minRGB≥235 |
+| --- | --- | --- | --- | --- | --- |
+| 基线 | 无过滤 | A | 3,686,694 | 135,009 (3.66%) | 142,889 (3.88%) |
+| 基线 | 无过滤 | B | 3,643,719 | 131,936 (3.62%) | 139,685 (3.83%) |
+| ① 丢弃 | `max(RGB)≥245 且 max-min≤15` → 不赋色 | A | 3,541,655 (−3.9%) | **0** | 717 (0.02%) |
+| ② 时序中位 | 同上打标记 + 1 cm 体素最近 6 帧中位修复 | B | 3,643,708 | 132,889 (3.65%) | — |
+| ②' 时序中位改进 | 高光观测不进中位缓冲，落盘只回填仍为高光的点 | B | 3,643,720 | 126,494 (3.47%) | 132,226 (3.63%) |
+| ③ 统一丢弃 | A/B 同为 `min(R,G,B)>250` → 不赋色 | A | 3,549,972 (−3.71%) | **0** | 3,039 (0.09%) |
+| ③ 统一丢弃 | 同上 | B | 3,501,555 (−3.90%) | **0** | 2,954 (0.08%) |
+
+**结论（本轮不可用，代码已全部回退）**：
+- 变体② 只修复 4.1%：会议室电视边框/顶灯的高光是**持久性**的（每帧都过曝），
+  剔掉高光观测后体素内没有非高光观测，时间中位无源可依。时序中位只适用于偶发高光。
+- 变体①/③ 能彻底清零白点，但**白色顶灯、白色墙面等"本来就白"的物体会一并被丢弃**：
+  像素颜色域无法区分"反光造成的假白"与"物体本征白"。点数代价（−3.7~−3.9%）也正好是这些点。
+- 因此像素颜色阈值不是可用方案。后续需要**长时序数据**（同一表面在多个视角/多次经过，
+  至少部分帧不反光）再验证时序中位或空间邻域补色；或者引入深度/强度一致性等额外判据。
+
+**回退范围**（8 个文件 `git checkout --`，均已恢复为 §43 基线行为）：
+`pointcloud_colorizer/{include/pointcloud_colorizer/{rgb_assignment,voxel_color_median}.hpp,src/rgb_assignment.cpp}`、
+`super_livo_visual_a/{config/visual_a_move.yaml,src/app/visual_a_app.cpp}`、
+`super_livo_visual_b/{config/visual_b_move.yaml,include/.../visual_pipeline.hpp,src/pipeline/visual_pipeline.cpp}`。
+新增参数 `color.glare_mask / glare_min_rgb / glare_reject / pcd.median_glare_only` 一并移除。
+
+**产出物**（保留作证据，未删除）：
+- `/home/ywj/slam_data/pcd_time_20261119_glare/test4/{a,b}/`（变体③ 的两臂 PCD 与日志）；
+  注意目录内 `b/` 已被最后一次「恢复全局中位」重跑覆盖，变体②' 的 PCD 未单独留存。
+- 基线对照：`/home/ywj/slam_data/pcd_time_20261119_timing/test4/{a,b}/pcd/*.pcd`。
 

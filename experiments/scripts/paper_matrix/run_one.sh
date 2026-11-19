@@ -314,7 +314,10 @@ else
     if [ "$SEQ" = "ntu01" ] || [ "$SEQ" = "ntu03" ]; then
       APP_ARGS+=(-p lio.observe.degeneracy_detect_en:=true -p lio.observe.degen_trans_only:=1)
     fi
-    APP_ARGS+=("${VOVER[@]}" -p super_livo_visual.pcd.save_dir:="$OUT/pcd")
+    # 端到端延时统计（[Img->VisCloud] / [Img->VisOdom]）：yaml 里默认关闭，
+    # 跑批统一开启，与主干 [Lidar->Odom] 同口径写进 node.log 的 run time 报告。
+    APP_ARGS+=("${VOVER[@]}" -p super_livo_visual.pcd.save_dir:="$OUT/pcd"
+               -p super_livo_visual.timing:=true)
     ros2 run "$NODE_PKG" "$NODE_EXE" "${APP_ARGS[@]}" > "$OUT/node.log" 2>&1 &
     NODE_PID=$!
   else
