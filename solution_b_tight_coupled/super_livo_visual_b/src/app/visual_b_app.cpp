@@ -526,10 +526,10 @@ int main(int argc, char** argv) {
   rclcpp::on_shutdown([lio, pipeline]() {
     lio->printTimeRecord();
     if (pipeline) {
-      // bag 结束时队列里可能还有等图像/等位姿的帧，尽量补完再落盘。
+      // 先排空队列，再**同步**停机落盘：退出时的保存不能交给异步 save 线程，
+      // 长序列的大图还没写完进程就退出了，线程被杀、产物全部丢失。
       pipeline->flush();
-      pipeline->requestSaveColoredMap();
-      pipeline->flush();
+      pipeline->shutdownAndSave();
       RCLCPP_INFO(rclcpp::get_logger("visual_b_app"), "[彩色统计] %s",
                   pipeline->statsString().c_str());
     }
@@ -542,6 +542,13 @@ int main(int argc, char** argv) {
 
   // 断开钩子，避免 lio 线程在 pipeline 析构后仍访问它。
   lio->setVisualPipeline(nullptr);
+
+  // 兜底：shutdown 钩子挂在全局 context 上，与主线程的退出时序不保证有序
+  // （实测两者可能并发）。这里再同步保存一次；shutdownAndSave() 幂等且
+  // 会让后到者阻塞到落盘完成，确保进程退出前文件已经写好。
+  if (pipeline) {
+    pipeline->shutdownAndSave();
+  }
 
   rclcpp::shutdown();
   return 0;

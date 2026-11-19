@@ -124,7 +124,8 @@ esac
 
 case "$ARM" in
   a) NODE_PKG=super_livo_visual_a; NODE_EXE=visual_a_node; VCFG=$A_CFG; OWN=/super_livo_visual_a/odom ;;
-  b) NODE_PKG=super_livo_visual_b; NODE_EXE=visual_b_node; VCFG=$B_CFG; OWN=/super_livo_visual_b/odom ;;
+  # b 臂已单体化：LIO 主干与视觉支路同一进程（visual_b_app），不再单独起 super_lio_node
+  b) NODE_PKG=super_livo_visual_b; NODE_EXE=visual_b_app; VCFG=$B_CFG; OWN=/super_livo_visual_b/odom ;;
   sl) OWN=/lio/odom ;;
   fl2) OWN=/aft_mapped_to_init ;;
   *) echo "未知臂 $ARM"; exit 2 ;;
@@ -159,7 +160,7 @@ flock -n 9 || { echo "拒绝启动：$LOCK 被占用（禁止并行）"; exit 1;
 # 注意 comm 被截断成 15 字符（parameter_black），pkill -x 匹配不到，只能按命令行匹配。
 # republish 要匹配 ros2 run 的**真身** /opt/ros/humble/lib/image_transport/republish：
 # ros2 run 只是个 wrapper，杀 wrapper 不会带走它 spawn 的子进程。
-LEFTOVER_RE='/demo_nodes_cpp/parameter_[b]lackboard|super_lio_node|visual_a_node|visual_b_node|fastlivo_mapping|latency_probe|image_transport[/ ]republish|ros2 bag play|ros2 bag record'
+LEFTOVER_RE='/demo_nodes_cpp/parameter_[b]lackboard|super_lio_node|visual_a_node|visual_b_app|visual_b_node|fastlivo_mapping|latency_probe|image_transport[/ ]republish|ros2 bag play|ros2 bag record'
 pkill -f "$LEFTOVER_RE" 2>/dev/null
 for _ in $(seq 1 15); do
   pgrep -f "$LEFTOVER_RE" > /dev/null || break
@@ -301,6 +302,19 @@ else
              -p lio.map.save_map:=true -p lio.map.save_map_dir:="$OUT/pcd"
              -p lio.map.save_interval:=-1 -p lio.map.map_name:="${SEQ}_${ARM}_map.pcd"
              -p lio.ros.map_save_service_topic:=/map_save_paper)
+  elif [ "$ARM" = "b" ]; then
+    # 方案 B 已单体化（visual_b_app）：LIO 主干与视觉支路同一进程，不再单独起
+    # super_lio_node。两份 params-file 一起喂给同一节点；SLK_CFG 与 B 配置的顶层
+    # 都是 /** 通配块，所以节点名保持默认 super_lio 也能全部生效。
+    APP_ARGS=(--ros-args --params-file "$SLK_CFG" --params-file "$VCFG"
+              -p lio.sc_pgo.enable:=false -p lio.map.save_map:=false)
+    # NTU 沿用 tools/run_ntu.sh 的退化检测设置，保证与既有 A/B 结果同口径
+    if [ "$SEQ" = "ntu01" ] || [ "$SEQ" = "ntu03" ]; then
+      APP_ARGS+=(-p lio.observe.degeneracy_detect_en:=true -p lio.observe.degen_trans_only:=1)
+    fi
+    APP_ARGS+=("${VOVER[@]}" -p pcd.save_dir:="$OUT/pcd")
+    ros2 run "$NODE_PKG" "$NODE_EXE" "${APP_ARGS[@]}" > "$OUT/node.log" 2>&1 &
+    NODE_PID=$!
   else
     SL_ARGS=(--ros-args --params-file "$SLK_CFG"
              -p lio.sc_pgo.enable:=false -p lio.map.save_map:=false)
@@ -308,11 +322,9 @@ else
     if [ "$SEQ" = "ntu01" ] || [ "$SEQ" = "ntu03" ]; then
       SL_ARGS+=(-p lio.observe.degeneracy_detect_en:=true -p lio.observe.degen_trans_only:=1)
     fi
-  fi
-  ros2 run super_lio super_lio_node "${SL_ARGS[@]}" > "$OUT/backbone.log" 2>&1 &
-  NODE_PID=$!
-  sleep 6
-  if [ "$ARM" != "sl" ]; then
+    ros2 run super_lio super_lio_node "${SL_ARGS[@]}" > "$OUT/backbone.log" 2>&1 &
+    NODE_PID=$!
+    sleep 6
     ros2 run "$NODE_PKG" "$NODE_EXE" --ros-args --params-file "$VCFG" \
       "${VOVER[@]}" -p pcd.save_dir:="$OUT/pcd" > "$OUT/node.log" 2>&1 &
     NODE_PID=$!

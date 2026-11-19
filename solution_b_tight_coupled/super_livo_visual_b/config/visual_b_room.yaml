@@ -4,7 +4,8 @@
 #     --params-file $(ros2 pkg prefix super_livo_visual_b)/share/super_livo_visual_b/config/visual_b_room.yaml
 # 说明：本包默认值对应 avia + OAK（640x512、img_time_offset=0.1），
 #   直接用于 room bag 会因内参/外参不匹配导致 0 点着色。
-super_livo_visual_b:
+# 顶层用 /** 通配：单体进程里节点名是 super_lio（ROSWrapper 写死）。
+/**:
   ros__parameters:
     image_topic: /camera/color/image_raw
     cam_width: 1280

@@ -374,8 +374,10 @@ void VisualPipeline::flush() {
   InputEvent ev;
   ev.kind = InputEvent::Kind::kBarrier;
   ev.barrier = promise;
-  pushInputEvent(std::move(ev));
-  // 停机后 pushInputEvent 会丢弃事件：此时不再等待，避免死锁。
+  // 停机后 pushInputEvent 会拒收：此时不再等待（否则会白等 30 s）。
+  if (!pushInputEvent(std::move(ev))) {
+    return;
+  }
   if (future.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
     logf(LogLevel::kWarn, "flush 超时：工作线程可能已停止");
   }
@@ -462,12 +464,12 @@ void VisualPipeline::stopWorkerThreads() {
   }
 }
 
-void VisualPipeline::pushInputEvent(InputEvent event) {
+bool VisualPipeline::pushInputEvent(InputEvent event) {
   event.enqueued = std::chrono::steady_clock::now();
   {
     std::lock_guard<std::mutex> lock(input_mutex_);
     if (input_stop_) {
-      return;  // 停机后不再接收，避免向已退出的 worker 投递
+      return false;  // 停机后不再接收，避免向已退出的 worker 投递
     }
     // 上限兜底：正常情况 worker 单帧约 30 ms、输入约 213 条/秒，不会积压。
     // 真积压说明 CPU 被抢或算法退化，此时丢最旧事件以守住内存上界
@@ -480,6 +482,7 @@ void VisualPipeline::pushInputEvent(InputEvent event) {
     input_queue_.push_back(std::move(event));
   }
   input_cv_.notify_one();
+  return true;
 }
 
 void VisualPipeline::workerLoop() {
@@ -667,20 +670,30 @@ void VisualPipeline::writeColoredSnapshot(std::deque<ColorSegment> segments) {
   }
 }
 
+void VisualPipeline::shutdownAndSave() {
+  // 用 call_once 保证只执行一次：shutdown 钩子跑在信号线程，主线程在
+  // executor.spin() 返回后也会调一次，两者可能并发；后到者阻塞到这次执行
+  // 结束，从而保证进程退出前 PCD 已经写完。
+  std::call_once(shutdown_once_, [this]() {
+    // 先停线程：worker 排空输入队列后退出，落盘线程写完手上那份快照。
+    // join 之后本函数独占全部状态，下面的收尾可以直接同步调用算法。
+    stopWorkerThreads();
+    // 收尾：bag 结束时队列里可能还有等图像/等位姿的帧，尽量补完再落盘。
+    // 待处理视觉帧不会再等到位姿了，直接按最新位姿算完，保证轨迹不缺尾段。
+    for (const auto& frame : pending_visual_) {
+      processVisualFrame(frame.gray, frame.stamp);
+    }
+    pending_visual_.clear();
+    drainPendingClouds();
+    drainPendingColorization();
+    // 同步写出整张彩色地图。长序列（几百万点 + 中位数回填）要几秒，
+    // 这一步必须在本进程内完成，不能交给 save 线程（进程退出时线程被杀）。
+    saveColoredMap();
+  });
+}
+
 VisualPipeline::~VisualPipeline() {
-  // 先停线程：worker 排空输入队列后退出，落盘线程写完手上那份快照。
-  // join 之后本函数独占全部状态，下面的收尾可以直接同步调用算法。
-  stopWorkerThreads();
-  // 收尾：bag 结束时队列里可能还有等图像/等位姿的帧，尽量补完再落盘。
-  // 待处理视觉帧不会再等到位姿了，直接按最新位姿算完，保证轨迹不缺尾段。
-  for (const auto& frame : pending_visual_) {
-    processVisualFrame(frame.gray, frame.stamp);
-  }
-  pending_visual_.clear();
-  drainPendingClouds();
-  drainPendingColorization();
-  // 退出（Ctrl+C / SIGTERM）时再存一次，保证短时长运行也有结果。
-  saveColoredMap();
+  shutdownAndSave();
   probeReport();  // 收尾打一份完整探针汇总
 }
 

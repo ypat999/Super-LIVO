@@ -123,6 +123,10 @@ class VisualPipeline {
   void requestSaveColoredMap();
   /// 等待已入队事件全部处理完（用于退出前补完尾段）。
   void flush();
+  /// 停机并**同步**写出最终彩色地图（幂等，可重复调用）。
+  /// 退出前必须调用：异步 save 线程会随进程结束被直接杀掉，长序列上
+  /// 大图还没写完进程就退出了，产物会整个丢失。
+  void shutdownAndSave();
   /// 彩色/队列统计（退出打印）。
   std::string statsString() const;
 
@@ -426,7 +430,7 @@ class VisualPipeline {
 
   void startWorkerThreads();
   void stopWorkerThreads();
-  void pushInputEvent(InputEvent event);
+  bool pushInputEvent(InputEvent event);
   void workerLoop();
   void saveLoop();
 
@@ -454,6 +458,9 @@ class VisualPipeline {
   std::thread save_thread_;
   pcl::PointCloud<pcl::PointXYZRGB> save_buffer_;
   std::shared_ptr<colorizer::VoxelColorMedian> save_median_;
+  /// shutdownAndSave() 只执行一次；并发调用者（shutdown 钩子 / 主线程 /
+  /// 析构）会阻塞到那次执行完成，保证进程退出前文件已落盘。
+  std::once_flag shutdown_once_;
 
   // ---- 探针 ----
   void probeMaybeReport();

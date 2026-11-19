@@ -1,6 +1,7 @@
 # RTK-SLAM construction_seq2（Livox Mid-360 CustomMsg + 1600x1200 压缩相机）——方案 B 相机参数。
 # 外参与 visual_a_rtk.yaml 同源（T_cam_lidar 转置），仅保留 B 支路需要的字段。
-super_livo_visual_b:
+# 顶层用 /** 通配：单体进程里节点名是 super_lio（ROSWrapper 写死）。
+/**:
   ros__parameters:
     image_topic: /camera/image_raw
     imu_topic: /livox/imu

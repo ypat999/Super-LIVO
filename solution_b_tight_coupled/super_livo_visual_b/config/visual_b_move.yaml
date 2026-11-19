@@ -8,7 +8,9 @@
 #
 # 注意：paper_matrix 的 move 序列回放的是 move_ros2（图像 header 为主机时钟），
 #   启动命令用 `-p img_time_offset:=-204262818.9974` 覆盖本文件的 0.0。
-super_livo_visual_b:
+# 顶层用 /** 通配：单体进程里节点名是 super_lio（ROSWrapper 写死），
+# 写成 super_livo_visual_b 时用 ros2 run 起会整块不生效。
+/**:
   ros__parameters:
     image_topic: /left_camera/image
     imu_topic: /livox/imu
