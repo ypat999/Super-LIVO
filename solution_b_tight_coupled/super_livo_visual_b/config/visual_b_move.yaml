@@ -1,8 +1,8 @@
 # move bag（1280x1024 bgr8 全局快门相机 + Livox CustomMsg）——方案 B 支路参数。
 # 外参 Rcl/Pcl 由 FAST-Calib 标定结果回填（标定 bag：livo_bag/all_ros2，RMSE 7.9 mm）。
 #
-# 用法（paper_matrix 口径：LIO 单独进程 + 本节点订阅其 /lio/odom）：
-#   ros2 run super_livo_visual_b visual_b_node --ros-args \
+# 用法（paper_matrix 口径：方案 B 单体，同一进程内运行 LIO 与视觉支路）：
+#   ros2 run super_livo_visual_b visual_b_app --ros-args \
 #     --params-file third_party/Super-LIO/src/super_lio/config/livox_360.yaml \
 #     --params-file solution_b_tight_coupled/super_livo_visual_b/config/visual_b_move.yaml
 #

@@ -1,4 +1,7 @@
-#include "super_livo_visual_b/node/visual_b_node.hpp"
+#include "super_livo_visual_b/pipeline/visual_pipeline.hpp"
+
+#include <cstdarg>
+#include <cstdio>
 
 #include <algorithm>
 #include <chrono>
@@ -10,9 +13,7 @@
 #include <limits>
 #include <memory>
 
-#include <cv_bridge/cv_bridge.h>
 #include <opencv2/calib3d.hpp>
-#include <pcl_conversions/pcl_conversions.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
@@ -56,6 +57,13 @@ constexpr double kPendingCloudTimeoutSec = 1.0;
 
 /// 标准重力幅值（m/s²），用于把加计归一化到 m/s²（对齐官方 G_m_s2）。
 constexpr double kGravityNorm = 9.81;
+
+/// 单调时钟秒（退化签名的到达时刻；与 ROS 时间无关）。
+double steadyNowSec() {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 /// W3 视觉本征噪声（相机系，rad²）：§36.12 的实测协方差（350–500 s 段，跨段复用）。
 /// 主轴 σ = [0.0235, 0.0278, 0.0567]°，floor 0.02°；与 §36.14 离线回放的
@@ -130,14 +138,6 @@ bool poseFromSamples(const std::vector<colorizer::PoseSample>& cache, double sta
   T_wl.block<3, 3>(0, 0) = q.normalized().toRotationMatrix();
   T_wl.block<3, 1>(0, 3) = t;
   return true;
-}
-
-/// double 秒 -> ROS 时间戳。
-builtin_interfaces::msg::Time toRosStamp(double sec) {
-  builtin_interfaces::msg::Time stamp;
-  stamp.sec = static_cast<int32_t>(std::floor(sec));
-  stamp.nanosec = static_cast<uint32_t>((sec - static_cast<double>(stamp.sec)) * 1e9);
-  return stamp;
 }
 
 /// so(3) 反对称矩阵。
@@ -271,142 +271,176 @@ void probeHeaderSpan(ProbeAcc& acc, double& first, double& last, double stamp) {
 }
 }  // namespace
 
-VisualBNode::VisualBNode(const rclcpp::NodeOptions& options)
-    : Node("super_livo_visual_b", options) {
-  // ---- 先声明 topic 参数（订阅/发布器创建前需要） -------------------------
-  const std::string image_topic = this->declare_parameter<std::string>("image_topic", "/left_camera/image");
-  // 默认用 10 Hz 的 /lio/odom（激光帧后验、带协方差），与 A 一致。
-  // 注意它发布的是 base_link（robot body）系 —— Super-LIO 对它施加了
-  // lio.extrinsic.odom_robo —— 所以 onOdom 里要先用 T_imu_robo_⁻¹ 换回 IMU 系
-  // （外参由 app 从 LIO 同一份参数里取，见 setOdomBodyExtrinsic）。
-  // 旧默认 lio/imu/odom 是 200 Hz 的 IMU 系传播结果，两者只差这个外参。
-  const std::string odom_topic =
-      this->declare_parameter<std::string>("odom_topic", "lio/odom");
-  const std::string cloud_topic = this->declare_parameter<std::string>("cloud_topic", "lio/cloud_world");
-  const std::string body_cloud_topic =
-      this->declare_parameter<std::string>("body_cloud_topic", "lio/cloud_body_dense");
-  const std::string imu_topic = this->declare_parameter<std::string>("imu_topic", "/livox/imu");
-
-  // ---- 创建订阅器 ---------------------------------------------------------
-  // 图像订阅 QoS 默认 reliable/depth 10，与 Rosbag2 回放端（以及 FL2 的 reliable 订阅）一致。
-  // 实测本机（WSL2，rmem_max=208 KB 且无 root）用 best_effort 订阅 4 MB 级原图时，
-  // 只要该订阅存在，整条图像流就被拖到 ~0.35 Hz（并行的 reliable 计数订阅也一起掉），
-  // B 臂因此拿不到图；调大 DefragUnreliableMaxSamples 无效。
-  // 若真实相机驱动发布 best_effort，需把 image.qos_reliable 设为 false。
-  const bool image_qos_reliable =
-      this->declare_parameter<bool>("image.qos_reliable", true);
-  // 回调侧一律只投递事件到 input_queue_（见 hpp "线程化"段），真正的解析与估计
-  // 在计算工作线程里按到达顺序执行，因此下面的 std::bind(&VisualBNode::onXxx)
-  // 已不再是 executor 回调，而是 workerLoop 的分派目标。
-  if (image_qos_reliable) {
-    image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-        image_topic, rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
-        [this](const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
-          InputEvent ev;
-          ev.kind = InputEvent::Kind::kImage;
-          ev.image = msg;
-          this->pushInputEvent(std::move(ev));
-        });
-  } else {
-    image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-        image_topic, rclcpp::SensorDataQoS(),
-        [this](const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
-          InputEvent ev;
-          ev.kind = InputEvent::Kind::kImage;
-          ev.image = msg;
-          this->pushInputEvent(std::move(ev));
-        });
-  }
-  odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-      odom_topic, rclcpp::SensorDataQoS(),
-      [this](const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
-        InputEvent ev;
-        ev.kind = InputEvent::Kind::kOdom;
-        ev.odom = msg;
-        this->pushInputEvent(std::move(ev));
-      });
-  cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      cloud_topic, rclcpp::SensorDataQoS(),
-      [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
-        InputEvent ev;
-        ev.kind = InputEvent::Kind::kCloud;
-        ev.cloud = msg;
-        this->pushInputEvent(std::move(ev));
-      });
-  // body 云发布端 QoS 不统一：FL2 是 reliable，Super-LIO 的 lio/cloud_body_dense 是 best_effort。
-  // 订阅端取更宽松的 best_effort 才能同时兼容两者；用 reliable 订阅 best_effort 发布端时
-  // 两端 QoS 不兼容，DDS 直接不投递（实测只有一条 "offering incompatible QoS" 警告，整段 0 帧）。
-  body_cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      body_cloud_topic, rclcpp::QoS(rclcpp::KeepLast(50)).best_effort(),
-      [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
-        InputEvent ev;
-        ev.kind = InputEvent::Kind::kBodyCloud;
-        ev.cloud = msg;
-        this->pushInputEvent(std::move(ev));
-      });
-  imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
-      imu_topic, rclcpp::SensorDataQoS(),
-      [this](const sensor_msgs::msg::Imu::ConstSharedPtr& msg) {
-        InputEvent ev;
-        ev.kind = InputEvent::Kind::kImu;
-        ev.imu = msg;
-        this->pushInputEvent(std::move(ev));
-      });
-  degen_topic_ = this->declare_parameter<std::string>("degen_topic", "lio/degeneracy");
-  degen_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
-      degen_topic_,
-      rclcpp::SensorDataQoS(),
-      std::bind(&VisualBNode::onDegeneracy, this, std::placeholders::_1));
-
-  // ---- 创建发布器 ---------------------------------------------------------
-  colored_cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-      "super_livo_visual_b/colored_cloud", rclcpp::SensorDataQoS());
-  odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>(
-      "super_livo_visual_b/odom", rclcpp::SensorDataQoS());
-  path_pub_ = this->create_publisher<nav_msgs::msg::Path>(
-      "super_livo_visual_b/path", rclcpp::SensorDataQoS());
-  // 旋转精修通道（默认不发布内容；rot_refine.enable=false 时该话题无数据）。
-  odom_rot_refined_pub_ = this->create_publisher<nav_msgs::msg::Odometry>(
-      "super_livo_visual_b/odom_rot_refined", rclcpp::SensorDataQoS());
-
+VisualPipeline::VisualPipeline(ParamSource& params,
+                               std::shared_ptr<ConstraintBridge> bridge)
+    : params_(params), bridge_(std::move(bridge)) {
   loadParameters();
-
-  // 周期性把累积的彩色地图落盘（覆盖写同一个文件）。
-  // 定时器回调只投递一个 kSaveSnapshot 事件：原先在这里同步 saveColoredMap()，
-  // 实测一次阻塞 855~980 ms（NTU 4M 点曾到 ~25 s），期间所有图像/IMU/odom 回调
-  // 停摆、pending_visual_ 溢出丢帧。现在序列化与写盘都在独立落盘线程上。
-  // 需要对 odom 精度做评测时把 pcd.save_interval_sec 设成 <=0，只在退出时存一次。
-  if (pcd_save_interval_sec_ > 0.0) {
-    pcd_save_timer_ = this->create_wall_timer(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::duration<double>(pcd_save_interval_sec_)),
-        [this]() {
-          InputEvent ev;
-          ev.kind = InputEvent::Kind::kSaveSnapshot;
-          this->pushInputEvent(std::move(ev));
-        });
-  }
-
-  path_msg_.header.frame_id = "world";
   startWorkerThreads();
-  // 启动自检：确认 YAML 分支参数确实注入到本节点（分支式配置最容易静默失效）。
-  RCLCPP_INFO(this->get_logger(),
-              "VisualBNode 初始化完成：相机 %dx%d fx=%.2f fy=%.2f cx=%.2f cy=%.2f "
-              "img_time_offset=%.3f pcd=%s",
-              intrinsics_.width, intrinsics_.height, intrinsics_.fx, intrinsics_.fy,
-              intrinsics_.cx, intrinsics_.cy, img_time_offset_, pcd_save_dir_.c_str());
+  // 启动自检：确认参数确实注入（分支式配置最容易静默失效）。
+  logf(LogLevel::kInfo,
+       "VisualPipeline 初始化完成：相机 %dx%d fx=%.2f fy=%.2f cx=%.2f cy=%.2f "
+       "img_time_offset=%.3f pcd=%s",
+       intrinsics_.width, intrinsics_.height, intrinsics_.fx, intrinsics_.fy,
+       intrinsics_.cx, intrinsics_.cy, img_time_offset_, pcd_save_dir_.c_str());
+}
+
+// ===========================================================================
+// 对外接口：输入 -> 队列，输出 -> 回调
+// ===========================================================================
+
+void VisualPipeline::setColoredCloudCallback(ColoredCloudCallback cb) {
+  colored_cb_ = std::move(cb);
+}
+
+void VisualPipeline::setOdomCallback(OdomCallback cb) {
+  odom_cb_ = std::move(cb);
+}
+
+void VisualPipeline::setRotRefinedOdomCallback(OdomCallback cb) {
+  rot_odom_cb_ = std::move(cb);
+}
+
+void VisualPipeline::setLogCallback(LogCallback cb) {
+  log_cb_ = std::move(cb);
+}
+
+void VisualPipeline::submitImage(const cv::Mat& bgr, double stamp) {
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kImage;
+  ev.image = bgr;
+  ev.stamp = stamp;
+  pushInputEvent(std::move(ev));
+}
+
+void VisualPipeline::submitOdom(const Eigen::Matrix4d& T_w, double stamp) {
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kOdom;
+  ev.T = T_w;
+  ev.stamp = stamp;
+  pushInputEvent(std::move(ev));
+}
+
+void VisualPipeline::submitCamOdom(const Eigen::Matrix4d& T_w, double stamp) {
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kCamOdom;
+  ev.T = T_w;
+  ev.stamp = stamp;
+  pushInputEvent(std::move(ev));
+}
+
+void VisualPipeline::submitWorldCloud(const std::vector<Eigen::Vector3d>& points_world) {
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kCloud;
+  ev.points_world = points_world;
+  pushInputEvent(std::move(ev));
+}
+
+void VisualPipeline::submitBodyCloud(const std::vector<Eigen::Vector3f>& points_lidar,
+                                     double stamp) {
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kBodyCloud;
+  ev.points_body = points_lidar;
+  ev.stamp = stamp;
+  pushInputEvent(std::move(ev));
+}
+
+void VisualPipeline::submitImu(const Eigen::Vector3d& acc, const Eigen::Vector3d& gyro,
+                               double stamp) {
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kImu;
+  ev.acc = acc;
+  ev.gyro = gyro;
+  ev.stamp = stamp;
+  pushInputEvent(std::move(ev));
+}
+
+void VisualPipeline::submitDegeneracy(
+    const superlivo_common::DegeneracySignature& sig) {
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kDegeneracy;
+  ev.degen = sig;
+  pushInputEvent(std::move(ev));
+}
+
+void VisualPipeline::requestSaveColoredMap() {
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kSaveSnapshot;
+  pushInputEvent(std::move(ev));
+}
+
+void VisualPipeline::flush() {
+  auto promise = std::make_shared<std::promise<void>>();
+  auto future = promise->get_future();
+  InputEvent ev;
+  ev.kind = InputEvent::Kind::kBarrier;
+  ev.barrier = promise;
+  pushInputEvent(std::move(ev));
+  // 停机后 pushInputEvent 会丢弃事件：此时不再等待，避免死锁。
+  if (future.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+    logf(LogLevel::kWarn, "flush 超时：工作线程可能已停止");
+  }
+}
+
+std::string VisualPipeline::statsString() const {
+  char buf[512];
+  std::snprintf(
+      buf, sizeof(buf),
+      "彩色帧=%zu 丢(无图)=%zu 丢(无位姿)=%zu 延后=%zu 输入丢弃=%zu "
+      "地图点=%zu 姿态帧=%zu 可用=%zu",
+      stat_colored_frames_, stat_drop_no_image_, stat_drop_pose_,
+      stat_deferred_, stat_input_dropped_.load(std::memory_order_relaxed),
+      map_points_.size(), stat_rot_frames_, stat_rot_usable_);
+  return std::string(buf);
+}
+
+// ---- 日志 ----
+void VisualPipeline::logf(LogLevel level, const char* fmt, ...) const {
+  char buf[2048];
+  va_list args;
+  va_start(args, fmt);
+  std::vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  if (log_cb_) {
+    log_cb_(level, std::string(buf));
+  }
+}
+
+void VisualPipeline::logfThrottled(LogLevel level, int period_ms, const char* fmt, ...) const {
+  if (period_ms > 0) {
+    // 以格式串地址作为调用点标识（与 RCLCPP_*_THROTTLE 的按调用点节流等价）。
+    static std::mutex throttle_mutex;
+    static std::unordered_map<std::string, std::chrono::steady_clock::time_point> last;
+    const std::string key = fmt;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(throttle_mutex);
+    auto it = last.find(key);
+    if (it != last.end() &&
+        std::chrono::duration<double, std::milli>(now - it->second).count() <
+            static_cast<double>(period_ms)) {
+      return;
+    }
+    last[key] = now;
+  }
+  char buf[2048];
+  va_list args;
+  va_start(args, fmt);
+  std::vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  if (log_cb_) {
+    log_cb_(level, std::string(buf));
+  }
 }
 
 // ===========================================================================
 // 线程化设施（分工与理由见 hpp "线程化：IO 与计算互不阻塞"段）
 // ===========================================================================
 
-void VisualBNode::startWorkerThreads() {
-  save_thread_ = std::thread(&VisualBNode::saveLoop, this);
-  worker_ = std::thread(&VisualBNode::workerLoop, this);
+void VisualPipeline::startWorkerThreads() {
+  save_thread_ = std::thread(&VisualPipeline::saveLoop, this);
+  worker_ = std::thread(&VisualPipeline::workerLoop, this);
 }
 
-void VisualBNode::stopWorkerThreads() {
+void VisualPipeline::stopWorkerThreads() {
   {
     std::lock_guard<std::mutex> lock(input_mutex_);
     if (input_stop_) {
@@ -428,7 +462,7 @@ void VisualBNode::stopWorkerThreads() {
   }
 }
 
-void VisualBNode::pushInputEvent(InputEvent event) {
+void VisualPipeline::pushInputEvent(InputEvent event) {
   event.enqueued = std::chrono::steady_clock::now();
   {
     std::lock_guard<std::mutex> lock(input_mutex_);
@@ -448,7 +482,7 @@ void VisualBNode::pushInputEvent(InputEvent event) {
   input_cv_.notify_one();
 }
 
-void VisualBNode::workerLoop() {
+void VisualPipeline::workerLoop() {
   for (;;) {
     InputEvent ev;
     {
@@ -496,25 +530,33 @@ void VisualBNode::workerLoop() {
     const auto handler_begin = std::chrono::steady_clock::now();
     switch (ev.kind) {
       case InputEvent::Kind::kImage:
-        onImage(ev.image);
+        onImage(ev.image, ev.stamp);
         break;
       case InputEvent::Kind::kOdom:
-        onOdom(ev.odom);
+        onOdom(ev.T, ev.stamp);
         break;
       case InputEvent::Kind::kCamOdom:
-        onCamOdom(ev.odom);
+        onCamOdom(ev.T, ev.stamp);
         break;
       case InputEvent::Kind::kCloud:
-        onCloud(ev.cloud);
+        onCloud(ev.points_world);
         break;
       case InputEvent::Kind::kBodyCloud:
-        onBodyCloud(ev.cloud);
+        onBodyCloud(ev.points_body, ev.stamp);
         break;
       case InputEvent::Kind::kImu:
-        onImu(ev.imu);
+        onImu(ev.acc, ev.gyro, ev.stamp);
+        break;
+      case InputEvent::Kind::kDegeneracy:
+        onDegeneracy(ev.degen);
         break;
       case InputEvent::Kind::kSaveSnapshot:
         requestColoredMapSave();
+        break;
+      case InputEvent::Kind::kBarrier:
+        if (ev.barrier) {
+          ev.barrier->set_value();
+        }
         break;
       case InputEvent::Kind::kQuit:
         return;
@@ -524,7 +566,7 @@ void VisualBNode::workerLoop() {
   }
 }
 
-void VisualBNode::saveLoop() {
+void VisualPipeline::saveLoop() {
   for (;;) {
     std::deque<ColorSegment> segments;
     {
@@ -543,7 +585,7 @@ void VisualBNode::saveLoop() {
   }
 }
 
-void VisualBNode::requestColoredMapSave() {
+void VisualPipeline::requestColoredMapSave() {
   const std::size_t n = colored_map_.size();
   if (n <= save_handed_points_) {
     return;  // 无新增
@@ -574,11 +616,11 @@ void VisualBNode::requestColoredMapSave() {
   probeMaybeReport();
 }
 
-void VisualBNode::writeColoredSnapshot(std::deque<ColorSegment> segments) {
+void VisualPipeline::writeColoredSnapshot(std::deque<ColorSegment> segments) {
   std::error_code ec;
   std::filesystem::create_directories(pcd_save_dir_, ec);
   if (ec) {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+    logfThrottled(LogLevel::kWarn, 5000,
                          "无法创建 PCD 输出目录 %s: %s", pcd_save_dir_.c_str(),
                          ec.message().c_str());
     return;
@@ -616,16 +658,16 @@ void VisualBNode::writeColoredSnapshot(std::deque<ColorSegment> segments) {
   save_buffer_.height = 1;
   save_buffer_.is_dense = false;
   if (pcl::io::savePCDFileBinary(path, save_buffer_) == 0) {
-    RCLCPP_INFO(this->get_logger(), "彩色地图已保存: %s（%zu 点，世界系%s）", path.c_str(),
+    logf(LogLevel::kInfo, "彩色地图已保存: %s（%zu 点，世界系%s）", path.c_str(),
                 save_buffer_.size(),
                 (save_median_ && save_median_->enabled()) ? "，时间中位数回填色" : "");
   } else {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+    logfThrottled(LogLevel::kWarn, 5000,
                          "保存 PCD 失败: %s", path.c_str());
   }
 }
 
-VisualBNode::~VisualBNode() {
+VisualPipeline::~VisualPipeline() {
   // 先停线程：worker 排空输入队列后退出，落盘线程写完手上那份快照。
   // join 之后本函数独占全部状态，下面的收尾可以直接同步调用算法。
   stopWorkerThreads();
@@ -637,21 +679,21 @@ VisualBNode::~VisualBNode() {
   pending_visual_.clear();
   drainPendingClouds();
   drainPendingColorization();
-  // 退出（Ctrl+C / SIGTERM 触发 rclcpp::spin 返回）时再存一次，保证短时长运行也有结果。
+  // 退出（Ctrl+C / SIGTERM）时再存一次，保证短时长运行也有结果。
   saveColoredMap();
   probeReport();  // 收尾打一份完整探针汇总
 }
 
-void VisualBNode::loadParameters() {
+void VisualPipeline::loadParameters() {
   // ---- 相机内参与畸变（同方案 A，来自 camera_pinhole.yaml） --------------
-  scale_ = this->declare_parameter<double>("scale", 0.5);
-  intrinsics_.width = this->declare_parameter<int>("cam_width", 640);
-  intrinsics_.height = this->declare_parameter<int>("cam_height", 512);
-  intrinsics_.fx = this->declare_parameter<double>("cam_fx", 646.78);
-  intrinsics_.fy = this->declare_parameter<double>("cam_fy", 646.66);
-  intrinsics_.cx = this->declare_parameter<double>("cam_cx", 313.46);
-  intrinsics_.cy = this->declare_parameter<double>("cam_cy", 261.40);
-  distortion_ = this->declare_parameter<std::vector<double>>(
+  scale_ = params_.getDouble("scale", 0.5);
+  intrinsics_.width = params_.getInt("cam_width", 640);
+  intrinsics_.height = params_.getInt("cam_height", 512);
+  intrinsics_.fx = params_.getDouble("cam_fx", 646.78);
+  intrinsics_.fy = params_.getDouble("cam_fy", 646.66);
+  intrinsics_.cx = params_.getDouble("cam_cx", 313.46);
+  intrinsics_.cy = params_.getDouble("cam_cy", 261.40);
+  distortion_ = params_.getDoubleArray(
       "cam_d", std::vector<double>{-0.076160, 0.123001, -0.00113, 0.000251});
 
   // ---- 外参：Camera->LiDAR（Rcl/Pcl）与 LiDAR->IMU（可选） ----------------
@@ -661,60 +703,71 @@ void VisualBNode::loadParameters() {
   T_li_ = Eigen::Matrix4d::Identity();
 
   // LiDAR 先验强度（D2）：先验越小越"信任" lio/odom，视觉修正越弱。
-  prior_pos_sigma_ = this->declare_parameter<double>("lv.prior_pos_sigma", 0.05);
-  prior_rot_sigma_ = this->declare_parameter<double>("lv.prior_rot_sigma", 0.02);
-  prior_vel_sigma_ = this->declare_parameter<double>("lv.prior_vel_sigma", 0.25);
+  prior_pos_sigma_ = params_.getDouble("lv.prior_pos_sigma", 0.05);
+  prior_rot_sigma_ = params_.getDouble("lv.prior_rot_sigma", 0.02);
+  prior_vel_sigma_ = params_.getDouble("lv.prior_vel_sigma", 0.25);
   // 退化感知先验：退化方向松开、垂直方向收紧（详见头文件注释）
   prior_directional_en_ =
-      this->declare_parameter<bool>("lv.prior_directional_en", true);
+      params_.getBool("lv.prior_directional_en", true);
   prior_pos_sigma_healthy_ =
-      this->declare_parameter<double>("lv.prior_pos_sigma_healthy", 0.005);
+      params_.getDouble("lv.prior_pos_sigma_healthy", 0.005);
   prior_pos_sigma_degen_ =
-      this->declare_parameter<double>("lv.prior_pos_sigma_degen", 1.0);
+      params_.getDouble("lv.prior_pos_sigma_degen", 1.0);
   // sev 对数映射标尺（本数据集实测）：健康段 cond_t≈25-40，必须映射为 sev≈0，
   // 否则先验在健康段就被无端松开一半（旧默认 10/100 使 cond_t=33 映射成 0.5）。
   // 完全退化（n_effect=0，cond=1e12）由 axes/active 硬触发直接置 1，不走该映射。
-  gate_cond_lo_ = this->declare_parameter<double>(
+  gate_cond_lo_ = params_.getDouble(
       "gate.cond_lo", superlivo_common::DegeneracyScale{}.cond_lo);
-  gate_cond_hi_ = this->declare_parameter<double>(
+  gate_cond_hi_ = params_.getDouble(
       "gate.cond_hi", superlivo_common::DegeneracyScale{}.cond_hi);
-  degen_timeout_ = this->declare_parameter<double>(
+  degen_timeout_ = params_.getDouble(
       "gate.degen_timeout", superlivo_common::DegeneracyScale{}.timeout_sec);
 
   // 退化段守卫（Trust + 速度限幅）
-  guard_enable_ = this->declare_parameter<bool>("guard.enable", true);
-  guard_lio_jump_pos_ = this->declare_parameter<double>("guard.lio_jump_pos", 1.0);
-  guard_lio_jump_rot_ = this->declare_parameter<double>("guard.lio_jump_rot", 0.2618);
-  guard_sev_threshold_ = this->declare_parameter<double>("guard.sev_threshold", 0.9);
-  guard_vel_ratio_ = this->declare_parameter<double>("guard.vel_ratio", 1.5);
-  guard_vel_fallback_ = this->declare_parameter<double>("guard.vel_fallback", 3.0);
-  guard_vel_abs_cap_ = this->declare_parameter<double>("guard.vel_abs_cap", 3.0);
+  guard_enable_ = params_.getBool("guard.enable", true);
+  guard_lio_jump_pos_ = params_.getDouble("guard.lio_jump_pos", 1.0);
+  guard_lio_jump_rot_ = params_.getDouble("guard.lio_jump_rot", 0.2618);
+  guard_sev_threshold_ = params_.getDouble("guard.sev_threshold", 0.9);
+  guard_vel_ratio_ = params_.getDouble("guard.vel_ratio", 1.5);
+  guard_vel_fallback_ = params_.getDouble("guard.vel_fallback", 3.0);
+  guard_vel_abs_cap_ = params_.getDouble("guard.vel_abs_cap", 3.0);
 
   // 默认值与官方 avia.yaml 一致（0.1 s），本数据集已通过 offset 扫描验证最优。
-  img_time_offset_ = this->declare_parameter<double>("img_time_offset", 0.1);
+  img_time_offset_ = params_.getDouble("img_time_offset", 0.1);
+
+  // 启动时间对齐：off = −(D + a)，D 由 IMU 桥每次会话现测，a 为相机打戳延迟标定值。
+  // align.enable=false 时退回上面手填的 img_time_offset。
+  align_enable_ = params_.getBool("align.enable", true);
+  align_samples_ = static_cast<std::size_t>(
+      params_.getInt("align.samples", 20));
+  align_window_ms_ = params_.getDouble("align.window_ms", 50.0);
+  align_img_stamp_latency_s_ =
+      params_.getDouble("align.img_stamp_latency_s", 0.111);
+  align_clock_lag_max_s_ = params_.getDouble("align.clock_lag_max_s", 2.0);
+  align_timeout_s_ = params_.getDouble("align.timeout_s", 10.0);
 
   // ---- 前端 PatchTracker --------------------------------------------------
-  patch_options_.patch_size = this->declare_parameter<int>("patch.patch_size", 5);
-  patch_options_.pyramid_levels = this->declare_parameter<int>("patch.pyramid_levels", 4);
-  patch_options_.max_features = this->declare_parameter<int>("patch.max_features", 200);
-  patch_options_.lssd_threshold = this->declare_parameter<double>("patch.lssd_threshold", 0.5);
-  patch_options_.min_distance = this->declare_parameter<double>("patch.min_distance", 8.0);
-  patch_options_.quality_level = this->declare_parameter<double>("patch.quality_level", 0.01);
-  patch_options_.use_lssd = this->declare_parameter<bool>("patch.use_lssd", true);
-  patch_options_.search_radius = this->declare_parameter<int>("patch.search_radius", 4);
+  patch_options_.patch_size = params_.getInt("patch.patch_size", 5);
+  patch_options_.pyramid_levels = params_.getInt("patch.pyramid_levels", 4);
+  patch_options_.max_features = params_.getInt("patch.max_features", 200);
+  patch_options_.lssd_threshold = params_.getDouble("patch.lssd_threshold", 0.5);
+  patch_options_.min_distance = params_.getDouble("patch.min_distance", 8.0);
+  patch_options_.quality_level = params_.getDouble("patch.quality_level", 0.01);
+  patch_options_.use_lssd = params_.getBool("patch.use_lssd", true);
+  patch_options_.search_radius = params_.getInt("patch.search_radius", 4);
   frontend_ = std::make_unique<PatchTracker>(patch_options_);
 
   // ---- 特征生命周期 FeatureLifecycle --------------------------------------
-  lifecycle_options_.mature_observations = this->declare_parameter<int>("lifecycle.mature_observations", 4);
-  lifecycle_options_.max_failures = this->declare_parameter<int>("lifecycle.max_failures", 2);
-  lifecycle_options_.max_track_length = this->declare_parameter<int>("lifecycle.max_track_length", 30);
+  lifecycle_options_.mature_observations = params_.getInt("lifecycle.mature_observations", 4);
+  lifecycle_options_.max_failures = params_.getInt("lifecycle.max_failures", 2);
+  lifecycle_options_.max_track_length = params_.getInt("lifecycle.max_track_length", 30);
   lifecycle_ = std::make_unique<FeatureLifecycle>(lifecycle_options_);
 
   // ---- 关键帧管理 KeyframeManager -----------------------------------------
-  keyframe_options_.max_keyframes = this->declare_parameter<int>("kf.max_keyframes", 20);
-  keyframe_options_.min_translation = this->declare_parameter<double>("kf.min_translation", 0.15);
-  keyframe_options_.min_rotation_deg = this->declare_parameter<double>("kf.min_rotation_deg", 5.0);
-  keyframe_options_.min_tracked_features = this->declare_parameter<int>("kf.min_tracked_features", 40);
+  keyframe_options_.max_keyframes = params_.getInt("kf.max_keyframes", 20);
+  keyframe_options_.min_translation = params_.getDouble("kf.min_translation", 0.15);
+  keyframe_options_.min_rotation_deg = params_.getDouble("kf.min_rotation_deg", 5.0);
+  keyframe_options_.min_tracked_features = params_.getInt("kf.min_tracked_features", 40);
   keyframe_manager_ = std::make_unique<KeyframeManager>(keyframe_options_);
 
   // ---- 2D-3D 约束 LidarVisualConstraint -----------------------------------
@@ -724,17 +777,17 @@ void VisualBNode::loadParameters() {
   lidar_visual_options_.cy = intrinsics_.cy;
   lidar_visual_options_.image_width = intrinsics_.width;
   lidar_visual_options_.image_height = intrinsics_.height;
-  lidar_visual_options_.pixel_radius = this->declare_parameter<int>("lv.pixel_radius", 3);
-  lidar_visual_options_.huber_delta = this->declare_parameter<double>("lv.huber_delta", 1.0);
-  lidar_visual_options_.min_constraints = this->declare_parameter<int>("lv.min_constraints", 8);
-  lidar_visual_options_.max_pixel_error = this->declare_parameter<double>("lv.max_pixel_error", 8.0);
+  lidar_visual_options_.pixel_radius = params_.getInt("lv.pixel_radius", 3);
+  lidar_visual_options_.huber_delta = params_.getDouble("lv.huber_delta", 1.0);
+  lidar_visual_options_.min_constraints = params_.getInt("lv.min_constraints", 8);
+  lidar_visual_options_.max_pixel_error = params_.getDouble("lv.max_pixel_error", 8.0);
   lidar_visual_options_.max_pixel_error_anchored =
-      this->declare_parameter<double>("lv.max_pixel_error_anchored", 60.0);
+      params_.getDouble("lv.max_pixel_error_anchored", 60.0);
   // 测量噪声模型：没有它等价于 σ=1 px 且地图点无误差，一帧即可压塌协方差。
-  lidar_visual_options_.sigma_pix = this->declare_parameter<double>("lv.sigma_pix", 1.5);
-  lidar_visual_options_.sigma_anchor = this->declare_parameter<double>("lv.sigma_anchor", 0.05);
+  lidar_visual_options_.sigma_pix = params_.getDouble("lv.sigma_pix", 1.5);
+  lidar_visual_options_.sigma_anchor = params_.getDouble("lv.sigma_anchor", 0.05);
   lidar_visual_options_.anchor_keep_sec =
-      this->declare_parameter<double>("lv.anchor_keep_sec", 20.0);
+      params_.getDouble("lv.anchor_keep_sec", 20.0);
   lidar_visual_ = std::make_unique<LidarVisualConstraint>(lidar_visual_options_);
 
   // ---- MSCKF 多帧约束 MsckfConstraint -------------------------------------
@@ -742,13 +795,13 @@ void VisualBNode::loadParameters() {
   msckf_options_.fy = intrinsics_.fy;
   msckf_options_.cx = intrinsics_.cx;
   msckf_options_.cy = intrinsics_.cy;
-  msckf_options_.min_observations = this->declare_parameter<int>("msckf.min_observations", 4);
-  msckf_options_.max_track_length = this->declare_parameter<int>("msckf.max_track_length", 20);
-  msckf_options_.min_parallax_deg = this->declare_parameter<double>("msckf.min_parallax_deg", 1.0);
-  msckf_options_.huber_delta = this->declare_parameter<double>("msckf.huber_delta", 1.0);
-  msckf_options_.use_nullspace_projection = this->declare_parameter<bool>("msckf.use_nullspace_projection", true);
-  msckf_options_.sigma_pix = this->declare_parameter<double>("msckf.sigma_pix", 1.5);
-  msckf_options_.sigma_track_pose = this->declare_parameter<double>("msckf.sigma_track_pose", 0.05);
+  msckf_options_.min_observations = params_.getInt("msckf.min_observations", 4);
+  msckf_options_.max_track_length = params_.getInt("msckf.max_track_length", 20);
+  msckf_options_.min_parallax_deg = params_.getDouble("msckf.min_parallax_deg", 1.0);
+  msckf_options_.huber_delta = params_.getDouble("msckf.huber_delta", 1.0);
+  msckf_options_.use_nullspace_projection = params_.getBool("msckf.use_nullspace_projection", true);
+  msckf_options_.sigma_pix = params_.getDouble("msckf.sigma_pix", 1.5);
+  msckf_options_.sigma_track_pose = params_.getDouble("msckf.sigma_track_pose", 0.05);
   msckf_ = std::make_unique<MsckfConstraint>(msckf_options_);
 
   // ---- 光度约束 PhotometricConstraint（可选，默认关） ----------------------
@@ -756,135 +809,128 @@ void VisualBNode::loadParameters() {
   photo_options_.fy = intrinsics_.fy;
   photo_options_.cx = intrinsics_.cx;
   photo_options_.cy = intrinsics_.cy;
-  photo_options_.enable = this->declare_parameter<bool>("photo.enable", false);
-  photo_options_.patch_size = this->declare_parameter<int>("photo.patch_size", 5);
-  photo_options_.pyramid_levels = this->declare_parameter<int>("photo.pyramid_levels", 3);
-  photo_options_.huber_delta = this->declare_parameter<double>("photo.huber_delta", 1.0);
-  photo_options_.max_intensity_error = this->declare_parameter<double>("photo.max_intensity_error", 40.0);
+  photo_options_.enable = params_.getBool("photo.enable", false);
+  photo_options_.patch_size = params_.getInt("photo.patch_size", 5);
+  photo_options_.pyramid_levels = params_.getInt("photo.pyramid_levels", 3);
+  photo_options_.huber_delta = params_.getDouble("photo.huber_delta", 1.0);
+  photo_options_.max_intensity_error = params_.getDouble("photo.max_intensity_error", 40.0);
   photometric_ = std::make_unique<PhotometricConstraint>(photo_options_);
 
   // ---- 统一估计器 UnifiedEstimator ----------------------------------------
-  estimator_options_.enable_visual = this->declare_parameter<bool>("est.enable_visual", true);
-  estimator_options_.visual_weight = this->declare_parameter<double>("est.visual_weight", 1.0);
-  estimator_options_.estimate_extrinsics = this->declare_parameter<bool>("est.estimate_extrinsics", false);
-  estimator_options_.gyro_noise = this->declare_parameter<double>("est.gyro_noise", 1.0e-3);
-  estimator_options_.acc_noise = this->declare_parameter<double>("est.acc_noise", 1.0e-2);
-  estimator_options_.bias_gyro_noise = this->declare_parameter<double>("est.bias_gyro_noise", 1.0e-5);
-  estimator_options_.bias_acc_noise = this->declare_parameter<double>("est.bias_acc_noise", 1.0e-4);
-  estimator_options_.initial_covariance = this->declare_parameter<double>("est.initial_covariance", 1.0);
+  estimator_options_.enable_visual = params_.getBool("est.enable_visual", true);
+  estimator_options_.visual_weight = params_.getDouble("est.visual_weight", 1.0);
+  estimator_options_.estimate_extrinsics = params_.getBool("est.estimate_extrinsics", false);
+  estimator_options_.gyro_noise = params_.getDouble("est.gyro_noise", 1.0e-3);
+  estimator_options_.acc_noise = params_.getDouble("est.acc_noise", 1.0e-2);
+  estimator_options_.bias_gyro_noise = params_.getDouble("est.bias_gyro_noise", 1.0e-5);
+  estimator_options_.bias_acc_noise = params_.getDouble("est.bias_acc_noise", 1.0e-4);
+  estimator_options_.initial_covariance = params_.getDouble("est.initial_covariance", 1.0);
   // 视觉注入强度上限与信息耦合方式（详见 UnifiedEstimator::Options 注释）。
-  estimator_options_.visual_info_ratio = this->declare_parameter<double>("est.visual_info_ratio", 1.0);
+  estimator_options_.visual_info_ratio = params_.getDouble("est.visual_info_ratio", 1.0);
   estimator_options_.visual_rot_sigma_floor =
-      this->declare_parameter<double>("est.visual_rot_sigma_floor", 0.005);
+      params_.getDouble("est.visual_rot_sigma_floor", 0.005);
   estimator_options_.visual_pos_sigma_floor =
-      this->declare_parameter<double>("est.visual_pos_sigma_floor", 0.02);
+      params_.getDouble("est.visual_pos_sigma_floor", 0.02);
   // 退化时的视觉上限（LiDAR 已不可信，需让视觉真正接管）
   estimator_options_.visual_info_ratio_degen =
-      this->declare_parameter<double>("est.visual_info_ratio_degen", 5.0);
+      params_.getDouble("est.visual_info_ratio_degen", 5.0);
   estimator_options_.visual_pos_sigma_floor_degen =
-      this->declare_parameter<double>("est.visual_pos_sigma_floor_degen", 0.01);
-  estimator_options_.visual_pose_only = this->declare_parameter<bool>("est.visual_pose_only", true);
+      params_.getDouble("est.visual_pos_sigma_floor_degen", 0.01);
+  estimator_options_.visual_pose_only = params_.getBool("est.visual_pose_only", true);
   estimator_ = std::make_unique<UnifiedEstimator>(estimator_options_);
 
   // ---- 延迟地图提交 MapCommitScheduler ------------------------------------
-  scheduler_options_.enable = this->declare_parameter<bool>("scheduler.enable", true);
-  scheduler_options_.max_pending = this->declare_parameter<int>("scheduler.max_pending", 3);
+  scheduler_options_.enable = params_.getBool("scheduler.enable", true);
+  scheduler_options_.max_pending = params_.getInt("scheduler.max_pending", 3);
   scheduler_ = std::make_unique<MapCommitScheduler>(scheduler_options_);
 
   // ---- 彩色点云 ColorizerPipeline（复用方案 A 的包） ----------------------
   colorizer_options_.intrinsics = intrinsics_;
   // 着色轨迹源：默认 false=/lio/odom；true=统一估计器修正后的位姿（own_pose_cache_）。
-  color_use_own_odom_ = this->declare_parameter<bool>("color.use_own_odom", false);
+  color_use_own_odom_ = params_.getBool("color.use_own_odom", false);
   // own 轨迹信任域（见 pushOwnPoseSample / 12.5）：残差超过上限按上限截断。
-  own_res_max_pos_ = this->declare_parameter<double>("color.own_res_max_pos", 0.5);
-  own_res_max_rot_ = this->declare_parameter<double>("color.own_res_max_rot", 0.035);
+  own_res_max_pos_ = params_.getDouble("color.own_res_max_pos", 0.5);
+  own_res_max_rot_ = params_.getDouble("color.own_res_max_rot", 0.035);
   // T_cl 在实现中的语义是 T_cw（作用于世界系点），逐帧变化，见 runColorizer。
   colorizer_options_.T_cl = Eigen::Matrix4d::Identity();
-  colorizer_options_.sync.max_offset = this->declare_parameter<double>("color.sync_max_offset", 0.15);
-  colorizer_options_.sync.use_exposure_mid = this->declare_parameter<bool>("color.use_exposure_mid", true);
-  colorizer_options_.occlusion.depth_tolerance = this->declare_parameter<double>("color.depth_tolerance", 0.1);
-  colorizer_options_.occlusion.check_depth_edges = this->declare_parameter<bool>("color.check_depth_edges", true);
-  colorizer_options_.occlusion.edge_threshold = this->declare_parameter<double>("color.edge_threshold", 0.5);
-  colorizer_options_.rgb.bilinear = this->declare_parameter<bool>("color.bilinear", true);
-  colorizer_options_.rgb.keep_best_quality = this->declare_parameter<bool>("color.keep_best_quality", true);
-  colorizer_options_.rgb.min_quality = this->declare_parameter<float>("color.min_quality", 0.2F);
+  colorizer_options_.sync.max_offset = params_.getDouble("color.sync_max_offset", 0.15);
+  colorizer_options_.sync.use_exposure_mid = params_.getBool("color.use_exposure_mid", true);
+  colorizer_options_.occlusion.depth_tolerance = params_.getDouble("color.depth_tolerance", 0.1);
+  colorizer_options_.occlusion.check_depth_edges = params_.getBool("color.check_depth_edges", true);
+  colorizer_options_.occlusion.edge_threshold = params_.getDouble("color.edge_threshold", 0.5);
+  colorizer_options_.rgb.bilinear = params_.getBool("color.bilinear", true);
+  colorizer_options_.rgb.keep_best_quality = params_.getBool("color.keep_best_quality", true);
+  colorizer_options_.rgb.min_quality = params_.getFloat("color.min_quality", 0.2F);
 
   // 相机位姿源（官方口径）：点云世界变换用 LIO 位姿，相机位姿用 VIO 光度修正后的位姿。
-  // 留空表示与 odom_topic 同源（旧行为）。
+  // 留空表示与 odom_topic 同源（旧行为）。订阅由 app 负责，这里只做提示。
   const std::string cam_odom_topic =
-      this->declare_parameter<std::string>("color.cam_odom_topic", "");
+      params_.getString("color.cam_odom_topic", "");
   if (!cam_odom_topic.empty()) {
-    cam_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        cam_odom_topic, rclcpp::SensorDataQoS(),
-        [this](const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
-          InputEvent ev;
-          ev.kind = InputEvent::Kind::kCamOdom;
-          ev.odom = msg;
-          this->pushInputEvent(std::move(ev));
-        });
-    RCLCPP_INFO(this->get_logger(),
-                "相机位姿源: %s（点云世界变换仍用 odom_topic）", cam_odom_topic.c_str());
+    logf(LogLevel::kInfo,
+         "相机位姿源: %s（点云世界变换仍用 odom_topic；订阅由 app 提供）",
+         cam_odom_topic.c_str());
   }
 
   // ---- 彩色地图落盘（把跑完的彩色点云输出为 PCD） ------------------------
-  pcd_save_dir_ = this->declare_parameter<std::string>("pcd.save_dir", "/home/ywj/slam_data/pcd");
-  pcd_save_interval_sec_ = this->declare_parameter<double>("pcd.save_interval_sec", 30.0);
+  pcd_save_dir_ = params_.getString("pcd.save_dir", "/home/ywj/slam_data/pcd");
+  pcd_save_interval_sec_ = params_.getDouble("pcd.save_interval_sec", 30.0);
   max_colored_map_points_ = static_cast<std::size_t>(
-      this->declare_parameter<int>("pcd.max_points", 20000000));
+      params_.getInt("pcd.max_points", 20000000));
   median_map_.set_voxel_size(
-      static_cast<float>(this->declare_parameter<double>("pcd.median_voxel_size", 0.01)));
+      static_cast<float>(params_.getDouble("pcd.median_voxel_size", 0.01)));
 
   // ---- E2 诊断落盘 --------------------------------------------------------
   // 默认关闭；打开后只多写两个 CSV，不改变估计器输入输出。
-  e2_dump_enable_ = this->declare_parameter<bool>("e2.dump_enable", false);
-  e2_dump_dir_ = this->declare_parameter<std::string>("e2.dump_dir", "");
+  e2_dump_enable_ = params_.getBool("e2.dump_enable", false);
+  e2_dump_dir_ = params_.getString("e2.dump_dir", "");
   if (e2_dump_enable_ && !e2_dump_dir_.empty()) {
     std::error_code ec;
     std::filesystem::create_directories(e2_dump_dir_, ec);
     if (ec) {
-      RCLCPP_ERROR(this->get_logger(), "无法创建 E2 输出目录 %s: %s",
+      logf(LogLevel::kError, "无法创建 E2 输出目录 %s: %s",
                    e2_dump_dir_.c_str(), ec.message().c_str());
     } else {
       const std::filesystem::path dir(e2_dump_dir_);
       e2_pose_ofs_.open((dir / "e2_pose.csv").string());
       e2_obs_ofs_.open((dir / "e2_obs.csv").string());
-      RCLCPP_INFO(this->get_logger(), "E2 落盘开启: %s", e2_dump_dir_.c_str());
+      logf(LogLevel::kInfo, "E2 落盘开启: %s", e2_dump_dir_.c_str());
     }
   }
 
   // ---- 旋转后处理（P0-F RotationRefiner 移植，默认关）---------------------
   // 只做"旋转后处理"：R' = Exp(u)·R_lio，位置原样透传；不触碰 ESKF 状态与地图。
-  rot_refine_enable_ = this->declare_parameter<bool>("rot_refine.enable", false);
+  rot_refine_enable_ = params_.getBool("rot_refine.enable", false);
   // 像素对门限默认 40：与 §36.14 离线回放一致（估计器内部另有 min_inl=25 的内点门）。
   rot_estimator_options_.min_inl =
-      this->declare_parameter<int>("rot_refine.min_pairs", 40);
-  rot_noise_mode_ = this->declare_parameter<std::string>("rot_refine.noise_mode", "w3");
+      params_.getInt("rot_refine.min_pairs", 40);
+  rot_noise_mode_ = params_.getString("rot_refine.noise_mode", "w3");
   rot_estimator_options_.seed_px =
-      this->declare_parameter<double>("rot_refine.seed_px", rot_estimator_options_.seed_px);
+      params_.getDouble("rot_refine.seed_px", rot_estimator_options_.seed_px);
   rot_estimator_options_.f_scale =
-      this->declare_parameter<double>("rot_refine.f_scale", rot_estimator_options_.f_scale);
+      params_.getDouble("rot_refine.f_scale", rot_estimator_options_.f_scale);
   rot_estimator_options_.rounds =
-      this->declare_parameter<int>("rot_refine.rounds", rot_estimator_options_.rounds);
+      params_.getInt("rot_refine.rounds", rot_estimator_options_.rounds);
   rot_refine_options_.window =
-      this->declare_parameter<int>("rot_refine.window", rot_refine_options_.window);
-  rot_refine_options_.sigma_prior_deg = this->declare_parameter<double>(
+      params_.getInt("rot_refine.window", rot_refine_options_.window);
+  rot_refine_options_.sigma_prior_deg = params_.getDouble(
       "rot_refine.sigma_prior_deg", rot_refine_options_.sigma_prior_deg);
-  rot_refine_options_.sigma_accel_deg = this->declare_parameter<double>(
+  rot_refine_options_.sigma_accel_deg = params_.getDouble(
       "rot_refine.sigma_accel_deg", rot_refine_options_.sigma_accel_deg);
   rot_refine_options_.clip_deg =
-      this->declare_parameter<double>("rot_refine.clip_deg", rot_refine_options_.clip_deg);
-  rot_refine_options_.slew_factor = this->declare_parameter<double>(
+      params_.getDouble("rot_refine.clip_deg", rot_refine_options_.clip_deg);
+  rot_refine_options_.slew_factor = params_.getDouble(
       "rot_refine.slew_factor", rot_refine_options_.slew_factor);
   rot_refine_options_.huber_c =
-      this->declare_parameter<double>("rot_refine.huber_c", rot_refine_options_.huber_c);
+      params_.getDouble("rot_refine.huber_c", rot_refine_options_.huber_c);
   rot_refine_options_.irls_rounds =
-      this->declare_parameter<int>("rot_refine.irls_rounds", rot_refine_options_.irls_rounds);
+      params_.getInt("rot_refine.irls_rounds", rot_refine_options_.irls_rounds);
   rot_refine_options_.max_iters =
-      this->declare_parameter<int>("rot_refine.max_iters", rot_refine_options_.max_iters);
+      params_.getInt("rot_refine.max_iters", rot_refine_options_.max_iters);
   rot_refine_options_.enable_bounds =
-      this->declare_parameter<bool>("rot_refine.enable_bounds", rot_refine_options_.enable_bounds);
+      params_.getBool("rot_refine.enable_bounds", rot_refine_options_.enable_bounds);
   const std::string rot_dump_csv =
-      this->declare_parameter<std::string>("rot_refine.dump_csv", "");
+      params_.getString("rot_refine.dump_csv", "");
 
   // 相机外参（Camera->LiDAR）：旋转必须投影到 SO(3) 后再用于 log/exp。
   R_bc_ = Eigen::Quaterniond(T_lc_.block<3, 3>(0, 0)).normalized().toRotationMatrix();
@@ -906,43 +952,40 @@ void VisualBNode::loadParameters() {
       }
       rot_refine_ofs_.open(csv.string());
       if (!rot_refine_ofs_.is_open()) {
-        RCLCPP_ERROR(this->get_logger(), "无法写入旋转精修诊断 CSV: %s",
+        logf(LogLevel::kError, "无法写入旋转精修诊断 CSV: %s",
                      rot_dump_csv.c_str());
       } else {
         rot_refine_ofs_ << "stamp,t_pose,n_pairs,n_inl,t_norm,th_deg,"
                            "rvx,rvy,rvz,ux,uy,uz,sgx,sgy,sgz,px_med,px_p90,d_med,usable\n";
       }
     }
-    RCLCPP_INFO(this->get_logger(),
+    logf(LogLevel::kInfo,
                 "旋转精修开启: window=%d σp=%.2f° σa=%.2f° clip=%.2f° bounds=%d",
                 rot_refine_options_.window, rot_refine_options_.sigma_prior_deg,
                 rot_refine_options_.sigma_accel_deg, rot_refine_options_.clip_deg,
                 static_cast<int>(rot_refine_options_.enable_bounds));
   }
 
-  params_loaded_ = true;
 }
 
-void VisualBNode::onImage(const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
-  if (!params_loaded_) {
-    return;
-  }
+void VisualPipeline::onImage(const cv::Mat& bgr_in, double stamp) {
   // 图像 header 时刻：与 dense 点云 header 同一时钟基准（实测差 < 7 ms），只用于配对。
   // 图像真实采集时刻 header + img_time_offset_ 只用于取相机位姿，见 runColorizer。
-  const double stamp = rclcpp::Time(msg->header.stamp).seconds();
+  const auto t_arrive = std::chrono::steady_clock::now();
   ++g_probe.n_image;
-  probeGap(g_probe.image_gap, g_probe.t_image, std::chrono::steady_clock::now());
+  probeGap(g_probe.image_gap, g_probe.t_image, t_arrive);
   probeHeaderSpan(g_probe.image_hgap, g_probe.first_image, g_probe.last_image, stamp);
 
-  // toCvCopy：得到拥有数据所有权的 Mat，才能安全放进 image_cache_。
-  cv::Mat bgr;
-  try {
-    bgr = cv_bridge::toCvCopy(msg, "bgr8")->image;
-  } catch (const std::exception& e) {
-    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                          "cv_bridge 转换失败: %s", e.what());
-    return;
+  // 启动时间对齐期间该帧只当样本、不进视觉流程（对齐完成前一律丢弃）。
+  if (align_enable_ && !align_done_ && !align_failed_) {
+    feedAlignSample(true, stamp, t_arrive);
+    if (!align_done_) {
+      return;
+    }
   }
+
+  // app 传入的 Mat 已转成 bgr8 且拥有数据所有权，可直接放进 image_cache_。
+  cv::Mat bgr = bgr_in;
   if (bgr.empty()) {
     return;
   }
@@ -975,30 +1018,27 @@ void VisualBNode::onImage(const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
   while (pending_visual_.size() > kMaxPendingVisualFrames) {
     ++stat_drop_pose_;
     ++g_probe.drop_visual_full;
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+    logfThrottled(LogLevel::kWarn, 5000,
                          "视觉[丢弃] 待定队列超限（%zu 帧），丢弃最旧帧", pending_visual_.size());
     pending_visual_.pop_front();
   }
   probeMaybeReport();
 }
 
-void VisualBNode::onDegeneracy(
-    const std_msgs::msg::Float64MultiArray::ConstSharedPtr& msg) {
-  // 布局：[cond6, axes, active, cond_t, evt_min, ux, uy, uz]，解析见 common。
+void VisualPipeline::onDegeneracy(
+    const superlivo_common::DegeneracySignature& sig) {
   std::lock_guard<std::mutex> lock(degen_mutex_);
-  if (!degen_sig_.fromArray(msg->data)) {
-    return;
-  }
-  degen_recv_time_ = this->now().seconds();
+  degen_sig_ = sig;
+  degen_recv_time_ = steadyNowSec();
 }
 
-bool VisualBNode::degeneracySignature(double& severity,
+bool VisualPipeline::degeneracySignature(double& severity,
                                       Eigen::Vector3d& dir_w) const {
   severity = 0.0;
   dir_w.setZero();
   std::lock_guard<std::mutex> lock(degen_mutex_);
   if (degen_recv_time_ < 0.0 ||
-      this->now().seconds() - degen_recv_time_ > degen_timeout_) {
+      steadyNowSec() - degen_recv_time_ > degen_timeout_) {
     return false;
   }
   // cond=0 说明 Super-LIO 侧没跑检测或不是 trans_only 模式，不能当"健康"用。
@@ -1010,30 +1050,24 @@ bool VisualBNode::degeneracySignature(double& severity,
   return true;
 }
 
-void VisualBNode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
-  const auto& pose = msg->pose.pose;
-  Eigen::Quaterniond q(pose.orientation.w, pose.orientation.x,
-                       pose.orientation.y, pose.orientation.z);
-  if (q.norm() < 1e-9) {
-    return;
-  }
-  q.normalize();
+void VisualPipeline::onOdom(const Eigen::Matrix4d& T_w_in, double stamp) {
+  const auto t_arrive = std::chrono::steady_clock::now();
+  Eigen::Matrix4d T_wl = T_w_in;
 
-  Eigen::Matrix4d T_wl = Eigen::Matrix4d::Identity();
-  T_wl.block<3, 3>(0, 0) = q.toRotationMatrix();
-  T_wl(0, 3) = pose.position.x;
-  T_wl(1, 3) = pose.position.y;
-  T_wl(2, 3) = pose.position.z;
-
-  // /lio/odom 是 base_link（robot body）系：T_w_body = T_w_imu · T_imu_body。
-  // 本节点的 ESKF、IMU 量测、T_li=I 的点云全在 IMU 系，先把外参除掉。
+  // 若输入是 base_link（robot body）系：T_w_body = T_w_imu · T_imu_body。
+  // 本流水线的 ESKF、IMU 量测、T_li=I 的点云全在 IMU 系，先把外参除掉。
+  // 单体钩子直供 IMU 系位姿时 T_imu_robo_ 保持单位阵，此处无操作。
   if (!T_imu_robo_.isApprox(Eigen::Matrix4d::Identity(), 1e-12)) {
     T_wl = T_wl * T_imu_robo_.inverse();
   }
   T_wl_ = T_wl;
 
   colorizer::PoseSample sample;
-  sample.stamp = rclcpp::Time(msg->header.stamp).seconds();
+  sample.stamp = stamp;
+  // 启动时间对齐：这条 /lio/odom 的（帧戳, 系统到达时刻）作为一个雷达样本。
+  if (align_enable_ && !align_done_ && !align_failed_) {
+    feedAlignSample(false, sample.stamp, t_arrive);
+  }
   sample.T_wl = T_wl;
   pose_cache_.push_back(sample);
   if (pose_cache_.size() > max_pose_samples_) {
@@ -1083,7 +1117,7 @@ void VisualBNode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
       // 陀螺零偏必须用静止段均值初始化：NTU 的 VN100 零偏约 (0.40,0.20,0.11) °/s，
       // 从 0 起估计会让姿态在 60 s 内漂 20~30°，重力泄漏成水平加速度后轨迹发散（实测 3 km）。
       init.bg = mean_gyro;
-      RCLCPP_INFO(this->get_logger(),
+      logf(LogLevel::kInfo,
                   "IMU 加计归一化: |mean_acc|=%.4f ⇒ acc_scale=%.4f, gravity=(%.2f,%.2f,%.2f), "
                   "gyro_bias=(%.4f,%.4f,%.4f) rad/s",
                   norm, imu_acc_scale_, init.g.x(), init.g.y(), init.g.z(),
@@ -1101,7 +1135,7 @@ void VisualBNode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
     } else {
       last_imu_stamp_ = sample.stamp;
     }
-    RCLCPP_INFO(this->get_logger(), "统一状态已用首帧 lio/odom 初始化");
+    logf(LogLevel::kInfo, "统一状态已用首帧 lio/odom 初始化");
   }
 
   // 新采样到齐后重试待处理视觉帧（t_pose 通常比 /lio/odom 的最新时刻还晚）。
@@ -1116,21 +1150,131 @@ void VisualBNode::onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
   probeMaybeReport();
 }
 
-void VisualBNode::onCamOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
-  const auto& pose = msg->pose.pose;
-  Eigen::Quaterniond q(pose.orientation.w, pose.orientation.x,
-                       pose.orientation.y, pose.orientation.z);
-  if (q.norm() < 1e-9) {
+// ============================================================================
+// 启动时间对齐
+// ----------------------------------------------------------------------------
+// 相机与雷达各自打戳，两者可能相差一整个时钟域（livo_bag 相差 2×10^8 s），
+// 且 10 Hz 下"取哪一帧"的整数周期无法只靠时刻分辨（相位每 100 ms 重复一次，
+// 差一帧的两种配对残差一样小）。因此启动对齐 = 一个绝对锚点 + 一个标定常量：
+//   D   = 系统钟 − 雷达钟。IMU 与雷达同一钟域、报文小、几乎不积压，用它的
+//         (到达, header) 逐样本测 D，取最近窗口的中位数。
+//   a   = 相机打戳延迟（一次性标定，见 align.img_stamp_latency_s）。
+//   off = −(D + a)，冻结后严格按它取时刻。
+// 图像/雷达到达时刻只用于校验：按 D 配对后残差应≈0。
+// 若系统钟与图像 header 相差过大，说明节点跑在离线回放上（now 不是传感器主机钟），
+// D 不可用，直接退回配置 img_time_offset 并告警。
+// ============================================================================
+void VisualPipeline::feedAlignSample(bool is_image, double header,
+                                  std::chrono::steady_clock::time_point arrival) {
+  auto& buf = is_image ? align_images_ : align_lidar_;
+  buf.push_back(AlignSample{header, arrival});
+  // 只留最近若干条：对齐窗口不需要历史，长期对不上时也避免无限增长。
+  const std::size_t cap = std::max<std::size_t>(2 * align_samples_, 40);
+  while (buf.size() > cap) {
+    buf.pop_front();
+  }
+  if (align_t0_ == std::chrono::steady_clock::time_point{}) {
+    align_t0_ = arrival;
+  }
+  tryAlign();
+}
+
+void VisualPipeline::tryAlign() {
+  if (align_done_ || align_failed_) {
     return;
   }
-  q.normalize();
+  auto median_of = [](std::vector<double> v) {
+    const std::size_t mid = v.size() / 2;
+    std::nth_element(v.begin(), v.begin() + mid, v.end());
+    return v[mid];
+  };
+
+  const double elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - align_t0_).count();
+  if (elapsed > align_timeout_s_) {
+    align_failed_ = true;
+    logf(LogLevel::kWarn,
+         "启动时间对齐失败（%.1f s 内样本不足：图像 %zu 帧、IMU %zu 条），继续使用配置 "
+         "img_time_offset=%+.6f s",
+         elapsed, align_images_.size(), align_d_samples_.size(), img_time_offset_);
+    return;
+  }
+  // 等够样本：align.samples 张图像（默认 20 帧 ≈2 s）+ 0.25 s 的 IMU。
+  if (align_images_.size() < align_samples_ || align_lidar_.empty() ||
+      align_d_samples_.size() < 50) {
+    return;
+  }
+
+  // ---- 1) 系统钟是否仍是传感器主机钟 --------------------------------------
+  // 离线回放时系统钟是"今天"的墙钟，而图像 header 是录制时的墙钟（可差几天），
+  // 由此算出的 D 完全失真；且差值通常是 0.1 s 的整数倍，相位校验也看不出来。
+  const double now_s =
+      std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch())
+          .count();
+  std::vector<double> lags;
+  lags.reserve(align_images_.size());
+  for (const auto& im : align_images_) {
+    lags.push_back(now_s - im.header);
+  }
+  const double lag = median_of(lags);
+  if (std::abs(lag) > align_clock_lag_max_s_) {
+    align_failed_ = true;
+    logf(LogLevel::kWarn,
+         "启动时间对齐放弃：系统钟与图像 header 相差 %.1f s（离线回放，系统钟不是"
+         "传感器主机钟），无法恢复雷达钟域；沿用配置 img_time_offset=%+.6f s",
+         lag, img_time_offset_);
+    align_images_.clear();
+    align_lidar_.clear();
+    align_d_samples_.clear();
+    return;
+  }
+
+  // ---- 2) 冻结 off = −(D + a) ---------------------------------------------
+  const std::vector<double> dv(align_d_samples_.begin(), align_d_samples_.end());
+  const double D = median_of(dv);
+  const double off = -(D + align_img_stamp_latency_s_);
+
+  // ---- 3) 校验：按到达时刻配对后，图像应几乎正好落在雷达帧上 ---------------
+  const double win_ns = align_window_ms_ * 1e6;
+  std::vector<double> cand;
+  cand.reserve(align_images_.size());
+  for (const auto& im : align_images_) {
+    const AlignSample* best = nullptr;
+    double best_ns = 0.0;
+    for (const auto& ld : align_lidar_) {
+      const double d =
+          std::chrono::duration<double, std::nano>(im.arrival - ld.arrival).count();
+      if (best == nullptr || std::abs(d) < std::abs(best_ns)) {
+        best = &ld;
+        best_ns = d;
+      }
+    }
+    if (best == nullptr || std::abs(best_ns) > win_ns) {
+      continue;  // 该图不落在任何雷达帧附近（多速率相机 / 启动错位）
+    }
+    cand.push_back(best->header - im.header);
+  }
+  double resid_ms = std::numeric_limits<double>::quiet_NaN();
+  if (!cand.empty()) {
+    resid_ms = (off - median_of(cand)) * 1e3;
+  }
+
+  const double old = img_time_offset_;
+  img_time_offset_ = off;
+  align_done_ = true;
+  logf(LogLevel::kInfo,
+       "启动时间对齐完成：D(系统钟−雷达钟)=%+.6f s，相机打戳延迟=%.1f ms "
+       "⇒ img_time_offset=%+.6f s（配置值 %+.6f；%zu 帧校验残差中位 %+.1f ms）",
+       D, align_img_stamp_latency_s_ * 1e3, off, old, cand.size(), resid_ms);
+  align_images_.clear();
+  align_lidar_.clear();
+  align_d_samples_.clear();
+}
+
+void VisualPipeline::onCamOdom(const Eigen::Matrix4d& T_w, double stamp) {
   colorizer::PoseSample sample;
-  sample.stamp = rclcpp::Time(msg->header.stamp).seconds();
-  sample.T_wl = Eigen::Matrix4d::Identity();
-  sample.T_wl.block<3, 3>(0, 0) = q.toRotationMatrix();
-  sample.T_wl(0, 3) = pose.position.x;
-  sample.T_wl(1, 3) = pose.position.y;
-  sample.T_wl(2, 3) = pose.position.z;
+  sample.stamp = stamp;
+  sample.T_wl = T_w;
   cam_pose_cache_.push_back(sample);
   if (cam_pose_cache_.size() > max_pose_samples_) {
     cam_pose_cache_.erase(cam_pose_cache_.begin(),
@@ -1142,70 +1286,68 @@ void VisualBNode::onCamOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) 
   }
 }
 
-void VisualBNode::onCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
+void VisualPipeline::onCloud(const std::vector<Eigen::Vector3d>& points_world) {
   ++g_probe.n_cloud;
   probeGap(g_probe.cloud_gap, g_probe.t_cloud, std::chrono::steady_clock::now());
-  // lio/cloud_world：世界系点，直接作为 2D-3D 约束的地图点来源。
-  pcl::PointCloud<pcl::PointXYZI> cloud;
-  try {
-    pcl::fromROSMsg(*msg, cloud);
-  } catch (const std::exception& e) {
-    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                          "点云解析失败: %s", e.what());
-    return;
-  }
-  for (std::size_t i = 0; i < cloud.size();
+  // 世界系点，直接作为 2D-3D 约束的地图点来源。
+  for (std::size_t i = 0; i < points_world.size();
        i += static_cast<std::size_t>(std::max(1, map_append_stride_))) {
-    const auto& p = cloud.points[i];
-    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+    const auto& p = points_world[i];
+    if (!std::isfinite(p.x()) || !std::isfinite(p.y()) || !std::isfinite(p.z())) {
       continue;
     }
-    map_points_.emplace_back(p.x, p.y, p.z);
+    map_points_.emplace_back(p);
   }
   if (map_points_.size() > max_map_points_) {
     map_points_.erase(map_points_.begin(),
                       map_points_.begin() + (map_points_.size() - max_map_points_));
   }
-  last_cloud_ = msg;
+  world_cloud_valid_ = true;
 }
 
-void VisualBNode::onBodyCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
-  pcl::PointCloud<pcl::PointXYZI> cloud;
-  try {
-    pcl::fromROSMsg(*msg, cloud);
-  } catch (const std::exception& e) {
-    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                          "机体系点云解析失败: %s", e.what());
-    return;
-  }
+void VisualPipeline::onBodyCloud(const std::vector<Eigen::Vector3f>& points_lidar,
+                                 double stamp) {
   body_points_.clear();
-  body_points_.reserve(cloud.size());
-  for (const auto& p : cloud.points) {
-    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+  body_points_.reserve(points_lidar.size());
+  for (const auto& p : points_lidar) {
+    if (!std::isfinite(p.x()) || !std::isfinite(p.y()) || !std::isfinite(p.z())) {
       continue;
     }
-    body_points_.emplace_back(p.x, p.y, p.z);
+    body_points_.push_back(p);
   }
-  body_stamp_ = rclcpp::Time(msg->header.stamp).seconds();
+  body_stamp_ = stamp;
   ++g_probe.n_body;
   probeGap(g_probe.body_gap, g_probe.t_body, std::chrono::steady_clock::now());
   probeHeaderSpan(g_probe.body_hgap, g_probe.first_body, g_probe.last_body, body_stamp_);
 
   // 新扫描到达即入队等图像/位姿（大图回调比云慢约 1 帧，不能等图像回调才入队）。
-  runColorizer(*msg);
+  runColorizer();
 }
 
-void VisualBNode::onImu(const sensor_msgs::msg::Imu::ConstSharedPtr& msg) {
+void VisualPipeline::onImu(const Eigen::Vector3d& acc, const Eigen::Vector3d& gyro,
+                           double stamp) {
   ++g_probe.n_imu;
   probeGap(g_probe.imu_gap, g_probe.t_imu, std::chrono::steady_clock::now());
+  if (align_enable_ && !align_done_ && !align_failed_) {
+    // D = 系统钟 − 雷达钟。IMU 报文小、几乎不积压，单样本偏差只有 ms 量级，
+    // 留最近 2 s（200 Hz）样本，取中位数压掉抖动。
+    const double now_s =
+        std::chrono::duration<double>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    align_d_samples_.push_back(now_s - stamp);
+    if (align_d_samples_.size() > 400) {
+      align_d_samples_.pop_front();
+    }
+    if (align_t0_ == std::chrono::steady_clock::time_point{}) {
+      align_t0_ = std::chrono::steady_clock::now();
+    }
+    tryAlign();
+  }
   ImuSample sample;
-  sample.stamp = rclcpp::Time(msg->header.stamp).seconds();
-  sample.acc = Eigen::Vector3d(msg->linear_acceleration.x,
-                               msg->linear_acceleration.y,
-                               msg->linear_acceleration.z);
-  sample.gyro = Eigen::Vector3d(msg->angular_velocity.x,
-                                msg->angular_velocity.y,
-                                msg->angular_velocity.z);
+  sample.stamp = stamp;
+  sample.acc = acc;
+  sample.gyro = gyro;
   imu_buffer_.push_back(sample);
   if (imu_buffer_.size() > max_imu_samples_) {
     imu_buffer_.erase(imu_buffer_.begin(),
@@ -1213,7 +1355,7 @@ void VisualBNode::onImu(const sensor_msgs::msg::Imu::ConstSharedPtr& msg) {
   }
 }
 
-void VisualBNode::probeMaybeReport() {
+void VisualPipeline::probeMaybeReport() {
   const auto now = std::chrono::steady_clock::now();
   if (g_probe.t0.time_since_epoch().count() == 0) {
     g_probe.t0 = now;
@@ -1227,7 +1369,7 @@ void VisualBNode::probeMaybeReport() {
   probeReport();
 }
 
-void VisualBNode::probeReport() {
+void VisualPipeline::probeReport() {
   BranchProbe& p = g_probe;
   const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - p.t0).count();
   const double win = t - std::max(0.0, p.t_last_report);
@@ -1238,7 +1380,7 @@ void VisualBNode::probeReport() {
     return d;
   };
 
-  RCLCPP_INFO(this->get_logger(),
+  logf(LogLevel::kInfo,
               "[PROBE-IO] t=%.1f/%.1fs 到达(img|odom|body|cloud|imu)="
               "%zu/%zu/%zu/%zu/%zu Δ%zu/%zu/%zu/%zu/%zu | 间隔ms avg|max img=%.1f|%.1f "
               "odom=%.1f|%.1f body=%.1f|%.1f | headerΔms max img=%.1f odom=%.1f body=%.1f",
@@ -1248,7 +1390,7 @@ void VisualBNode::probeReport() {
               p.image_gap.avg(), p.image_gap.max, p.odom_gap.avg(), p.odom_gap.max,
               p.body_gap.avg(), p.body_gap.max, p.image_hgap.max, p.odom_hgap.max,
               p.body_hgap.max);
-  RCLCPP_INFO(this->get_logger(),
+  logf(LogLevel::kInfo,
               "[PROBE-T] 时刻 img[%.2f→%.2f] odom[%.2f→%.2f] body[%.2f→%.2f] | "
               "处理 Δ=%zu/%zu gap=%.1f|%.1f 等位姿=%.1f|%.1f | "
               "耗时ms avg|max 前端=%.1f|%.1f 约束=%.1f|%.1f 更新=%.1f|%.1f 彩色=%.1f|%.1f "
@@ -1258,7 +1400,7 @@ void VisualBNode::probeReport() {
               p.wait_visual.avg(), p.wait_visual.max, p.ms_front.avg(), p.ms_front.max,
               p.ms_constraint.avg(), p.ms_constraint.max, p.ms_update.avg(), p.ms_update.max,
               p.ms_color.avg(), p.ms_color.max, p.ms_total.avg(), p.ms_total.max);
-  RCLCPP_INFO(this->get_logger(),
+  logf(LogLevel::kInfo,
               "[PROBE-S] 约束细分ms avg|max 拷贝地图=%.1f|%.1f 投影建栅格=%.1f|%.1f "
               "法方程=%.1f|%.1f 选轨=%.1f|%.1f mscfk=%.1f|%.1f | "
               "上色内部ms 流水线=%.1f|%.1f 并入地图=%.1f|%.1f 发布=%.1f|%.1f",
@@ -1266,13 +1408,13 @@ void VisualBNode::probeReport() {
               p.ms_normal_eq.avg(), p.ms_normal_eq.max, p.ms_select.avg(), p.ms_select.max,
               p.ms_mscfk.avg(), p.ms_mscfk.max, p.ms_colorize.avg(), p.ms_colorize.max,
               p.ms_accum_map.avg(), p.ms_accum_map.max, p.ms_pub_cloud.avg(), p.ms_pub_cloud.max);
-  RCLCPP_INFO(this->get_logger(),
+  logf(LogLevel::kInfo,
               "[PROBE-U] 更新细分ms avg|max IMU传播=%.1f|%.1f 激光先验=%.1f|%.1f "
               "视觉更新+发布约束=%.1f|%.1f 地图提交=%.1f|%.1f 位姿发布=%.1f|%.1f",
               p.ms_imu_prop.avg(), p.ms_imu_prop.max, p.ms_prior.avg(), p.ms_prior.max,
               p.ms_vis_upd.avg(), p.ms_vis_upd.max, p.ms_map_commit.avg(), p.ms_map_commit.max,
               p.ms_pub.avg(), p.ms_pub.max);
-  RCLCPP_INFO(this->get_logger(),
+  logf(LogLevel::kInfo,
               "[PROBE-X] 规模 avg obs=%.1f tracks=%.1f lv=%.1f mscfk用=%.1f used=%.1f "
               "地图点=%.1f 上色点=%.1f | 丢弃累计 位姿空洞=%zu 等位姿超时=%zu 待定满=%zu "
               "无图像=%zu 图像队列满=%zu 着色等位姿超时=%zu 着色队列满=%zu | "
@@ -1283,7 +1425,7 @@ void VisualBNode::probeReport() {
               p.drop_cloud_full, p.drop_color_timeout, p.drop_color_full,
               dt(p.color_ok, p.prev_color_ok), p.color_ok, dt(p.queue_push, p.prev_queue_push),
               p.color_defer);
-  RCLCPP_INFO(this->get_logger(),
+  logf(LogLevel::kInfo,
               "[PROBE-Q] 队列 img=%zu pend_vis=%zu pend_cloud=%zu pend_color=%zu pose=%zu "
               "imu=%zu 地图=%zu/%zu | 落盘 Δ=%zu n=%zu 快照ms=%.1f|%.1f | "
               "守卫 先验否决=%zu 速度限幅=%zu | 输入队列溢出丢弃=%zu",
@@ -1296,7 +1438,7 @@ void VisualBNode::probeReport() {
   // 阻塞定位：排队延迟（入队→出队）按事件类型拆开，队列深度与工作线程占用时长。
   // 判读：某类延迟随窗口持续抬升 = 工作线程被前面的事件拖住；深度长期 >10 =
   // 消费速度跟不上；处理耗时接近窗口时长 = 线程满负荷。
-  RCLCPP_INFO(this->get_logger(),
+  logf(LogLevel::kInfo,
               "[PROBE-L] 排队延迟ms img=%.1f|%.1f odom=%.1f|%.1f body=%.1f|%.1f "
               "cloud=%.1f|%.1f imu=%.1f|%.1f | 队列深度 avg=%.1f max=%.0f 出队Δ=%zu "
               "| 处理耗时ms avg=%.1f max=%.1f",
@@ -1308,7 +1450,7 @@ void VisualBNode::probeReport() {
   // 彩色排空路径占用：窗口内累计耗时（占窗口的百分比）与重试规模。
   // 判读：占比 >50% 说明工作线程主要被"查不到位姿的彩色重试"吃掉，
   // 此时输入队列必然堆积，图像事件排队 => 视觉约束时差变大 => 注入过期。
-  RCLCPP_INFO(this->get_logger(),
+  logf(LogLevel::kInfo,
               "[PROBE-D] 彩色排空 重试Δ=%zu/%zu 位姿失败=%zu | 窗口累计=%.0fms "
               "单次ms avg=%.2f max=%.1f",
               dt(p.n_retry_color, p.prev_retry_color), p.n_retry_color,
@@ -1362,7 +1504,7 @@ void VisualBNode::probeReport() {
   p.ms_drain_color.reset();
 }
 
-void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
+void VisualPipeline::processVisualFrame(const cv::Mat& gray, double stamp) {
   // ==========================================================================
   // 主流程（对应 gpt §3.4）：
   //   前端 -> 生命周期 -> 关键帧/轨迹 -> LiDAR 2D-3D + MSCKF -> 统一估计器
@@ -1388,7 +1530,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     ++g_probe.drop_pose_hole;
     // 丢帧后上一帧不再是"相邻帧"，必须切断配对，避免跨位姿空洞算区间旋转。
     rot_prev_.valid = false;
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+    logfThrottled(LogLevel::kWarn, 2000,
                          "视觉[丢弃] 无 t_pose=%.3f 的可靠位姿（位姿空洞），跳过该帧", t_pose);
     return;
   }
@@ -1396,7 +1538,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   Eigen::Vector3d degen_u = Eigen::Vector3d::Zero();
   if (!degeneracySignature(degen_sev, degen_u) && !degen_stale_warned_) {
     degen_stale_warned_ = true;
-    RCLCPP_WARN(this->get_logger(),
+    logf(LogLevel::kWarn,
                 "未收到 %s 退化签名（超时 %.1fs）：请给 Super-LIO 开启 "
                 "lio.observe.degeneracy_detect_en 且 degen_trans_only=1，"
                 "否则退化感知恒不触发。",
@@ -1592,9 +1734,8 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
         // 0.1 s 标定，若仍按单帧上限逐帧追，姿态会持续落后 lio/odom，残差在
         // 下一帧 propagate 里变成 |g|·sinΔθ ≈ 2.25 m/s² 的水平伪加速度。
         estimator_->noteSkippedInterval(gap);
-        RCLCPP_WARN_THROTTLE(
-            this->get_logger(), *this->get_clock(), 2000,
-            "IMU 中断 %.3f s（%.3f→%.3f），该段不积分，交由激光先验按该间隔锚定",
+        logfThrottled(LogLevel::kWarn, 2000,
+      "IMU 中断 %.3f s（%.3f→%.3f），该段不积分，交由激光先验按该间隔锚定",
             gap, t_prev, t_pose);
       } else {
         estimator_->propagate(acc_prev * imu_acc_scale_, gyro_prev, gap);
@@ -1610,7 +1751,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
       const auto& st = estimator_->filterState().state;
       const Eigen::Vector3d aw =
           st.R * (acc_prev * imu_acc_scale_ - st.ba) + st.g;
-      RCLCPP_INFO(this->get_logger(),
+      logf(LogLevel::kInfo,
                   "[传播] a_w=(%.2f,%.2f,%.2f) |a_w|=%.2f ba=(%.3f,%.3f,%.3f) "
                   "bg=(%.4f,%.4f,%.4f) g=(%.2f,%.2f,%.2f) |v|=%.3f",
                   aw.x(), aw.y(), aw.z(), aw.norm(), st.ba.x(), st.ba.y(), st.ba.z(),
@@ -1634,9 +1775,8 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     }
     estimator_->resetState(deg);
     ++stat_no_imu_;
-    RCLCPP_WARN_THROTTLE(
-        this->get_logger(), *this->get_clock(), 5000,
-        "未收到任何 IMU 样本：按 lio/odom 位姿重置状态（退化模式，累计 %zu 帧）",
+    logfThrottled(LogLevel::kWarn, 5000,
+      "未收到任何 IMU 样本：按 lio/odom 位姿重置状态（退化模式，累计 %zu 帧）",
         stat_no_imu_);
   }
   g_probe.ms_imu_prop.add(probeMs(t_prop0));
@@ -1660,9 +1800,8 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
         dtheta > guard_lio_jump_rot_ * scale_dt) {
       lio_trusted = false;
       ++stat_prior_veto_;
-      RCLCPP_WARN_THROTTLE(
-          this->get_logger(), *this->get_clock(), 2000,
-          "[Guard] lio/odom 单帧跳变 %.2f m / %.2f deg 超阈值（间隔 %.2f s），本帧撤销"
+      logfThrottled(LogLevel::kWarn, 2000,
+      "[Guard] lio/odom 单帧跳变 %.2f m / %.2f deg 超阈值（间隔 %.2f s），本帧撤销"
           "激光先验（累计 %zu 次）",
           dp.norm(), dtheta * 57.29577951308232, t_pose - last_trust_stamp_, stat_prior_veto_);
     }
@@ -1717,9 +1856,8 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     if (cap > 0.0) {
       if (estimator_->clampSpeed(cap) > 0.0) {
         ++stat_vel_clamp_;
-        RCLCPP_WARN_THROTTLE(
-            this->get_logger(), *this->get_clock(), 2000,
-            "[Guard] 速度 %.2f m/s 超上限 %.2f m/s（sev=%.2f），限幅（累计 %zu 次）",
+        logfThrottled(LogLevel::kWarn, 2000,
+      "[Guard] 速度 %.2f m/s 超上限 %.2f m/s（sev=%.2f），限幅（累计 %zu 次）",
             vn, cap, degen_sev, stat_vel_clamp_);
       }
     } else {
@@ -1763,7 +1901,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   // 12) 发布：以统一估计器的位姿为准（视觉修正后的结果）
   const auto t_update = std::chrono::steady_clock::now();
   g_probe.ms_map_commit.add(probeMs(t_commit0));
-  publishOdomAndPath(T_wl_updated, toRosStamp(t_pose));
+  publishOdomAndPath(T_wl_updated, t_pose);
   g_probe.ms_pub.add(probeMs(t_update));
 
   // 12.5) 记录本锚点的融合残差（own ⊖ lio，世界系），并按信任域截断。
@@ -1796,7 +1934,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     // 若 |dp| 达到分米级，1 Hz 的分段刚体位移就是"分层"的直接来源。
     Eigen::Vector3d v_lio = Eigen::Vector3d::Zero();
     const bool has_v = lioVelocity(t_pose, v_lio);
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 0,
+    logfThrottled(LogLevel::kInfo, 0,
                          "[own残差] |dp|=%.3f(截=%d) ang=%.2fdeg(截=%d) "
                          "|v|=%.2f v_lio=%.2f(%d)",
                          dp_raw, clip_p ? 1 : 0, ang_raw * 180.0 / M_PI,
@@ -1808,8 +1946,8 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
     pushOwnPoseSample(t_pose, T_wl_frame_);
   }
 
-  if (!body_points_.empty() && last_cloud_) {
-    runColorizer(*last_cloud_);
+  if (!body_points_.empty() && world_cloud_valid_) {
+    runColorizer();
   }
   const auto t_end = std::chrono::steady_clock::now();
   auto ms = [](const std::chrono::steady_clock::time_point& a,
@@ -1819,8 +1957,8 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
 
   const UnifiedEstimator::VisualDiagnostics& vd = estimator_->visualDiagnostics();
   const auto tp = keyframe_manager_->trackPoolStats();
-  RCLCPP_INFO_THROTTLE(
-      this->get_logger(), *this->get_clock(), 1000,
+  logfThrottled(
+      LogLevel::kInfo, 1000,
       "视觉帧: obs=%zu tracks=%zu lv=%zu mscfk=%d used=%d quality=%.2f | "
       "退化 sev=%.2f dir=(%+.2f %+.2f %+.2f) | "
       "注入 λ=%.2e cap=%.2e scale=%.4f dxθ=%.4frad dxp=%.4fm σp=%.3fm σθ=%.4frad |v|=%.2fm/s | "
@@ -1859,7 +1997,7 @@ void VisualBNode::processVisualFrame(const cv::Mat& gray, double stamp) {
   probeMaybeReport();
 }
 
-void VisualBNode::publishVisualConstraint(double stamp) {
+void VisualPipeline::publishVisualConstraint(double stamp) {
   if (!bridge_) {
     return;
   }
@@ -1901,15 +2039,14 @@ void VisualBNode::publishVisualConstraint(double stamp) {
   bridge_->push(std::move(obs));
 }
 
-void VisualBNode::runColorizer(const sensor_msgs::msg::PointCloud2& cloud_msg) {
-  // 与方案 A 相同：lio/body/cloud 已是 LiDAR 系的去畸变点，逐点时间都用扫描帧头。
+void VisualPipeline::runColorizer() {
+  // 与方案 A 相同：机体系点云已是 LiDAR 系的去畸变点，逐点时间都用扫描帧头。
   // 注意 colorizer 的 Options.T_cl 实现语义为 T_cw（作用于世界系点），逐帧重建 options。
   //
   // 时间基准（与 A 一致，已用离线重放实验确认）：
   //   t_cloud = body_stamp_  → 点云世界系变换
   //   t_pair  = 图像 header.stamp → 选图（实测 |t_pair-t_cloud| < 7 ms）
   //   t_img   = t_pair + img_time_offset_ → 取相机位姿（本数据集最优 0.1 s）
-  (void)cloud_msg;
   if (body_points_.empty()) {
     return;
   }
@@ -1939,7 +2076,7 @@ void VisualBNode::runColorizer(const sensor_msgs::msg::PointCloud2& cloud_msg) {
       pending_clouds_.pop_front();
       ++stat_drop_no_image_;
       ++g_probe.drop_cloud_full;
-      RCLCPP_WARN(this->get_logger(), "彩色[丢弃] 等图像队列溢出，丢弃最早一帧");
+      logf(LogLevel::kWarn, "彩色[丢弃] 等图像队列溢出，丢弃最早一帧");
     }
   }
 
@@ -1947,7 +2084,7 @@ void VisualBNode::runColorizer(const sensor_msgs::msg::PointCloud2& cloud_msg) {
   drainPendingColorization();
 }
 
-void VisualBNode::drainPendingClouds() {
+void VisualPipeline::drainPendingClouds() {
   const auto now = std::chrono::steady_clock::now();
   for (auto it = pending_clouds_.begin(); it != pending_clouds_.end();) {
     // 显式配对：按 header.stamp 挑最接近 t_cloud 的一帧图像。
@@ -1979,7 +2116,7 @@ void VisualBNode::drainPendingClouds() {
         pending_color_.pop_front();
         ++stat_drop_pose_;
         ++g_probe.drop_color_full;
-        RCLCPP_WARN(this->get_logger(), "彩色[丢弃] 待处理队列溢出，丢弃最早一帧");
+        logf(LogLevel::kWarn, "彩色[丢弃] 待处理队列溢出，丢弃最早一帧");
       }
       it = pending_clouds_.erase(it);
       continue;
@@ -1988,7 +2125,7 @@ void VisualBNode::drainPendingClouds() {
     if (waited > kPendingCloudTimeoutSec) {
       ++stat_drop_no_image_;
       ++g_probe.drop_no_image;
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+      logfThrottled(LogLevel::kWarn, 5000,
                            "彩色[丢弃] 等待图像超时: t_cloud=%.4f 最近差=%.4f 阈值=%.4f 已等 %.2fs",
                            it->t_cloud, best_dt, colorizer_options_.sync.max_offset, waited);
       it = pending_clouds_.erase(it);
@@ -1998,7 +2135,7 @@ void VisualBNode::drainPendingClouds() {
   }
 }
 
-void VisualBNode::drainPendingVisualFrames() {
+void VisualPipeline::drainPendingVisualFrames() {
   if (pending_visual_.empty()) {
     return;
   }
@@ -2020,7 +2157,7 @@ void VisualBNode::drainPendingVisualFrames() {
     if (waited > kPendingVisualTimeoutSec) {
       ++stat_drop_pose_;
       ++g_probe.drop_pose_timeout;
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+      logfThrottled(LogLevel::kWarn, 5000,
                            "视觉[丢弃] 等待位姿超时: stamp=%.4f t_pose=%.4f 已等 %.2fs",
                            it->stamp, t_pose, waited);
       it = pending_visual_.erase(it);
@@ -2030,7 +2167,7 @@ void VisualBNode::drainPendingVisualFrames() {
   }
 }
 
-void VisualBNode::drainPendingColorization() {
+void VisualPipeline::drainPendingColorization() {
   if (pending_color_.empty()) {
     return;
   }
@@ -2062,7 +2199,7 @@ void VisualBNode::drainPendingColorization() {
         ++g_probe.drop_color_timeout;
         // 探针：把"缺位姿"的判定依据一并打出来——t_img 比最新位姿落后多少、缓存里
         // 还有多少采样。
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+        logfThrottled(LogLevel::kWarn, 5000,
                              "彩色[丢弃] 等待位姿超时: t_cloud=%.4f t_img=%.4f 已等 %.2fs "
                              "最新位姿=%.4f 落后=%.3fs cache=%zu",
                              it->t_cloud, it->t_img, waited, newest, newest - it->t_img,
@@ -2088,7 +2225,7 @@ void VisualBNode::drainPendingColorization() {
     if (waited > kPendingColorTimeoutSec) {
       ++stat_drop_pose_;
       ++g_probe.drop_color_timeout;
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+      logfThrottled(LogLevel::kWarn, 5000,
                            "彩色[丢弃] 着色失败超时: t_cloud=%.4f t_img=%.4f 已等 %.2fs "
                            "最新位姿=%.4f cache=%zu",
                            it->t_cloud, it->t_img, waited, newest, cache.size());
@@ -2101,7 +2238,7 @@ void VisualBNode::drainPendingColorization() {
   g_probe.ms_drain_color.add(probeMs(t_begin));
 }
 
-bool VisualBNode::colorizeFrame(const PendingColorFrame& frame) {
+bool VisualPipeline::colorizeFrame(const PendingColorFrame& frame) {
   const double t_cloud = frame.t_cloud;
   const double t_img = frame.t_img;
 
@@ -2132,7 +2269,7 @@ bool VisualBNode::colorizeFrame(const PendingColorFrame& frame) {
       pipeline.process(frame.points_lidar, point_stamps, images_for_frame, pose_cache_);
   g_probe.ms_colorize.add(probeMs(t_pipe0));
   if (colored.empty()) {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+    logfThrottled(LogLevel::kWarn, 5000,
                          "彩色点云为空（t_cloud=%.4f t_img=%.4f）", t_cloud, t_img);
   }
 
@@ -2144,7 +2281,7 @@ bool VisualBNode::colorizeFrame(const PendingColorFrame& frame) {
   }
   ++stat_colored_frames_;
   last_colored_cloud_stamp_ = t_cloud;
-  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+  logfThrottled(LogLevel::kInfo, 1000,
                        "彩色: t_cloud=%.4f t_pair=%.4f t_img=%.4f(offset=%+.3f) "
                        "dt_pair_cloud=%+.4f dt_img_cloud=%+.4f %zu/%zu 上色 帧#%zu",
                        t_cloud, frame.t_pair, t_img, img_time_offset_,
@@ -2156,12 +2293,12 @@ bool VisualBNode::colorizeFrame(const PendingColorFrame& frame) {
   accumulateColoredMap(colored, t_cloud);
   g_probe.ms_accum_map.add(probeMs(t_acc0));
   const auto t_pub0 = std::chrono::steady_clock::now();
-  publishColoredCloud(colored, toRosStamp(t_cloud));
+  publishColoredCloud(colored, t_cloud);
   g_probe.ms_pub_cloud.add(probeMs(t_pub0));
   return true;
 }
 
-void VisualBNode::pushOwnPoseSample(double stamp, const Eigen::Matrix4d& T_wl_lio) {
+void VisualPipeline::pushOwnPoseSample(double stamp, const Eigen::Matrix4d& T_wl_lio) {
   colorizer::PoseSample own;
   own.stamp = stamp;
   own.T_wl = Eigen::Matrix4d::Identity();
@@ -2183,21 +2320,21 @@ void VisualBNode::pushOwnPoseSample(double stamp, const Eigen::Matrix4d& T_wl_li
   }
 }
 
-bool VisualBNode::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
+bool VisualPipeline::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
   // 查询时刻晚于最新采样时必须拒绝：插值器会直接用最后一个采样顶替，
   // 那等于把 t_img 的位姿退化成 t_cloud 的位姿，offset 就白加了。
   // 轨迹源由 color.use_own_odom 决定：默认 /lio/odom；true 时用统一估计器修正位姿。
   return poseFromSamples(color_use_own_odom_ ? own_pose_cache_ : pose_cache_, stamp, T_wl);
 }
 
-bool VisualBNode::camPoseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
+bool VisualPipeline::camPoseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
   if (cam_pose_cache_.empty()) {
     return poseAtStamp(stamp, T_wl);  // 未配置独立相机位姿源：沿用旧行为
   }
   return poseFromSamples(cam_pose_cache_, stamp, T_wl);
 }
 
-void VisualBNode::buildLidarPrior(const Eigen::Matrix4d& T_wl,
+void VisualPipeline::buildLidarPrior(const Eigen::Matrix4d& T_wl,
                                   double t_pose,
                                   Eigen::MatrixXd& H,
                                   Eigen::VectorXd& b) const {
@@ -2255,14 +2392,14 @@ void VisualBNode::buildLidarPrior(const Eigen::Matrix4d& T_wl,
     }
     static int vel_dbg_n = 0;
     if (++vel_dbg_n % 10 == 1) {
-      RCLCPP_INFO(this->get_logger(),
+      logf(LogLevel::kInfo,
                   "[先验] vel_ok=%d |v_lio|=%.3f |v_cur|=%.3f t_pose=%.3f cache=%zu",
                   vel_ok ? 1 : 0, v_lio.norm(), s.v.norm(), t_pose, pose_cache_.size());
     }
   }
 }
 
-bool VisualBNode::lioVelocity(double t_pose, Eigen::Vector3d& v_lio) const {
+bool VisualPipeline::lioVelocity(double t_pose, Eigen::Vector3d& v_lio) const {
   const double kBaseline = 0.10;  // 差分基线（s）：太短被位姿噪声主导，太长切弯
   const colorizer::PoseSample* a = nullptr;
   const colorizer::PoseSample* b = nullptr;
@@ -2287,7 +2424,7 @@ bool VisualBNode::lioVelocity(double t_pose, Eigen::Vector3d& v_lio) const {
   return v_lio.allFinite() && v_lio.norm() < 10.0;
 }
 
-std::vector<FeatureTrack> VisualBNode::assembleTracks(
+std::vector<FeatureTrack> VisualPipeline::assembleTracks(
     const std::vector<PatchObservation>& obs, double stamp) const {
   // 本帧每条观测组装成"单观测轨迹"，跨帧合并交给 KeyframeManager::updateTracks。
   const Eigen::Matrix4d T_wc = T_wl_frame_ * T_lc_;
@@ -2308,32 +2445,15 @@ std::vector<FeatureTrack> VisualBNode::assembleTracks(
   return tracks;
 }
 
-void VisualBNode::publishColoredCloud(const std::vector<colorizer::ColoredPoint>& points,
-                                      const builtin_interfaces::msg::Time& stamp) {
-  pcl::PointCloud<pcl::PointXYZRGB> cloud;
-  cloud.reserve(points.size());
-  for (const auto& cp : points) {
-    pcl::PointXYZRGB p;
-    p.x = cp.xyz.x();
-    p.y = cp.xyz.y();
-    p.z = cp.xyz.z();
-    const auto clamp_u8 = [](float v) {
-      return static_cast<std::uint8_t>(std::clamp(v, 0.0F, 255.0F));
-    };
-    p.r = clamp_u8(cp.rgb.x());
-    p.g = clamp_u8(cp.rgb.y());
-    p.b = clamp_u8(cp.rgb.z());
-    cloud.push_back(p);
+void VisualPipeline::publishColoredCloud(const std::vector<colorizer::ColoredPoint>& points,
+                                         double stamp) {
+  // 点表达在 LiDAR 系；ROS 消息的组装与发布由 app 完成。
+  if (colored_cb_) {
+    colored_cb_(points, stamp);
   }
-
-  sensor_msgs::msg::PointCloud2 msg;
-  pcl::toROSMsg(cloud, msg);
-  msg.header.stamp = stamp;
-  msg.header.frame_id = "imu";  // 点仍在 LiDAR 系；Super-LIO 名义上叫 imu
-  colored_cloud_pub_->publish(msg);
 }
 
-void VisualBNode::accumulateColoredMap(const std::vector<colorizer::ColoredPoint>& points,
+void VisualPipeline::accumulateColoredMap(const std::vector<colorizer::ColoredPoint>& points,
                                        double stamp) {
   if (points.empty()) {
     return;
@@ -2341,7 +2461,7 @@ void VisualBNode::accumulateColoredMap(const std::vector<colorizer::ColoredPoint
   if (colored_map_.size() >= max_colored_map_points_) {
     if (!pcd_capacity_warned_) {
       pcd_capacity_warned_ = true;
-      RCLCPP_WARN(this->get_logger(), "彩色地图点数达到上限 %zu，后续帧不再累积",
+      logf(LogLevel::kWarn, "彩色地图点数达到上限 %zu，后续帧不再累积",
                   max_colored_map_points_);
     }
     return;
@@ -2352,7 +2472,7 @@ void VisualBNode::accumulateColoredMap(const std::vector<colorizer::ColoredPoint
   // 禁止回退到最新位姿：那会把点云搬到错误时刻的世界系，产生跨帧错位的"重影"。
   Eigen::Matrix4d T_wl = Eigen::Matrix4d::Identity();
   if (!poseAtStamp(stamp, T_wl)) {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+    logfThrottled(LogLevel::kWarn, 5000,
                          "彩色[丢弃] 累积位姿插值失败: %.4f 缓存=%zu", stamp,
                          pose_cache_.size());
     return;
@@ -2402,7 +2522,7 @@ void VisualBNode::accumulateColoredMap(const std::vector<colorizer::ColoredPoint
   }
 }
 
-void VisualBNode::saveColoredMap() {
+void VisualPipeline::saveColoredMap() {
   if (colored_map_.empty() || colored_map_.size() == pcd_saved_points_) {
     return;
   }
@@ -2410,7 +2530,7 @@ void VisualBNode::saveColoredMap() {
   std::error_code ec;
   std::filesystem::create_directories(pcd_save_dir_, ec);
   if (ec) {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+    logfThrottled(LogLevel::kWarn, 5000,
                          "无法创建 PCD 输出目录 %s: %s", pcd_save_dir_.c_str(),
                          ec.message().c_str());
     return;
@@ -2439,40 +2559,23 @@ void VisualBNode::saveColoredMap() {
   colored_map_.is_dense = false;
   if (pcl::io::savePCDFileBinary(path, colored_map_) == 0) {
     pcd_saved_points_ = colored_map_.size();
-    RCLCPP_INFO(this->get_logger(), "彩色地图已保存: %s（%zu 点，世界系%s）", path.c_str(),
+    logf(LogLevel::kInfo, "彩色地图已保存: %s（%zu 点，世界系%s）", path.c_str(),
                 colored_map_.size(),
                 median_map_.enabled() ? "，时间中位数回填色" : "");
   } else {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+    logfThrottled(LogLevel::kWarn, 5000,
                          "保存 PCD 失败: %s", path.c_str());
   }
 }
 
-void VisualBNode::publishOdomAndPath(const Eigen::Matrix4d& T_wl,
-                                     const builtin_interfaces::msg::Time& stamp) {
-  nav_msgs::msg::Odometry odom;
-  odom.header.stamp = stamp;
-  odom.header.frame_id = "world";
-  odom.child_frame_id = "lidar";
-  odom.pose.pose.position.x = T_wl(0, 3);
-  odom.pose.pose.position.y = T_wl(1, 3);
-  odom.pose.pose.position.z = T_wl(2, 3);
-  const Eigen::Quaterniond q(T_wl.block<3, 3>(0, 0));
-  odom.pose.pose.orientation.x = q.x();
-  odom.pose.pose.orientation.y = q.y();
-  odom.pose.pose.orientation.z = q.z();
-  odom.pose.pose.orientation.w = q.w();
-  odom_pub_->publish(odom);
-
-  geometry_msgs::msg::PoseStamped pose;
-  pose.header = odom.header;
-  pose.pose = odom.pose.pose;
-  path_msg_.header.stamp = stamp;
-  path_msg_.poses.push_back(pose);
-  path_pub_->publish(path_msg_);
+void VisualPipeline::publishOdomAndPath(const Eigen::Matrix4d& T_wl, double stamp) {
+  // odom 与 path 的发布（含 path 累积）在 app 侧完成，这里只输出位姿。
+  if (odom_cb_) {
+    odom_cb_(T_wl, stamp);
+  }
 }
 
-cv::Mat VisualBNode::rectifyBgr(const cv::Mat& bgr) const {
+cv::Mat VisualPipeline::rectifyBgr(const cv::Mat& bgr) const {
   if (bgr.empty()) {
     return {};
   }
@@ -2496,12 +2599,12 @@ cv::Mat VisualBNode::rectifyBgr(const cv::Mat& bgr) const {
   return rectified;
 }
 
-Eigen::Matrix4d VisualBNode::makeTlcFromRclPcl() {
+Eigen::Matrix4d VisualPipeline::makeTlcFromRclPcl() const {
   // Rcl/Pcl 表示 p_cam = Rcl·p_lidar + Pcl（LiDAR -> Camera），
   // 本节点内部用 T_lc（Camera -> LiDAR），因此需求逆（同方案 A 的说明）。
-  const auto rcl = this->declare_parameter<std::vector<double>>(
+  const auto rcl = params_.getDoubleArray(
       "Rcl", std::vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1});
-  const auto pcl = this->declare_parameter<std::vector<double>>(
+  const auto pcl = params_.getDoubleArray(
       "Pcl", std::vector<double>{0, 0, 0});
   Eigen::Matrix4d T_cl = Eigen::Matrix4d::Identity();
   if (rcl.size() >= 9) {
@@ -2519,7 +2622,7 @@ Eigen::Matrix4d VisualBNode::makeTlcFromRclPcl() {
   return T_cl.inverse();  // Camera -> LiDAR
 }
 
-Eigen::Matrix3d VisualBNode::whiteningFromCov(const Eigen::Matrix3d& cov) const {
+Eigen::Matrix3d VisualPipeline::whiteningFromCov(const Eigen::Matrix3d& cov) const {
   // Cw = Σ^{-1/2}：特征分解后逐轴取 1/σ。σ 下限 1e-4 rad（≈0.0057°）只防数值爆掉，
   // 实测逐区间主轴 σ 在 0.02–0.06°（§36.12），离该下限还有一个量级。
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
@@ -2532,7 +2635,7 @@ Eigen::Matrix3d VisualBNode::whiteningFromCov(const Eigen::Matrix3d& cov) const 
          es.eigenvectors().transpose();
 }
 
-void VisualBNode::refineRotation(double stamp, double t_pose,
+void VisualPipeline::refineRotation(double stamp, double t_pose,
                                  const std::vector<PatchObservation>& obs) {
   // 输入全部来自"该图像时刻"的量：obs 是当前帧像素，T_wl_frame_ 是 t_pose 处
   // 插值的 LIO 位姿；上一帧的观测/位姿在 rot_prev_ 里。视觉—惯导的时间错位
@@ -2594,19 +2697,12 @@ void VisualBNode::refineRotation(double stamp, double t_pose,
 
   // 精修 odom：位置沿用 LIO，旋转换成 Exp(u)·R_lio（只做旋转后处理的承诺）。
   {
-    nav_msgs::msg::Odometry odom;
-    odom.header.stamp = toRosStamp(t_pose);
-    odom.header.frame_id = "world";
-    odom.child_frame_id = "lidar";
-    odom.pose.pose.position.x = p_wb2.x();
-    odom.pose.pose.position.y = p_wb2.y();
-    odom.pose.pose.position.z = p_wb2.z();
-    const Eigen::Quaterniond q(rot_refiner_->correctedRotation());
-    odom.pose.pose.orientation.x = q.x();
-    odom.pose.pose.orientation.y = q.y();
-    odom.pose.pose.orientation.z = q.z();
-    odom.pose.pose.orientation.w = q.w();
-    odom_rot_refined_pub_->publish(odom);
+    Eigen::Matrix4d T_refined = Eigen::Matrix4d::Identity();
+    T_refined.block<3, 3>(0, 0) = rot_refiner_->correctedRotation();
+    T_refined.block<3, 1>(0, 3) = p_wb2;
+    if (rot_odom_cb_) {
+      rot_odom_cb_(T_refined, t_pose);
+    }
   }
 
   if (rot_refine_ofs_.is_open()) {
@@ -2630,7 +2726,7 @@ void VisualBNode::refineRotation(double stamp, double t_pose,
   }
 }
 
-Eigen::Matrix4d VisualBNode::applyLeftPerturbation(const Eigen::Matrix4d& T,
+Eigen::Matrix4d VisualPipeline::applyLeftPerturbation(const Eigen::Matrix4d& T,
                                                    const Eigen::VectorXd& dx) const {
   // dx = [φ; ρ]：R' = Exp(φ)·R，p' = Exp(φ)·p + ρ。
   if (dx.size() < 6) {
@@ -2645,6 +2741,5 @@ Eigen::Matrix4d VisualBNode::applyLeftPerturbation(const Eigen::Matrix4d& T,
 
 }  // namespace superlivo_b
 
-// 入口 main 已拆到 visual_b_node_main.cpp：
-// 节点实现本身需要被两个可执行文件复用（对话题版 visual_b_node 与
-// 同进程版 visual_b_app），留在实现文件里会产生重复 main 定义。
+// 可执行入口在 src/app/visual_b_app.cpp：本文件只承载 ROS 无关的流水线实现，
+// 不定义 main，避免与入口重复。
