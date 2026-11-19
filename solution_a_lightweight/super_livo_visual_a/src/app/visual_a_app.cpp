@@ -191,6 +191,9 @@ superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
       getOrDeclare<int>(node, vp("pcd.max_points"), 20000000));
   opt.median_voxel_size =
       static_cast<float>(getOrDeclare<double>(node, vp("pcd.median_voxel_size"), 0.01));
+  // 分片落盘：每 N 个彩色帧异步写一个增量 PCD（0 = 只在退出时写整图）。
+  opt.pcd_save_interval_frames = static_cast<std::size_t>(
+      getOrDeclare<int>(node, vp("pcd.save_interval_frames"), 0));
 
   // ---- 轨迹 / 图像落盘（与 FAST-LIVO2 的 evo / image_save 同口径） ----
   // 轨迹：<evo.save_dir>/<evo.seq_name>.txt，TUM 格式，每行

@@ -434,7 +434,9 @@ class VisualPipeline {
   };
 
   void startWorkerThreads();
-  void stopWorkerThreads();
+  void stopWorkerThreads(bool keep_save_thread = false);
+  /// 停止落盘线程并等它写完队列里剩下的段（幂等）。
+  void stopSaveThread();
   bool pushInputEvent(InputEvent event);
   void workerLoop();
   void saveLoop();
@@ -472,6 +474,10 @@ class VisualPipeline {
   std::thread save_thread_;
   pcl::PointCloud<pcl::PointXYZRGB> save_buffer_;
   std::shared_ptr<colorizer::VoxelColorMedian> save_median_;
+  /// 分片落盘（pcd.save_interval_frames > 0）：每片一个 colored_%05zu.pcd。
+  std::size_t save_interval_frames_{0};
+  std::size_t shard_index_{0};
+  std::size_t frames_since_shard_{0};
   /// shutdownAndSave() 只执行一次；并发调用者（shutdown 钩子 / 主线程 /
   /// 析构）会阻塞到那次执行完成，保证进程退出前文件已落盘。
   std::once_flag shutdown_once_;

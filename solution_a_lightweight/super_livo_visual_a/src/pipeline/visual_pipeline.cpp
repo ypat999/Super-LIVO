@@ -97,6 +97,7 @@ VisualPipeline::VisualPipeline(const VisualPipelineOptions& options) : opt_(opti
   colorizer_options_.T_cl = Eigen::Matrix4d::Identity();
 
   median_map_.set_voxel_size(opt_.median_voxel_size);
+  save_interval_frames_ = opt_.pcd_save_interval_frames;
 
   // ---- 轨迹 / 图像落盘（目录解析与文件打开，参照 FAST-LIVO2 evo/image_save） ----
   if (opt_.pose_output_en) {
@@ -254,7 +255,7 @@ void VisualPipeline::startWorkerThreads() {
   worker_ = std::thread(&VisualPipeline::workerLoop, this);
 }
 
-void VisualPipeline::stopWorkerThreads() {
+void VisualPipeline::stopWorkerThreads(bool keep_save_thread) {
   {
     std::lock_guard<std::mutex> lock(input_mutex_);
     if (input_stop_) {
@@ -266,6 +267,12 @@ void VisualPipeline::stopWorkerThreads() {
   if (worker_.joinable()) {
     worker_.join();  // 先排空输入队列，剩余事件照常处理完（不丢尾段）
   }
+  if (!keep_save_thread) {
+    stopSaveThread();
+  }
+}
+
+void VisualPipeline::stopSaveThread() {
   {
     std::lock_guard<std::mutex> lock(save_mutex_);
     save_stop_ = true;
@@ -421,6 +428,48 @@ void VisualPipeline::writeColoredSnapshot(std::deque<ColorSegment> segments) {
       (std::filesystem::path(opt_.pcd_save_dir) / "super_livo_visual_a_colored.pcd")
           .string();
 
+  // ---- 分片模式（参照 Super-LIO scans_*.pcd）：一段写一个文件，纯增量 ----
+  // 每片只含本时间窗新增点，落盘线程异步写；分片按时间有序，可直接做时序滤波。
+  if (save_interval_frames_ > 0) {
+    const auto c8 = [](double v) {
+      return static_cast<std::uint8_t>(std::clamp(v, 0.0, 255.0));
+    };
+    for (auto& seg : segments) {
+      if (seg.points.empty()) {
+        continue;
+      }
+      if (seg.median) {
+        save_median_ = seg.median;
+      }
+      pcl::PointCloud<pcl::PointXYZRGB> cloud = std::move(seg.points);
+      if (save_median_ && save_median_->enabled()) {
+        for (auto& p : cloud.points) {
+          Eigen::Vector3d rgb;
+          if (save_median_->colorAt(Eigen::Vector3f(p.x, p.y, p.z), rgb)) {
+            p.r = c8(rgb.x());
+            p.g = c8(rgb.y());
+            p.b = c8(rgb.z());
+          }
+        }
+      }
+      cloud.width = static_cast<std::uint32_t>(cloud.size());
+      cloud.height = 1;
+      cloud.is_dense = false;
+      char name[64];
+      std::snprintf(name, sizeof(name), "colored_%05zu.pcd", shard_index_++);
+      const std::string shard_path =
+          (std::filesystem::path(opt_.pcd_save_dir) / name).string();
+      if (pcl::io::savePCDFileBinary(shard_path, cloud) == 0) {
+        log(LogLevel::kInfo, "彩色分片已保存: " + shard_path + "（" +
+                                 std::to_string(cloud.size()) + " 点）");
+      } else {
+        logThrottled("pcd_save", 5000, LogLevel::kWarn,
+                     "保存 PCD 分片失败: " + shard_path);
+      }
+    }
+    return;
+  }
+
   // 合并增量段到常驻缓冲。正常一个保存周期只有一段；落盘慢于移交时会有多段。
   for (auto& seg : segments) {
     save_buffer_.points.insert(save_buffer_.points.end(), seg.points.points.begin(),
@@ -467,13 +516,18 @@ void VisualPipeline::shutdownAndSave() {
   // executor.spin() 返回后也会调一次，两者可能并发；后到者阻塞到那次执行
   // 结束，从而保证进程退出前文件已经落盘。
   std::call_once(shutdown_once_, [this]() {
-    // 先停线程：worker 排空输入队列后退出，落盘线程写完手上剩余的段。
-    // join 之后本函数独占全部状态，下面的收尾可以直接同步调用算法。
-    stopWorkerThreads();
+    // 先停 worker（保留落盘线程）：worker 排空输入队列后退出。
+    stopWorkerThreads(/*keep_save_thread=*/true);
     // 收尾：bag 结束时队列里可能还有等图像/等位姿的帧，尽量补完再落盘
     // （配不到图/位的按超时丢弃并计数，与运行期口径一致）。
     drainPendingClouds();
     drainPendingColorization();
+    // 分片模式：把最后不足一个间隔的尾段也交给落盘线程写一片，
+    // 保证「分片并集 == 合并图」，时序滤波不会漏掉结尾。
+    if (save_interval_frames_ > 0) {
+      requestColoredMapSave();
+    }
+    stopSaveThread();
     // 同步写出整张彩色地图。长序列（几百万点 + 中位数回填）要几秒，
     // 这一步必须在本进程内完成，不能交给 save 线程（进程退出时线程被杀）。
     saveColoredMap();
@@ -1225,6 +1279,14 @@ void VisualPipeline::accumulateColoredMap(
     q.a = 255;
     colored_map_.push_back(q);
     ++added;
+  }
+
+  // 分片落盘：每 N 个真正上过色的帧把一个增量段交给落盘线程（参照 Super-LIO
+  // lio.map.save_interval）。段内只含本时间窗新增点，写盘不阻塞工作线程。
+  if (save_interval_frames_ > 0 && added > 0 &&
+      ++frames_since_shard_ >= save_interval_frames_) {
+    frames_since_shard_ = 0;
+    requestColoredMapSave();
   }
 }
 

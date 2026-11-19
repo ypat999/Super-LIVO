@@ -104,6 +104,10 @@ struct VisualPipelineOptions {
   std::string pcd_save_dir{"/home/ywj/slam_data/pcd"};
   /// 时间中位数体素边长（米），<=0 关闭。
   float median_voxel_size{0.01F};
+  /// 分片落盘：每 N 个彩色帧异步写一个增量 PCD（0 = 关闭，只在退出时写整图）。
+  /// 参照 Super-LIO 的 lio.map.save_interval：每片只含自上一片以来的新增点，
+  /// 由落盘线程写出、不阻塞工作线程；分片天然按时间有序，便于离线做时序滤波。
+  std::size_t pcd_save_interval_frames{0};
 
   // ---- 轨迹 / 图像落盘（参照 FAST-LIVO2 的 evo / image_save 开关） ----
   /// 轨迹输出开关：TUM 格式（timestamp tx ty tz qx qy qz qw），
@@ -272,7 +276,9 @@ class VisualPipeline {
   };
 
   void startWorkerThreads();
-  void stopWorkerThreads();
+  void stopWorkerThreads(bool keep_save_thread = false);
+  /// 停止落盘线程并等它写完队列里剩下的段（幂等）。
+  void stopSaveThread();
   bool pushInputEvent(InputEvent event);
   void workerLoop();
   void saveLoop();
@@ -309,6 +315,10 @@ class VisualPipeline {
   std::thread save_thread_;
   pcl::PointCloud<pcl::PointXYZRGB> save_buffer_;
   std::shared_ptr<colorizer::VoxelColorMedian> save_median_;
+  /// 分片落盘（pcd_save_interval_frames > 0）：每片一个 colored_%05zu.pcd。
+  std::size_t save_interval_frames_{0};
+  std::size_t shard_index_{0};
+  std::size_t frames_since_shard_{0};
   /// shutdownAndSave() 只执行一次；并发调用者（shutdown 钩子 / 主线程 /
   /// 析构）会阻塞到那次执行完成，保证进程退出前文件已落盘。
   std::once_flag shutdown_once_;
