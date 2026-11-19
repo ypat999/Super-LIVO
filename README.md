@@ -26,6 +26,17 @@
 
 ## 更新日志
 
+- **2026-11-19**：方案 B 完成单体化（S2）并修掉退出落盘。`visual_b_app` 现在一个进程、一个节点
+  （`ROSWrapper` + `VisualPipeline`），LIO→视觉全部进程内直推，`visual_b_node` 删除；
+  配套把 `run_one.sh` 的 b 臂改起单进程、三份数据集配置顶层键改 `/**`（单体节点名是
+  `super_lio`，写旧名字整块配置会静默失效）。新增 `shutdownAndSave()`：**退出时同步写**最终
+  彩色地图（此前交给异步 save 线程，进程退出即被杀，test4 全量跑批 `pcd/` 只有目录没有文件）。
+  启动时间对齐（`off = −(D + a)`）在单体下继承，离线回放因系统钟与图像 header 相差约 15.5 万秒
+  按设计回退配置 `img_time_offset`。A 侧同批加入启动时间对齐与位姿按曝光时刻取用。
+  见 [方案 B README §9.11](solution_b_tight_coupled/README.md)、
+  [monolith_refactor_progress.md](monolith_refactor_progress.md)。
+  ⚠️ 单体路径 `app.visual_inject` 默认开，b 臂从此真正把视觉约束写回 ESKF，
+  `paper_20261119` 的双进程 B 结果不可与之混比。
 - **2026-11**：方案 B 前端与位姿链路加固：Patch 跟踪由单层 SSD 改**金字塔 LK**（Retail_Street 大位移下视觉相对旋转偏 1.5–2° 的问题消除）；`b_own` 速度观测 / 守卫 / 10 Hz 同频三层修复，彩色点云 634 万 → **1711 万点**；新增旋转后处理通道（默认关，eee_01 上 0.1 s 区间旋转 RMS 0.281° → 0.257°，偏航略退化）。见 [方案 B README](solution_b_tight_coupled/README.md#97-patch-前端单层-ssd--金字塔-lk)。
 - **2026-11**：标定板法向退化修正（holefix）重标 A/B 外参，四孔重投影 5.83 → 1.00 px（2026-11-16 用 all bag 全量点云 + 同步后的标定参数复标定：FAST-Calib RMSE 7.9 mm、holefix 1.00/1.62 px）；FAST-Calib-ROS2 改动推入自有 fork（`bb1e748`、`8963f32`）。见「相机-雷达外参标定流程」。
 - **2026-11**：官方 FAST-LIVO2 长序列 OOM 修复（视觉地图点滚动淘汰，fork `b9f931f`），本机 23 GB 内存跑满 99.3% 数据时长。
@@ -218,7 +229,7 @@ FAST-Calib 直出 1.26/2.17 px、旧 holefix 1.25/1.65 px、**新 holefix 1.00/1
 | `ros2 bag play`（顶替 Livox 驱动） | `taskset -c 4` |
 | `super_lio_node` | `taskset -c 7` + `lio.single_core:=true` |
 | `fastlivo_mapping` | `taskset -c 7` + `OMP_NUM_THREADS=1` |
-| `visual_a_node` / `visual_b_node` | `taskset -c 7`（**与 LIO 同挤一个大核**） |
+| `visual_a_node` / `visual_b_app` | `taskset -c 7`（**与 LIO 同挤一个大核**；B 单体化后视觉支路已在 LIO 同进程内，历史双节点数据见 [speed_test.md](speed_test.md)） |
 | `parameter_blackboard`（FL2 相机参数托管） | `taskset -c 0` |
 
 组间留 ≥15 s 间隔降温；每组**至少重复 3 次**（本仓库已实测：裁剪输入下 Super-LIO 本身

@@ -1351,7 +1351,7 @@ N=1 是**构造恒等**（链的区间就是 `R_vis`），含义是"若完全信
 **结论**：
 
 1. **融合轨迹无回归**：三轮 `/lio/odom` 路径 66.80–66.83 m、闭环 23–35 mm，注入生效率 97.2–97.3%；与 11-14 同数据集旧代码 B（`/home/ywj/slam_data/output/retail_ab_1114/b/odom.csv`，n=1270、raw span 132.90 s、66.82 m、闭环 19.9 mm、PCD 244 MB）一致。轮间差异（23 ↔ 34/35 mm）属轮次噪声，按 §0 不做跨轮判决。
-2. **PCD 只能靠周期落盘拿到**：`visual_b_app` 对 SIGINT 无响应（三轮均需 SIGKILL），析构里的 `saveColoredMap()` 不执行。轮 1 的 PCD 实际来自第 5 次定时落盘（相对 bag 开始 +24/+54/+84/+114/+144 s，点数 2,819,737→6,572,926→10,845,467→14,916,945→**16,815,272**）；轮 2/3 把 `pcd.save_interval_sec` 置 0 后完全无 PCD（`save_seen_after_sigint=0`）。⇒ 需要点云时必须保留 `pcd.save_interval_sec>0`；要评测 odom 不受落盘阻塞时再置 0。
+2. **PCD 只能靠周期落盘拿到**（**已由 §38 的退出同步落盘关闭**）：`visual_b_app` 对 SIGINT 无响应（三轮均需 SIGKILL），析构里的 `saveColoredMap()` 不执行。轮 1 的 PCD 实际来自第 5 次定时落盘（相对 bag 开始 +24/+54/+84/+114/+144 s，点数 2,819,737→6,572,926→10,845,467→14,916,945→**16,815,272**）；轮 2/3 把 `pcd.save_interval_sec` 置 0 后完全无 PCD（`save_seen_after_sigint=0`）。⇒ 需要点云时必须保留 `pcd.save_interval_sec>0`；要评测 odom 不受落盘阻塞时再置 0。
 3. **t≈42 s 的 3.2 s 空洞是系统性的，不是数据问题**：原始 bag 该段连续——`/livox/lidar` 40–50 s 内 100 帧（全段 1355 帧、最大间隔 **0.1195 s**）、`/livox/imu` 40–47 s 内 1396 条（最大 0.1169 s）、`/left_camera/image` 70 帧（最大 0.1096 s），无重复戳、该段无逆序块；而三轮与 11-14 旧运行都在 t≈42 s 出现同一 3.2 s（约 32 帧）缺口，`/lio/odom` 与 B 自有 odom 同时缺。换 reliable QoS 无效 ⇒ 丢样发生在消费侧（Super-LIO 输入/同步路径），根因**未定位**，登记待查。
 4. **轮 3 的 B 自有 odom 异常**：85.37 m、闭环 16.35 m、z 最低 −2.99 m，而同轮融合 `/lio/odom` 正常（66.82 m / 35.0 mm）、注入 take 1302/1314（99.1%）、生效 1299（98.9%）。该轮 B 自有通道数据作废；异常在 B 的独立状态递推/发布侧，不影响本轮融合结论（`color.use_own_odom=false`，着色用的是 `/lio/odom`）。
 5. **header 逆序随运行变化（66/50/77）**，成段出现且与周期落盘时刻不严格对应（轮 2 无落盘仍有 50 条）⇒ 成因未定位；先排序后计算是硬约定，否则同一录制流会算出 250 m 量级路径与 2 m 级假差。
@@ -1430,3 +1430,52 @@ Pcl = [0.016642, -0.113077, -0.037398]
 **声明的未入库项**：`solution_{a,b,c}/README.md`、`solution_a/test_results.md`、测速原始 CSV；`/tmp/probe_body_color_v3`、`/tmp/fz_src`、`/tmp/sl_build`、`/tmp/fz_install` 为临时目录（随 WSL 重启清空）。
 
 **上游依据**：`third_party/Super-LIO/stairwell_drift_diagnosis.txt`（M.0–M.40 原始记录，约 488 KB）与 `docs/HANDOVER_2026-11-08.md`（§0–§22）；本文件 §16–§24 为其索引级压缩，数字以原文为准。§25–§29 依据 2026-11-13~15 的标定/测速/提交记录与根 README「关键实验结论」、两份方案 README 退化章节、`experiments/speed_test.md`。
+
+---
+
+## 39. 方案 B 单体化（S2）接线核查与退出同步落盘（2026-11-19）
+
+### 39.1 触发与判据
+
+用户把 B 做成单体可执行 `visual_b_app.cpp`（`ROSWrapper` + `VisualPipeline` 同进程，节点名 `super_lio`），要求核查：① 启动时间对齐机制是否仍生效；② 跑批链路是否可用；没问题就提交。判据：`node.log` 出现对齐日志、`odom_rows` 与延迟行数不低于旧双进程口径、`pcd/` 必须真的有文件。
+
+### 39.2 对齐机制核查（结论：继承，无需改码）
+
+- 三路输入在单体内全部直推进 `VisualPipeline`：图像 `submitImage`、IMU `submitImu`、LIO 输出 `onLioOutput → submitOdom`，对齐样本链（图像 / 雷达帧 / IMU 滞后 D）完整；
+- 参数经 `RosParamSource` 懒声明，`align.enable` 默认 `true`，`tryAlign()` 里 `off = −(D + a)` 逻辑不变；
+- 实测 test4（离线回放）日志：`启动时间对齐放弃：系统钟与图像 header 相差 154697.2 s（离线回放，系统钟不是传感器主机钟），无法恢复雷达钟域；沿用配置 img_time_offset=-204701439.493700 s` ⇒ 机制运行且按设计回退，CLI `-p img_time_offset` 覆盖 YAML 生效。
+
+### 39.3 发现的三处缺口
+
+1. **`run_one.sh` b 臂仍起两个进程**（`super_lio_node` + 已删除的 `visual_b_node`）⇒ 跑不起来。改为单个 `visual_b_app`、同时喂 `livox_360.yaml` 与 `visual_b_move.yaml`；残留清理正则与 `tools/ros_batch_guard.sh` 的 `_LIVEPAT` 加入 `visual_b_app`。
+2. **配置整块静默失效**：`visual_b_move/rtk/room.yaml` 顶层键写 `super_livo_visual_b:`，而单体节点名是 `super_lio` ⇒ 内参、`img_time_offset`、开关全部回落默认值且无告警。三份统一改 `/**`。
+3. **退出时 PCD 不落盘**（本轮主问题）：见 §39.4。
+
+### 39.4 退出落盘：异步投递被进程退出杀掉
+
+| 现象 | test4/b 全量 1x（96 s）`pcd/` 只有目录、`files=0`；smoke 15 s 却出 7.1 MB 文件 |
+| --- | --- |
+| 首次误判 | 疑写盘失败 / 权限 / rosout 丢日志 —— 逐个排除 |
+| 关键实验 | 手动起 app + `-p pcd.save_interval_sec:=10.0` 跑 45 s：运行中四次周期落盘全部成功（249,429 / 691,075 / 1,122,353 / 1,630,754 点）⇒ 写盘路径与权限无问题 |
+| 时间戳证据 | 全量运行的 `pcd/` mtime 与 `[彩色统计]` 同刻（08:39:51.83），目录建了文件没写；smoke 的文件 mtime 与目录同刻 = 写完 |
+| 根因 | `on_shutdown` 里 `requestSaveColoredMap()` 只是把快照投给独立 save 线程（PROBE 记录单次 737.7 ms，全量地图 60,000 voxels / 364 万点更久），主线程随即 `return 0`，线程被杀 |
+| 修法 | 新增 `VisualPipeline::shutdownAndSave()`：`stopWorkerThreads()` → 补 `pending_visual_` / `drainPendingClouds()` / `drainPendingColorization()` → **同步** `saveColoredMap()`；`std::call_once` 幂等，shutdown 钩子、`main` 收口、析构三路调用，后到者阻塞到写盘完成。`flush()` 改为停机后立即返回（此前白等 30 s 打 `flush 超时` 告警） |
+
+> 15 s smoke"通过"是假信号：图小刚好赶在退出前写完。**验证落盘必须用全量时长**。
+
+### 39.5 验证与口径提醒
+
+| 项 | 修前（`test4_check_b2`，脚本改后首跑） | 修后（`test4_check_b3`） |
+| --- | --- | --- |
+| `pcd/` | `4.0K / files=0` | **56 MB / files=1**，`3,642,499` 点（`FIELDS x y z rgb`） |
+| `odom_rows` | 502 | 502 |
+| `latency_lines` | 1407 | 1407 |
+| `dt_img_cloud` | +0.0036 s | +0.0035 s |
+| 退出码 | 0 | 0（同步落盘在退出前完成） |
+
+**口径变化**：单体路径 `app.visual_inject` 默认 `true`，b 臂从此**真正把视觉约束写回 ESKF**；
+`paper_20261119` 的 B 行出自双进程跑批（跨进程无法注入，见 §38 / `paper_compare/REPORT.md` 前言）。
+论文矩阵的 B 行需用单体形态重跑后才可与其他臂并列，**不可混用两轮数据**。
+
+**产物**：`/home/ywj/slam_data/test4_check_b{,2}/`（修前，无 PCD）、`/home/ywj/slam_data/test4_smoke_b/`（15 s smoke）、`/home/ywj/slam_data/test4_check_b3/`（修后，含 PCD）；诊断脚本 `/tmp/repro_b_exit.sh`、`/tmp/diag_b_save.sh` 为临时探针，不入库。代码改动：`bf916ef`。
+

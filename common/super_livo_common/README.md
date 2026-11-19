@@ -7,7 +7,7 @@
 
 | 头文件 | 提供 | 谁在用 |
 | --- | --- | --- |
-| `super_livo_common/degeneracy_signature.hpp` | `DegeneracySignature`（`/lio/degeneracy` 载荷解析、`valid()`、`severity()` 对数映射）+ `DegeneracyScale`（`cond_lo`/`cond_hi`/`timeout_sec` 默认值） | A `visual_a_node`、B `visual_b_node` |
+| `super_livo_common/degeneracy_signature.hpp` | `DegeneracySignature`（`/lio/degeneracy` 载荷解析、`valid()`、`severity()` 对数映射）+ `DegeneracyScale`（`cond_lo`/`cond_hi`/`timeout_sec` 默认值） | A `visual_a_app`、B `visual_b_app`（`VisualPipeline`，签名由进程内钩子直推） |
 | `super_livo_common/anisotropic_prior.hpp` | `directionalPositionInformation(base, sev, dir, σ_healthy, σ_degen)`：退化方向松开、垂直方向收紧，再按 sev 插值 | A `visual_update`、B `buildLidarPrior` |
 | `super_livo_common/measurement_noise.hpp` | `reprojectionVariance(σ_pix, f, σ_anchor, 1/z)` = `σ_pix² + (f·σ_anchor/z)²`；`associationVariance(pixel_radius)` | A `ReprojectionConstraint`、B `LidarVisualConstraint` |
 

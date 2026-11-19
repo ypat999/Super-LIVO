@@ -347,6 +347,10 @@ def make_report(table, outdir):
           '本条跑批用 `visual_b_node`，注入门控 `app.visual_inject_max_dt` 只在 '
           '`visual_b_app` 单进程路径生效），'
           '**FL2/SL/A 取 `paper_sync`**（`lio.extrinsic.odom_robo` 回单位阵后的重跑）。',
+          '- ⚠ **2026-11-19 起 b 臂已改为单体 `visual_b_app`，且 `app.visual_inject` 默认开'
+          '（视觉约束真的写回 ESKF）** ⇒ 本表 B 行仍是双进程（无注入）口径，两者不可混比；'
+          '矩阵 B 行需用单体形态重跑后才能与其余三臂并列'
+          '（见 `exp_records.md` §39、`solution_b_tight_coupled/README.md` §9.11）。',
           '- move 序列：B 用 `move_ros2`（图像 header 保留主机时钟，以 '
           '`-p img_time_offset:=-204262818.9974` 覆盖）；原 `move_livoxclk`'
           '（图像 header 已改写为 Livox 时钟）副本已不在磁盘，FL2/SL/A 的 move 行'

@@ -52,9 +52,12 @@ solution_b_tight_coupled/
 │   │   ├── estimator/rotation_refiner.hpp          # 旋转滑窗鲁棒融合（后处理，默认关）
 │   │   └── estimator/map_commit_scheduler.hpp      # 延迟地图提交
 │   ├── src/                                     # 与头文件一一对应的实现
-│   └── src/node/visual_b_node.cpp               # ROS2 接线节点（退化感知与守卫见 §9）
+│   ├── src/pipeline/visual_pipeline.cpp         # ROS 无关的视觉支路（前端+约束+着色+落盘，多线程）
+│   └── src/app/visual_b_app.cpp                 # 单体入口：一个进程/一个节点内跑 Super-LIO + VisualPipeline
 └── README.md
 ```
+
+> 旧的 `src/node/visual_b_node.cpp` 双节点接线已在单体化（S2）中删除；LIO→视觉不再走话题。
 
 彩色点云模块**直接复用**独立包 [`../pointcloud_colorizer`](../pointcloud_colorizer/README.md)，不做重复实现：它与定位主干解耦，两套方案共用同一份代码。
 
@@ -84,10 +87,13 @@ IMU 传播 → LiDAR 更新 → 更新几何地图 → 视觉跟踪
 
 `super_lio` 在这里只作为公共库（`super_lio::lio`）。`visual_b_app` 是同进程可执行：
 Super-LIO 主干 + B 视觉支路，视觉约束通过 `super_lio` 暴露的通用扩展点写回 18 维 ESKF，
-不经过任何话题。
+不经过任何话题。单体只有一个 ROS 节点，节点名沿用 `ROSWrapper` 的 `super_lio`，
+因此 **B 的配置顶层键必须写 `/**`**（写 `super_livo_visual_b:` 整块不生效，见 §9.11）。
 
 ```
-图像回调 → UnifiedEstimator::visualUpdate
+图像 / IMU 订阅（app）→ VisualPipeline::submitImage / submitImu
+SuperLIO::onLioOutput / onDenseCloud / degeneracySnapshot → submitOdom / submitWorldCloud
+        → VisualPipeline（前端 + 约束）→ UnifiedEstimator::visualUpdate
         → 记录本帧等效法方程（6×6 相机位姿 H、b）
         → ConstraintBridge（单槽信箱，跨线程，mutex）
         → SuperLIO::ExternalObserve()（每帧 LiDAR 更新之后、建图/输出之前）
@@ -131,6 +137,11 @@ Super-LIO 主干 + B 视觉支路，视觉约束通过 `super_lio` 暴露的通�
 | `super_livo_visual_b/path` | `nav_msgs/Path` | 发布 | |
 | `super_livo_visual_b/colored_cloud` | `sensor_msgs/PointCloud2` | 发布 | 复用 Colorizer |
 | `super_livo_visual_b/odom_rot_refined` | `nav_msgs/Odometry` | 发布 | 仅旋转后处理通道（`rot_refine.enable=true` 时才发，见 §9.9） |
+
+> 单体化（S2）后，表中 `lio/odom`、`lio/cloud_world`、`lio/cloud_body_dense`、`/lio/degeneracy`
+> 四项**不再是 DDS 订阅**，而由 `SuperLIO` 的进程内钩子（`onLioOutput` / `onDenseCloud` /
+> `degeneracySnapshot`）直接推给 `VisualPipeline`；话题本身仍由 Super-LIO 发布，可用于外部
+> 录制与探针。真正订阅的输入只剩图像与 IMU。
 
 ## 7. 实施阶段与验收
 
@@ -313,7 +324,41 @@ cond_t≈33 误映射成 0.5，健康段就无端松开先验，已修）。完�
 - 三轮融合轨迹与 11-14 旧代码 B **无回归**（66.80–66.83 m / 闭环 23–35 mm）；
 - **未解决①**：`t≈42 s` 处 **3.2 s 数据时间空洞**（三轮与 11-14 旧运行同样存在）。原始 bag 该段
   lidar/imu/image 全连续（最大间隔 0.1195 s）⇒ 丢样在消费侧，根因未定位；reliable QoS 未消除；
-- **未解决②**：`visual_b_app` 收到 SIGINT 无响应（45 s 后 SIGKILL，析构落盘不执行）⇒ 点云只能靠
+- **未解决②**（**已于 2026-11-19 关闭，见 §9.11**）：`visual_b_app` 收到 SIGINT 无响应（45 s 后 SIGKILL，析构落盘不执行）⇒ 点云只能靠
   `pcd.save_interval_sec` 周期落盘；`save_interval=0` 时无 PCD 属预期；
 - **注意**：第三轮 B 自有 odom 异常（85.37 m / 闭环 16.35 m / z 到 −2.99 m），同轮 `/lio/odom` 正常，
   归因未定，引用该轮 `b_own` 数字前须先查。
+
+### 9.11 单体化后的接线补齐与退出同步落盘（2026-11-19）
+
+B 收敛为单进程单节点（`visual_b_app` = `ROSWrapper` + `VisualPipeline`，见 §5.1）后，
+本轮补齐两处环节缺口并修掉 §9.10 的未解决②。
+
+**① 配置顶层键**：单体只有一个节点，名字是 `super_lio`。三份数据集配置
+`visual_b_move.yaml` / `visual_b_rtk.yaml` / `visual_b_room.yaml` 的顶层键原写
+`super_livo_visual_b:`，`ros2 run` 起单进程时整块不匹配 ⇒ 内参、`img_time_offset`、
+各开关全部回落默认值且**不报错**。已统一改为 `/**`（`visual_b_params.yaml`、
+`visual_b_ntu.yaml` 原本就是 `/**`），CLI `-p` 覆盖仍优先于 YAML（实测生效）。
+
+**② 跑批脚本**：`experiments/scripts/paper_matrix/run_one.sh` 的 b 臂原起
+`super_lio_node` + `visual_b_node` 两个进程，现改为单个 `visual_b_app`、同时喂
+LIO 与视觉两份 params-file（不再 `sleep 6` 等主干）；残留清理正则与
+`tools/ros_batch_guard.sh` 的 `_LIVEPAT` 同步加入 `visual_b_app`。
+
+**③ 启动时间对齐随单体继承**：图像 / IMU / odom 三路都直推进 `VisualPipeline`，
+对齐样本链完整、`align.enable` 默认开。离线回放时系统钟与图像 header 相差约 15.5 万秒，
+物理上无法恢复雷达钟域，按设计放弃并回退配置值，日志形如
+`启动时间对齐放弃：系统钟与图像 header 相差 155602.2 s…沿用配置 img_time_offset=-204701439.493700 s`。
+
+**④ 退出同步落盘**：新增 `VisualPipeline::shutdownAndSave()` —— 先停 worker/save 线程、
+补完尾段帧，再**同步**写出最终彩色地图；shutdown 钩子、`main` 收口与析构共用，
+`std::call_once` 保证幂等且后到者阻塞到写盘完成。此前退出那次保存投给异步 save 线程，
+进程随即退出、线程被杀：test4 全量（96 s）跑批 `pcd/` 只有目录没有文件，
+15 s smoke 因图小才侥幸写完。`flush()` 同时改为停机后立即返回，不再白等 30 s。
+
+**验证**（test4/b 全量 1x，FastDDS、`ROS_DOMAIN_ID=95`）：`pcd=56M files=1`
+（3,642,499 点）、`odom_rows=502`、`latency_lines=1407`、`dt_img_cloud=+0.0035 s`。
+
+**口径变化提醒**：单体路径 `app.visual_inject` 默认 `true`，b 臂从此**真正把视觉约束写回
+ESKF**；而 `paper_20261119` 的 B 数据出自双进程跑批（跨进程无法注入）。两者不可混比，
+论文矩阵的 B 行需用单体形态重跑。

@@ -2,7 +2,8 @@
 
 > 配套方案文档：[monolith_refactor_plan.md](monolith_refactor_plan.md)
 > 本文只记录"做到哪儿了、验证过什么、换机器要做什么"。
-> 最后更新：2026-11-19（A 的 S1 已跑通；B 完成进程内注入 + 三线程改造，odom 源切到 10 Hz `/lio/odom`，并在 test20261118 上验证无漂移）
+> 最后更新：2026-11-19（B 完成 S2：抽出 `VisualPipeline`、删除 `visual_b_node`，`visual_b_app` 单进程单节点；
+> 退出改为同步落盘 `shutdownAndSave()`，跑批脚本与配置顶层键同步；A/B 启动时间对齐在离线回放下按设计回退配置值）
 
 ---
 
@@ -11,15 +12,14 @@
 - **方案 A**：进程内单体接线（S1）已完成、编译并跑通。Super-LIO 通过
   `onLioOutput` / `onDenseCloud` 两个虚钩子把位姿、世界云、机体系全量云、退化快照
   直推 `VisualPipeline`，视觉支路不再有任何 DDS 回环。旧 `visual_a_node`（S0 对照）保留。
-- **方案 B**：目标与 A 相同——**单进程单节点、LIO↔视觉全部进程内通信**。
-  当前是**过渡形态**：`visual_b_app` 在一个进程内跑 `ROSWrapper` + `VisualBNode` 两个
-  节点，视觉→LIO 已走直接函数调用，但 LIO→视觉仍是 DDS 订阅。节点内部已完成
-  回调 / 计算 / 落盘三线程改造，并在 Retail_Street 上实测通过。
-  odom 源已从 200 Hz 的 `/lio/imu/odom` 切到与 A 一致的 10 Hz `/lio/odom`（再用
-  `odom_robo` 外参换回 IMU 系），test20261118 上漂移消失；视觉注入时间门控
-  `app.visual_inject_max_dt` 定为 `0.4`。
-- **未开始**：A 的视觉回灌 ESKF（§6.5 的 8 个参数）、B 抽 `VisualPipeline` 并收敛为
-  单节点、B 直吃 `last_HTVH`、S2 清理。
+- **方案 B**：**S2 已完成（2026-11-19）**——`VisualPipeline`（ROS 无关）已抽出，
+  `visual_b_app` 单进程单节点：`ROSWrapper` + `VisualPipeline`，LIO→视觉改由
+  `onLioOutput` / `onDenseCloud` / `degeneracySnapshot` 直推，旧 `visual_b_node` 与其
+  DDS 订阅已删除。节点内部保持回调 / 计算 / 落盘三线程；odom 源为 10 Hz `/lio/odom`
+  （用 `odom_robo` 外参换回 IMU 系），视觉注入时间门控 `app.visual_inject_max_dt` 定为 `0.4`。
+  配套接线：三份数据集配置顶层键改 `/**`、`run_one.sh` b 臂改起单进程、退出改为
+  **同步落盘**（`shutdownAndSave()`），详见 [方案 B README §9.11](solution_b_tight_coupled/README.md)。
+- **未开始**：A 的视觉回灌 ESKF（§6.5 的 8 个参数）、B 直吃 `last_HTVH`、单测。
 
 ---
 
@@ -67,6 +67,10 @@ A 最终没有用它——`VisualPipeline` 内部是"任务队列 + 单工作线
 > 目标形态是**单进程单节点**：`VisualBNode` 最终被 ROS 无关的 `VisualPipeline`
 > 取代并删除，`visual_b_app` 只保留 `ROSWrapper`。本节的三线程改造只是过渡，
 > 它解决了回调阻塞，但没有消除 DDS 订阅本身。
+>
+> **2026-11-19（S2 已完成）**：上表 `VisualBNode` 侧的全部改造已整体搬进
+> `super_livo_visual_b/{include,src}/pipeline/visual_pipeline.{hpp,cpp}`，`visual_b_node.*`
+> 已删除；本节的文件名字面保留为历史记录。
 
 | 改动 | 说明 |
 | --- | --- |
@@ -87,6 +91,9 @@ executor 上，是唯一没进 `input_queue_` 的回调。`degen_sig_` 有独立
 但签名与帧之间没有顺序保证。
 
 ### 2.5 本地未提交改动（换机器前注意）
+
+> **2026-11-19 更新**：下列改动均已随 `bb712d6`（单体化 S2）与 `bf916ef`（退出同步落盘 +
+> 跑批接线）提交并推送，`git pull` 可取；本节保留为当时的改动清单。
 
 以下改动在**本机工作区尚未提交**，`git pull` 不会带过去：
 
@@ -320,15 +327,14 @@ ros2 bag play /home/ywj/slam_data/Retail_Street --rate 1.0
 
 1. **A 的视觉回灌 ESKF**（`monolith_refactor_plan.md` §6.5）：8 个参数目前**不存在于**
    `VisualPipelineOptions`，需要先接线；`VisualASuperLIO::ExternalObserve()` 仍是空实现。
-2. **B 收敛为单进程单节点**（设计目标，不是可选优化）：
-   - 抽 `super_livo_visual_b/.../pipeline/visual_pipeline.{hpp,cpp}`，承接
-     `VisualBNode` 的图像前端、`UnifiedEstimator`、彩色落盘；
-   - 位姿（10 Hz `/lio/odom`）/ 世界云 / 机体系云 / 退化快照全部改内部直推；
-     IMU 传播本来就直订 `/livox/imu`，不需要 `onImuOdom` 钩子；
-   - `visual_b_app` 只建 `ROSWrapper` 一个节点，图像订阅与输出发布都挂上去；
-   - 删除 `VisualBNode` 及其全部 DDS 订阅（S2）。
+2. ~~**B 收敛为单进程单节点**~~ **已完成（2026-11-19）**：`VisualPipeline` 已抽出
+   （`super_livo_visual_b/{include,src}/pipeline/`，承接图像前端、`UnifiedEstimator`、
+   着色与落盘）；位姿 / 世界云 / 机体系云 / 退化快照改内部直推；`visual_b_app` 只建
+   `ROSWrapper` 一个节点，图像与 IMU 订阅、输出发布与周期落盘都挂上去；
+   `VisualBNode` 及其 DDS 订阅已删除（S2）。
 3. **B 直吃 `last_HTVH`**：`UnifiedEstimator::lidarUpdate` 由合成强先验改为消费快照 `info`。
-4. **S2 清理**：删除 `app.lio_source=topic` 对照路径与两个旧节点。
+4. **S2 清理（剩余）**：删除 `app.lio_source=topic` 对照路径与 A 的旧 `visual_a_node`
+   （B 的 `visual_b_node` 已随 S2 删除）。
 
 ### 5.3 标定前置数据（A 已具备，B 仍缺）
 
@@ -364,8 +370,12 @@ ros2 bag play /home/ywj/slam_data/Retail_Street --rate 1.0
 6. **`pcd.save_dir` 默认 `/home/ywj/slam_data/pcd`**，换机器记得改。
 7. **彩色 PCD 落盘必须走独立线程且增量移交**：周期落盘或整图移交都会拖停回调，
    实测分别丢 293 帧 / 阻塞 1267 ms。
-8. `ros2 run` 的 Python 包装器不转发 SIGINT；脚本里收尾请
-   `pkill -f 'lib/super_livo_visual_b/visual_b_app'`，否则会被 SIGKILL、来不及落盘。
+8. **退出时的最终落盘必须同步**（2026-11-19 修）：投给异步 save 线程会随进程退出被杀，
+   长序列（test4 全量 96 s）表现为 `pcd/` 只有目录没有文件，15 s 短跑因图小反而"看着正常"。
+   统一走 `VisualPipeline::shutdownAndSave()`（`std::call_once` 幂等，shutdown 钩子 /
+   `main` 收口 / 析构任一路径调用都会阻塞到写盘完成）。
+9. `ros2 run` 的 Python 包装器不转发 SIGINT；脚本里收尾请
+   `pkill -f 'lib/super_livo_visual_b/visual_b_app'`，否则会被 SIGKILL。
 
 ---
 

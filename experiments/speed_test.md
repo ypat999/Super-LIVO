@@ -36,7 +36,7 @@
 | `ros2 bag play`（顶替 livox 驱动） | `taskset -c 4` | 大核 A76 #4 |
 | `super_lio_node` | `taskset -c 7` + `lio.single_core:=true` | 大核 A76 #7，单核串行 |
 | `fastlivo_mapping` | `taskset -c 7` + `OMP_NUM_THREADS=1` | 同上，单线程 |
-| `visual_a_node` / `visual_b_node` | `taskset -c 7` | 与 LIO **同挤一个大核**（按既定要求） |
+| `visual_a_node` / `visual_b_node` | `taskset -c 7` | 与 LIO **同挤一个大核**（按既定要求）；**2026-11-19 起 B 改单体 `visual_b_app`，视觉与 LIO 同进程，本表为双节点时期口径** |
 | `parameter_blackboard`（fast_livo 相机参数托管） | `taskset -c 0` | 仅初始化时查询，不影响 |
 
 组间均留 ≥15 s 间隔，降低热漂移影响。

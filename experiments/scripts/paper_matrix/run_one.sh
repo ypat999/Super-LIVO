@@ -8,7 +8,7 @@
 # 四臂定义：
 #   fl2  官方 FAST-LIVO2（话题 /aft_mapped_to_init）
 #   a    方案A：Super-LIO 主干 + super_livo_visual_a/visual_a_node（/super_livo_visual_a/odom）
-#   b    方案B：Super-LIO 主干 + super_livo_visual_b/visual_b_node（/super_livo_visual_b/odom）
+#   b    方案B：单体 visual_b_app（LIO 主干 + 视觉支路同进程，/super_livo_visual_b/odom）
 #   sl   官方 Super-LIO（/lio/odom）；RTK/room 用其自带视觉配置，其余数据集为 LIO-only
 #
 # 统一条件：FastDDS、同一 ROS_DOMAIN_ID、1x 实时播放、同一话题过滤、
