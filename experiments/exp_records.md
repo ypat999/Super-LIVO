@@ -1624,3 +1624,88 @@ B 的 `est.visual_info_ratio(_degen)`（信息矩阵比例）、B 的 `guard.*`�
 
 验证：`colcon build` 三包全过（super_livo_common / visual_a / visual_b）。
 
+---
+
+## 42. test20261118 实跑：视觉端到端延时计时（A/B 对比，2026-11-19）
+
+**结论**：为 A/B 两条视觉支路补上 `[Img->VisOdom]` / `[Img->VisCloud]` 墙钟延时计时
+（图像消息入队 → 修正 odom 发布 / 彩色云发布），与主干 `super_lio` 自带
+`lio.eva.timer`（`[Lidar->Odom]` 等）同口径对照。真实数据集 test20261118 上实测：
+主干延时两臂同量级（稳态 avg 11.6–15.5 ms）；视觉端到端延时紧耦合 B 臂约为松耦合 A 臂的
+**3–5 倍**，方向符合架构预期（B 需在图像周期内完成 KLT + 锚点更新并回写 ESKF）。
+
+### 42.1 实现与计时口径
+
+- 新增线程安全计时器 `common/super_livo_common/include/super_livo_common/latency_timer.hpp`
+  （header-only `superlivo_common::LatencyTimer`），口径完全仿 Super-LIO
+  `common/timer.h`：按名字累计 avg/max/calls，**60 s 窗口 `PrintAndClear()` 周期报告 +
+  退出前 `PrintAll()` 总报告**，输出格式与主干 `[Lidar->Odom]` 日志并排可读。
+- 锚点：工作线程消费 `kImage` 事件时记录 `ev.enqueued`（图像入队墙钟时刻）；
+  `publishOdomAndPath()` / `publishColoredCloud()` 处分别记录
+  `[Img->VisOdom]` / `[Img->VisCloud]` 到当前 steady_clock 的差值。
+  窗口打印与尾量报告逻辑对齐 B §39 的 `shutdownAndSave()` 收口（worker join 后打总报告）。
+- 开关：
+  - A 侧：ROS 参数 `super_livo_visual.timing` → `VisualPipelineOptions.timing_en`
+    （`visual_a_app.cpp` 的 `loadPipelineOptions` 接线）；
+  - B 侧：`VisualPipeline::loadParameters()` 里 `timing_en_ = params_.getBool("timing", false)`
+    （app 的 ParamSource 已带 `super_livo_visual.` 前缀，YAML/`-p` 用全名）。
+  - 默认关闭，零开销路径仅一次 bool 判断。
+
+### 42.2 数据与环境准备
+
+| 项 | 说明 |
+| --- | --- |
+| 源 bag | `/mnt/dataset/slam_data/livo_bag/test20261118/`（mcap，210.9 s）：`/livox/lidar` CustomMsg 2099 @10 Hz、`/livox/imu` 42133、`/left_camera/image` 1963 @~9.3 Hz；话题结构与 move 相同（同套 Livox + 相机设备） |
+| 格式转换 | 本机无 mcap storage 插件，用 `rosbags-convert --src … --dst …_s3_0.db3 --dst-storage sqlite3 --include-topic …` 转 sqlite3 |
+| QoS 坑 | rosbags 写出的 `metadata.yaml` 中 QoS `deadline`/`lifespan` 的 `sec=9223372036` 超出 int32，Humble 解析 `bad conversion` 直接崩溃；需把各 `topic_metadata` 的 `offered_qos_profiles`/`requested_qos_profiles` 改写为空字符串，`ros2 bag` 才能播 |
+| 时钟域 | 该 bag 图像 header 为主机 2026 时钟、LiDAR/IMU header 为 Livox 设备 2020 纪元时钟。以 bag 记录时间为基准、取 200 条消息的 hdr−bagts 中位数实测常数差，运行时 `-p super_livo_visual.img_time_offset:=-204777458.695583` |
+| 构建 | `liblio.so` 在 Super-LIO 独立工作区，须按 README 两段式：先 `cd third_party/Super-LIO && colcon build --packages-select super_lio`（及 basic），主工作区只补建 `third_party/livox_ros_driver2` 与四个 LIVO 包；全量 `colcon build` 会因无关的 basalt 编译失败中断 |
+
+### 42.3 运行隔离两处教训
+
+1. **DDS 域隔离**：本机同时跑着 task_dispatcher 仿真（也发 `/livox/imu`、`/livox/lidar`），
+   第一次混跑时两套时钟域数据灌进同一 LIO 主干直接卡死（Watchdog 千秒级无有效帧），该轮作废。
+   正式跑全程 `ROS_DOMAIN_ID=42` 与仿真完全隔离。
+2. **信号直达**：脚本必须直连 `install/` 下的 exe 而非 `ros2 run`——ros2 CLI 包装层不转发
+   SIGINT，`kill -INT` 打不到真 app 进程（曾导致 app 挂留 25 分钟未退出、收尾报告不落）。
+
+### 42.4 运行命令（A 臂）
+
+B 臂同构，换成 `visual_b_app` 与 `visual_b_move.yaml`。
+
+```bash
+env -u LD_LIBRARY_PATH ROS_DOMAIN_ID=42 bash -c '
+source /opt/ros/humble/setup.bash && source third_party/Super-LIO/install/setup.bash && source install/setup.bash
+install/super_livo_visual_a/lib/super_livo_visual_a/visual_a_app --ros-args \
+  --params-file third_party/Super-LIO/src/super_lio/config/livox_360.yaml \
+  --params-file solution_a_lightweight/super_livo_visual_a/config/visual_a_move.yaml \
+  -p lio.eva.timer:=true \
+  -p super_livo_visual.img_time_offset:=-204777458.695583 \
+  -p super_livo_visual.timing:=true &
+ros2 bag play <转换后的bag> --topics /livox/lidar /livox/imu /left_camera/image'
+```
+
+### 42.5 结果（steady 窗口均值 ± max，ms）
+
+| 指标 | A 臂（松耦合） | B 臂（紧耦合） |
+| --- | --- | --- |
+| `[Lidar->Odom]` 主干 | 稳态 avg 11.6–14.4，max ≈46 | avg 12.7–15.5，max ≈40 |
+| `[Img->VisOdom]` | avg 19.5–21.8，max 92–137 | avg 54.6–113.4，max 155–519 |
+| `[Img->VisCloud]` | avg 32.6–36.0，max 117–152 | avg 79.7–151.1，max 364–584 |
+
+- A 臂稳态窗口健康：彩色帧 1796 / 地图 784.4 万点 / 输入丢弃 0。
+- A 臂末段两个窗口出现 `[Lidar->Odom]` max 3013 / 4359 ms 的尖峰，同期 `[Img->Vis*]`
+  尾窗均值被拉高到 113 / 134 ms；B 臂无此尖峰。疑似与并行仿真进程抢 CPU 相关
+  （DDS 虽已隔离，机器仍在跑 task_dispatcher），**待干净机器复跑确认**。
+- B 臂结论方向符合架构预期：图像周期内需完成 KLT + 锚点更新并注入 ESKF，
+  视觉端到端延时约为 A 的 3–5 倍；主干延时两臂同量级。
+- 另一观察（非本次目标，留档）：B 臂 `[注入]` 统计 push=1778 / take=1342 / 生效=170 /
+  过期=1172、取用时差 avg 634 ms，注入队列过期率偏高，后续值得单独排查。
+
+### 42.6 产出物
+
+- 代码：`latency_timer.hpp`（新增）+ A/B `visual_pipeline.hpp/.cpp` 与 A app
+  （`visual_a_app.cpp`）计时接线，共 6 个文件；编译已验证。
+- 参数：`super_livo_visual.timing`（A/B 同名，默认 false）。
+- 日志：`/tmp/t20261118_{a,b}.log`（本机临时，不入库）。
+

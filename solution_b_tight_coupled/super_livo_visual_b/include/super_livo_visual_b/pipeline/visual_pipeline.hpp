@@ -37,6 +37,7 @@
 #include "pointcloud_colorizer/colorizer_pipeline.hpp"
 #include "pointcloud_colorizer/voxel_color_median.hpp"
 #include "super_livo_common/degeneracy_signature.hpp"
+#include "super_livo_common/latency_timer.hpp"
 
 namespace superlivo_b {
 
@@ -437,6 +438,8 @@ class VisualPipeline {
   bool pushInputEvent(InputEvent event);
   void workerLoop();
   void saveLoop();
+  /// 每 60 s 打印一次延时窗口（timing_en_ 开启且有记录时），工作线程调用
+  void maybePrintLatencyWindow();
 
   struct ColorSegment {
     pcl::PointCloud<pcl::PointXYZRGB> points;
@@ -452,6 +455,13 @@ class VisualPipeline {
   bool input_stop_{false};
   std::atomic<std::size_t> stat_input_dropped_{0};
   std::thread worker_;
+
+  // 延时计时（口径仿 Super-LIO lio.eva.timer）：img_enqueue_wall_ /
+  // last_timing_report_ 仅工作线程读写；latency_timer_ 内部加锁。
+  bool timing_en_{false};
+  superlivo_common::LatencyTimer latency_timer_;
+  std::chrono::steady_clock::time_point img_enqueue_wall_{};
+  std::chrono::steady_clock::time_point last_timing_report_{};
 
   std::size_t save_handed_points_{0};
   std::deque<ColorSegment> save_segments_;

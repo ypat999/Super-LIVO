@@ -29,6 +29,7 @@
 #include "pointcloud_colorizer/colorizer_pipeline.hpp"
 #include "pointcloud_colorizer/voxel_color_median.hpp"
 #include "super_livo_common/degeneracy_signature.hpp"
+#include "super_livo_common/latency_timer.hpp"
 
 namespace superlivo_a {
 
@@ -122,6 +123,11 @@ struct VisualPipelineOptions {
   std::string img_save_dir;
   /// 每 N 张图像写一张（<=0 关闭）。
   int img_save_interval{1};
+
+  // ---- 延时计时（口径仿 Super-LIO lio.eva.timer，见 LatencyTimer）----
+  /// 开启后按 60 s 窗口打印视觉支路端到端墙钟延时：
+  /// [Img->VisOdom] 图像入队 → 修正 odom 发布；[Img->VisCloud] 图像入队 → 彩色云发布。
+  bool timing_en{false};
 };
 
 /// 进程内视觉流水线（方案 A）。
@@ -270,6 +276,8 @@ class VisualPipeline {
   bool pushInputEvent(InputEvent event);
   void workerLoop();
   void saveLoop();
+  /// 每 60 s 打印一次延时窗口（timing_en 开启且有记录时），工作线程调用
+  void maybePrintLatencyWindow();
 
   struct ColorSegment {
     pcl::PointCloud<pcl::PointXYZRGB> points;
@@ -285,6 +293,12 @@ class VisualPipeline {
   bool input_stop_{false};
   std::atomic<std::size_t> stat_input_dropped_{0};
   std::thread worker_;
+
+  // 延时计时：img_enqueue_wall_ / last_timing_report_ 仅工作线程读写；
+  // latency_timer_ 内部加锁（退出总报告可能来自 shutdown 线程）。
+  superlivo_common::LatencyTimer latency_timer_;
+  std::chrono::steady_clock::time_point img_enqueue_wall_{};
+  std::chrono::steady_clock::time_point last_timing_report_{};
 
   std::size_t save_handed_points_{0};
   std::deque<ColorSegment> save_segments_;

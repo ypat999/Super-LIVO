@@ -204,6 +204,8 @@ superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
   opt.img_save_en = getOrDeclare<bool>(node, vp("image_save.img_save_en"), false);
   opt.img_save_dir = getOrDeclare<std::string>(node, vp("image_save.dir"), "");
   opt.img_save_interval = getOrDeclare<int>(node, vp("image_save.interval"), 1);
+  // 延时计时（仿 lio.eva.timer 口径）：[Img->VisOdom] / [Img->VisCloud]
+  opt.timing_en = getOrDeclare<bool>(node, vp("timing"), false);
 
   // ---- 标定源覆盖（各取所长，最高优先级）----
   // camera_intrinsic.yaml 提供内参+畸变，FAST-Calib 结果提供外参 Rcl/Pcl；

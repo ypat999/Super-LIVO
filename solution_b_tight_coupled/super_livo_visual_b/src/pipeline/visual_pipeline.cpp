@@ -535,6 +535,7 @@ void VisualPipeline::workerLoop() {
     const auto handler_begin = std::chrono::steady_clock::now();
     switch (ev.kind) {
       case InputEvent::Kind::kImage:
+        img_enqueue_wall_ = ev.enqueued;  // 延时计时锚点：图像入队墙钟时刻
         onImage(ev.image, ev.stamp);
         break;
       case InputEvent::Kind::kOdom:
@@ -568,7 +569,24 @@ void VisualPipeline::workerLoop() {
     }
     // 工作线程占用时长（分派+处理），配合报告窗口可算线程占空比。
     g_probe.ms_handler.add(probeMs(handler_begin));
+    maybePrintLatencyWindow();
   }
+}
+
+void VisualPipeline::maybePrintLatencyWindow() {
+  if (!timing_en_) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (last_timing_report_.time_since_epoch().count() == 0) {
+    last_timing_report_ = now;  // 首个事件确立窗口起点
+    return;
+  }
+  if (now - last_timing_report_ < std::chrono::seconds(60) || latency_timer_.empty()) {
+    return;
+  }
+  latency_timer_.PrintAndClear();
+  last_timing_report_ = now;
 }
 
 void VisualPipeline::saveLoop() {
@@ -691,6 +709,10 @@ void VisualPipeline::shutdownAndSave() {
     // 同步写出整张彩色地图。长序列（几百万点 + 中位数回填）要几秒，
     // 这一步必须在本进程内完成，不能交给 save 线程（进程退出时线程被杀）。
     saveColoredMap();
+    // 延时总报告（worker 已 join，无并发 Record；60 s 窗口报告之外的尾量在这）
+    if (timing_en_) {
+      latency_timer_.PrintAll();
+    }
   });
 }
 
@@ -700,6 +722,9 @@ VisualPipeline::~VisualPipeline() {
 }
 
 void VisualPipeline::loadParameters() {
+  // ---- 延时计时开关（仿 lio.eva.timer 口径；app 的 ParamSource 已带
+  //      super_livo_visual. 前缀，YAML/-p 用全名 super_livo_visual.timing）----
+  timing_en_ = params_.getBool("timing", false);
   // ---- 相机内参与畸变（同方案 A，来自 camera_pinhole.yaml） --------------
   scale_ = params_.getDouble("scale", 0.5);
   intrinsics_.width = params_.getInt("cam_width", 640);
@@ -2463,6 +2488,13 @@ std::vector<FeatureTrack> VisualPipeline::assembleTracks(
 
 void VisualPipeline::publishColoredCloud(const std::vector<colorizer::ColoredPoint>& points,
                                          double stamp) {
+  if (timing_en_ && img_enqueue_wall_.time_since_epoch().count() != 0) {
+    latency_timer_.Record(
+        "[Img->VisCloud]",
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                  img_enqueue_wall_)
+            .count());
+  }
   // 点表达在 LiDAR 系；ROS 消息的组装与发布由 app 完成。
   if (colored_cb_) {
     colored_cb_(points, stamp);
@@ -2585,6 +2617,13 @@ void VisualPipeline::saveColoredMap() {
 }
 
 void VisualPipeline::publishOdomAndPath(const Eigen::Matrix4d& T_wl, double stamp) {
+  if (timing_en_ && img_enqueue_wall_.time_since_epoch().count() != 0) {
+    latency_timer_.Record(
+        "[Img->VisOdom]",
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                  img_enqueue_wall_)
+            .count());
+  }
   // odom 与 path 的发布（含 path 累积）在 app 侧完成，这里只输出位姿。
   if (odom_cb_) {
     odom_cb_(T_wl, stamp);

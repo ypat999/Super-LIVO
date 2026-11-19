@@ -314,6 +314,7 @@ void VisualPipeline::workerLoop() {
     // 全部算法状态只在这条线程上访问，因此 handleXxx 内部无需任何锁。
     switch (ev.kind) {
       case InputEvent::Kind::kImage:
+        img_enqueue_wall_ = ev.enqueued;  // 延时计时锚点：图像入队墙钟时刻
         handleImage(ev.image, ev.stamp);
         break;
       case InputEvent::Kind::kOdom:
@@ -342,7 +343,24 @@ void VisualPipeline::workerLoop() {
       case InputEvent::Kind::kQuit:
         return;
     }
+    maybePrintLatencyWindow();
   }
+}
+
+void VisualPipeline::maybePrintLatencyWindow() {
+  if (!opt_.timing_en) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (last_timing_report_.time_since_epoch().count() == 0) {
+    last_timing_report_ = now;  // 首个事件确立窗口起点
+    return;
+  }
+  if (now - last_timing_report_ < std::chrono::seconds(60) || latency_timer_.empty()) {
+    return;
+  }
+  latency_timer_.PrintAndClear();
+  last_timing_report_ = now;
 }
 
 void VisualPipeline::saveLoop() {
@@ -462,6 +480,10 @@ void VisualPipeline::shutdownAndSave() {
     if (pose_file_.is_open()) {
       pose_file_.flush();
       pose_file_.close();
+    }
+    // 延时总报告（worker 已 join，无并发 Record；60 s 窗口报告之外的尾量在这）
+    if (opt_.timing_en) {
+      latency_timer_.PrintAll();
     }
   });
 }
@@ -1119,6 +1141,13 @@ bool VisualPipeline::poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl,
 
 void VisualPipeline::publishColoredCloud(
     const std::vector<colorizer::ColoredPoint>& points, double stamp) {
+  if (opt_.timing_en && img_enqueue_wall_.time_since_epoch().count() != 0) {
+    latency_timer_.Record(
+        "[Img->VisCloud]",
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                  img_enqueue_wall_)
+            .count());
+  }
   ColoredCloudCallback cb;
   {
     std::lock_guard<std::mutex> lk(cb_mutex_);
@@ -1275,6 +1304,13 @@ void VisualPipeline::saveImage(const cv::Mat& bgr, double stamp) {
 }
 
 void VisualPipeline::publishOdomAndPath(const Eigen::Matrix4d& T_wl, double stamp) {
+  if (opt_.timing_en && img_enqueue_wall_.time_since_epoch().count() != 0) {
+    latency_timer_.Record(
+        "[Img->VisOdom]",
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                  img_enqueue_wall_)
+            .count());
+  }
   OdomCallback cb;
   {
     std::lock_guard<std::mutex> lk(cb_mutex_);
