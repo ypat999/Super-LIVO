@@ -95,8 +95,8 @@ ros2 run super_lio super_lio_node --ros-args --params-file "$SL_NTU" \
   > /tmp/slio_${SEQ}_${SIDE}.log 2>&1 &
 # 可选：用环境变量覆盖门控阈值（做阈值敏感性/链路验证时用），不设则用 params 文件
 GATE_ARGS=()
-[ -n "$GATE_LO" ] && GATE_ARGS+=(-p gate.cond_lo:=$GATE_LO)
-[ -n "$GATE_HI" ] && GATE_ARGS+=(-p gate.cond_hi:=$GATE_HI)
+[ -n "$GATE_LO" ] && GATE_ARGS+=(-p super_livo_visual.gate.cond_lo:=$GATE_LO)
+[ -n "$GATE_HI" ] && GATE_ARGS+=(-p super_livo_visual.gate.cond_hi:=$GATE_HI)
 ros2 run "$NODE_PKG" "$NODE_EXE" --ros-args --params-file "$PARAMS" "${GATE_ARGS[@]}" \
   > "$VLOG" 2>&1 &
 sleep 6

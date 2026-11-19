@@ -716,16 +716,16 @@ void VisualPipeline::loadParameters() {
   T_li_ = Eigen::Matrix4d::Identity();
 
   // LiDAR 先验强度（D2）：先验越小越"信任" lio/odom，视觉修正越弱。
-  prior_pos_sigma_ = params_.getDouble("lv.prior_pos_sigma", 0.05);
-  prior_rot_sigma_ = params_.getDouble("lv.prior_rot_sigma", 0.02);
-  prior_vel_sigma_ = params_.getDouble("lv.prior_vel_sigma", 0.25);
+  prior_pos_sigma_ = params_.getDouble("update.prior_pos_sigma", 0.05);
+  prior_rot_sigma_ = params_.getDouble("update.prior_rot_sigma", 0.02);
+  prior_vel_sigma_ = params_.getDouble("update.prior_vel_sigma", 0.25);
   // 退化感知先验：退化方向松开、垂直方向收紧（详见头文件注释）
   prior_directional_en_ =
-      params_.getBool("lv.prior_directional_en", true);
+      params_.getBool("update.directional_prior_en", true);
   prior_pos_sigma_healthy_ =
-      params_.getDouble("lv.prior_pos_sigma_healthy", 0.005);
+      params_.getDouble("update.prior_pos_sigma_healthy", 0.005);
   prior_pos_sigma_degen_ =
-      params_.getDouble("lv.prior_pos_sigma_degen", 1.0);
+      params_.getDouble("update.prior_pos_sigma_degen", 1.0);
   // sev 对数映射标尺（本数据集实测）：健康段 cond_t≈25-40，必须映射为 sev≈0，
   // 否则先验在健康段就被无端松开一半（旧默认 10/100 使 cond_t=33 映射成 0.5）。
   // 完全退化（n_effect=0，cond=1e12）由 axes/active 硬触发直接置 1，不走该映射。
@@ -790,17 +790,17 @@ void VisualPipeline::loadParameters() {
   lidar_visual_options_.cy = intrinsics_.cy;
   lidar_visual_options_.image_width = intrinsics_.width;
   lidar_visual_options_.image_height = intrinsics_.height;
-  lidar_visual_options_.pixel_radius = params_.getInt("lv.pixel_radius", 3);
-  lidar_visual_options_.huber_delta = params_.getDouble("lv.huber_delta", 1.0);
-  lidar_visual_options_.min_constraints = params_.getInt("lv.min_constraints", 8);
-  lidar_visual_options_.max_pixel_error = params_.getDouble("lv.max_pixel_error", 8.0);
+  lidar_visual_options_.pixel_radius = params_.getInt("depth.pixel_radius", 3);
+  lidar_visual_options_.huber_delta = params_.getDouble("reproj.huber_delta", 1.0);
+  lidar_visual_options_.min_constraints = params_.getInt("reproj.min_constraints", 8);
+  lidar_visual_options_.max_pixel_error = params_.getDouble("reproj.max_pixel_error", 8.0);
   lidar_visual_options_.max_pixel_error_anchored =
-      params_.getDouble("lv.max_pixel_error_anchored", 60.0);
+      params_.getDouble("reproj.max_pixel_error_anchored", 60.0);
   // 测量噪声模型：没有它等价于 σ=1 px 且地图点无误差，一帧即可压塌协方差。
-  lidar_visual_options_.sigma_pix = params_.getDouble("lv.sigma_pix", 1.5);
-  lidar_visual_options_.sigma_anchor = params_.getDouble("lv.sigma_anchor", 0.05);
+  lidar_visual_options_.sigma_pix = params_.getDouble("reproj.sigma_pix", 1.5);
+  lidar_visual_options_.sigma_anchor = params_.getDouble("reproj.sigma_anchor", 0.05);
   lidar_visual_options_.anchor_keep_sec =
-      params_.getDouble("lv.anchor_keep_sec", 20.0);
+      params_.getDouble("depth.anchor_keep_sec", 20.0);
   lidar_visual_ = std::make_unique<LidarVisualConstraint>(lidar_visual_options_);
 
   // ---- MSCKF 多帧约束 MsckfConstraint -------------------------------------
@@ -830,7 +830,7 @@ void VisualPipeline::loadParameters() {
   photometric_ = std::make_unique<PhotometricConstraint>(photo_options_);
 
   // ---- 统一估计器 UnifiedEstimator ----------------------------------------
-  estimator_options_.enable_visual = params_.getBool("est.enable_visual", true);
+  estimator_options_.enable_visual = params_.getBool("update.enable", true);
   estimator_options_.visual_weight = params_.getDouble("est.visual_weight", 1.0);
   estimator_options_.estimate_extrinsics = params_.getBool("est.estimate_extrinsics", false);
   estimator_options_.gyro_noise = params_.getDouble("est.gyro_noise", 1.0e-3);

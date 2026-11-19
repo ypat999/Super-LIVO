@@ -6,9 +6,10 @@
 
 - 四臂：**FL2** = 官方 FAST-LIVO2；**SL** = 官方 Super-LIO（rtk/room 用自带视觉配置，其余数据集 LIO-only）；**A** = Super-LIO 主干 + 轻量视觉；**B** = Super-LIO 主干 + 紧耦合视觉。
 - 统一 1× 实时播放、同一 FastDDS / ROS_DOMAIN_ID、同一外部探针；延时为「odom 到达 − 对应雷达帧到达」的 algo 项。
-- 结果根：**B 取 `paper_20261119`**（本轮当前代码：`/lio/odom` 为 10 Hz、经 `odom_robo⁻¹` 换回 IMU 机体系、`poseFromSamples` 插值取相机位姿；本条跑批用 `visual_b_node`，注入门控 `app.visual_inject_max_dt` 只在 `visual_b_app` 单进程路径生效），**FL2/SL/A 取 `paper_sync`**（`lio.extrinsic.odom_robo` 回单位阵后的重跑）。
-  ⚠️ **2026-11-19 起 b 臂已改为单体 `visual_b_app`，且 `app.visual_inject` 默认开（视觉约束真的写回 ESKF）** ⇒ 本表 B 行仍是双进程（无注入）口径，两者不可混比；矩阵 B 行需用单体形态重跑后才能与其余三臂并列（见 [exp_records §39](../exp_records.md)、[方案 B README §9.11](../../solution_b_tight_coupled/README.md)）。
-- move 序列：B 用 `move_ros2`（图像 header 保留主机时钟，以 `-p img_time_offset:=-204262818.9974` 覆盖）；原 `move_livoxclk`（图像 header 已改写为 Livox 时钟）副本已不在磁盘，FL2/SL/A 的 move 行仍来自 `paper_sync` 的该副本——两者只差图像 header 的时钟域，雷达/IMU 数据完全相同，对 LIO/轨迹无影响。
+- 结果根：**B 取 `paper_20261119`**（本轮当前代码：`/lio/odom` 为 10 Hz、经 `odom_robo⁻¹` 换回 IMU 机体系、`poseFromSamples` 插值取相机位姿；本条跑批用 `visual_b_node`，注入门控 `app.visual_inject_max_dt`（该记录为改名前命名，现名 `super_livo_visual.inject_max_dt`）只在 `visual_b_app` 单进程路径生效），**FL2/SL/A 取 `paper_sync`**（`lio.extrinsic.odom_robo` 回单位阵后的重跑）。
+  ⚠️ **2026-11-19 起 b 臂已改为单体 `visual_b_app`，且 `super_livo_visual.inject` 默认开（视觉约束真的写回 ESKF；本条记录时叫 `app.visual_inject`）** ⇒ 本表 B 行仍是双进程（无注入）口径，两者不可混比；矩阵 B 行需用单体形态重跑后才能与其余三臂并列（见 [exp_records §39](../exp_records.md)、[方案 B README §9.11](../../solution_b_tight_coupled/README.md)）。
+- move 序列：B 用 `move_ros2`（图像 header 保留主机时钟，以 `-p super_livo_visual.img_time_offset:=-204262818.9974`
+  覆盖；该跑批当时的写法是 `-p img_time_offset:=…`，2026-11-19 参数格式统一后 `-p` 必须写带前缀的全名）；原 `move_livoxclk`（图像 header 已改写为 Livox 时钟）副本已不在磁盘，FL2/SL/A 的 move 行仍来自 `paper_sync` 的该副本——两者只差图像 header 的时钟域，雷达/IMU 数据完全相同，对 LIO/轨迹无影响。
 - rtk 用 RTK-SLAM 官方绝对评测（起点+前 30 s 定向，不做全轨迹对齐），同时给出 SE3 对齐 ATE 与 Gap；ntu 用 ATE（最近邻）与旋转区间 RPE。
 
 ## 0.5 关键结论

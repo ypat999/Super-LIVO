@@ -28,7 +28,7 @@ for pair in B:2 C:1; do
     --params-file "$CFG" -p lio.hash_map.rep_mode:="$mode" \
     > "$dir/slio.log" 2>&1 &
   ros2 run super_livo_visual_a visual_a_node --ros-args \
-    --params-file "$VCFG" -p pcd.save_dir:="$dir" -p pcd.save_interval_sec:=0.0 \
+    --params-file "$VCFG" -p super_livo_visual.pcd.save_dir:="$dir" -p super_livo_visual.pcd.save_interval_sec:=0.0 \
     > "$dir/vis.log" 2>&1 &
   for i in $(seq 1 60); do grep -aq "Map init done" "$dir/slio.log" && break; sleep 1; done
   sleep 2

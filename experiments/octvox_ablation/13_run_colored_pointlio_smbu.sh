@@ -25,11 +25,11 @@ ros2 run point_lio pointlio_mapping --ros-args \
 sleep 5
 ros2 run super_livo_visual_a visual_a_node --ros-args \
   --params-file "$VCFG" \
-  -p odom_topic:="/aft_mapped_to_init" \
-  -p body_cloud_topic:="/cloud_registered_body" \
-  -p cloud_topic:="/cloud_registered" \
-  -p pcd.save_dir:="$OUT" \
-  -p pcd.save_interval_sec:=0.0 \
+  -p super_livo_visual.odom_topic:="/aft_mapped_to_init" \
+  -p super_livo_visual.body_cloud_topic:="/cloud_registered_body" \
+  -p super_livo_visual.cloud_topic:="/cloud_registered" \
+  -p super_livo_visual.pcd.save_dir:="$OUT" \
+  -p super_livo_visual.pcd.save_interval_sec:=0.0 \
   > "$OUT/vis.log" 2>&1 &
 sleep 3
 ros2 bag play "$BAG" --rate 1.0 --disable-keyboard-controls < /dev/null > "$OUT/play.log" 2>&1

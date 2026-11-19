@@ -38,12 +38,12 @@ for i in $(seq 1 60); do grep -aq "Map init done" "$OUT/slio.log" && break; slee
 # 默认配对窗 0.05 s 会把 20 s 之后的所有帧全部丢掉。SYNC_MAX 可放大配对窗。
 EXTRA=()
 if [ -n "${SYNC_MAX:-}" ]; then
-  EXTRA+=(-p color.sync_max_offset:="$SYNC_MAX")
+  EXTRA+=(-p super_livo_visual.color.sync_max_offset:="$SYNC_MAX")
 fi
 ros2 run super_livo_visual_a visual_a_node --ros-args \
   --params-file "$REPO/solution_a_lightweight/super_livo_visual_a/config/visual_a_params.yaml" \
   "${EXTRA[@]}" \
-  -p pcd.save_dir:="$OUT" -p pcd.save_interval_sec:=0.0 \
+  -p super_livo_visual.pcd.save_dir:="$OUT" -p super_livo_visual.pcd.save_interval_sec:=0.0 \
   > "$OUT/vis.log" 2>&1 &
 sleep 3
 ros2 bag play "$BAG" --rate 1.0 --disable-keyboard-controls < /dev/null \

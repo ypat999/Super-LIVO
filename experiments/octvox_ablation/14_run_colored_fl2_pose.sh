@@ -59,26 +59,26 @@ run_one() {
   # A/B 各自的视觉修正轨迹，不再另给相机位姿源。
   EXTRA=()
   if [ "$OWN" != "true" ]; then
-    EXTRA+=(-p color.cam_odom_topic:=/vio/odom_lidar)
+    EXTRA+=(-p super_livo_visual.color.cam_odom_topic:=/vio/odom_lidar)
   fi
 
   if [ "$plan" = "A" ]; then
     "$ABIN" --ros-args --params-file "$ACFG" \
-      -p odom_topic:=/aft_mapped_lidar_to_init \
-      -p body_cloud_topic:=/cloud_registered_body \
-      -p cloud_topic:=/cloud_registered \
-      -p color.use_own_odom:="$OWN" \
+      -p super_livo_visual.odom_topic:=/aft_mapped_lidar_to_init \
+      -p super_livo_visual.body_cloud_topic:=/cloud_registered_body \
+      -p super_livo_visual.cloud_topic:=/cloud_registered \
+      -p super_livo_visual.color.use_own_odom:="$OWN" \
       "${EXTRA[@]}" \
-      -p pcd.save_dir:="$dir" -p pcd.save_interval_sec:=0.0 \
+      -p super_livo_visual.pcd.save_dir:="$dir" -p super_livo_visual.pcd.save_interval_sec:=0.0 \
       > "$dir/vis.log" 2>&1 &
   else
     "$BBIN" --ros-args --params-file "$BCFG" \
-      -p odom_topic:=/aft_mapped_lidar_to_init \
-      -p body_cloud_topic:=/cloud_registered_body \
-      -p cloud_topic:=/cloud_registered \
-      -p color.use_own_odom:="$OWN" \
+      -p super_livo_visual.odom_topic:=/aft_mapped_lidar_to_init \
+      -p super_livo_visual.body_cloud_topic:=/cloud_registered_body \
+      -p super_livo_visual.cloud_topic:=/cloud_registered \
+      -p super_livo_visual.color.use_own_odom:="$OWN" \
       "${EXTRA[@]}" \
-      -p pcd.save_dir:="$dir" -p pcd.save_interval_sec:=0.0 \
+      -p super_livo_visual.pcd.save_dir:="$dir" -p super_livo_visual.pcd.save_interval_sec:=0.0 \
       > "$dir/vis.log" 2>&1 &
   fi
   VIS=$!

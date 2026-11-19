@@ -38,13 +38,13 @@ fi
 # 默认配对窗 0.05 s 会把 20 s 之后的帧全丢掉。
 COLOR_EXTRA=()
 if [ -n "${SYNC_MAX:-}" ]; then
-  COLOR_EXTRA+=(-p color.sync_max_offset:="$SYNC_MAX")
+  COLOR_EXTRA+=(-p super_livo_visual.color.sync_max_offset:="$SYNC_MAX")
 fi
 # 图像订阅用 reliable（与 rosbag2 回放端一致）。默认的 SensorDataQoS(best_effort)
 # 在本机单线程 executor 下会被密集点云回调饿死，整段收不到图像（实测 0 帧）。
-COLOR_EXTRA+=(-p image.qos_reliable:=true)
+COLOR_EXTRA+=(-p super_livo_visual.image.qos_reliable:=true)
 # 归因消融用：从环境注入额外的 -p（空格分隔的完整 token，如
-# EXTRA_COLOR='-p color.own_res_max_pos:=0.1 -p color.own_res_max_rot:=0.0087'）。
+# EXTRA_COLOR='-p super_livo_visual.color.own_res_max_pos:=0.1 -p super_livo_visual.color.own_res_max_rot:=0.0087'）。
 # shellcheck disable=SC2206
 COLOR_EXTRA+=(${EXTRA_COLOR:-})
 
@@ -62,8 +62,8 @@ run_one() {
   ros2 run super_livo_visual_b visual_b_node --ros-args \
     --params-file "$REPO/solution_b_tight_coupled/super_livo_visual_b/config/visual_b_params.yaml" \
     "${COLOR_EXTRA[@]}" \
-    -p color.use_own_odom:="$own" \
-    -p pcd.save_dir:="$dir" -p pcd.save_interval_sec:=0.0 \
+    -p super_livo_visual.color.use_own_odom:="$own" \
+    -p super_livo_visual.pcd.save_dir:="$dir" -p super_livo_visual.pcd.save_interval_sec:=0.0 \
     > "$dir/vis.log" 2>&1 &
   sleep 3
   ros2 bag play "$BAG" --rate "${BAG_RATE:-1.0}" --disable-keyboard-controls < /dev/null \

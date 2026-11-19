@@ -62,6 +62,14 @@ namespace superlivo_a {
 //     变化，需要每帧重建 ColorizerPipeline 或修正 colorizer 库，切勿当成固定外参。
 // ----------------------------------------------------------------------------
 
+// ----------------------------------------------------------------------------
+// 统一参数格式：所有视觉参数在 YAML 里位于 ros__parameters 下的 super_livo_visual 分支，
+// rcl 会摊平成 super_livo_visual.<name>，故读取时统一加这个前缀。
+// 节点路径（VisualANode::declare_parameter）与单体路径（app 的 getOrDeclare）
+// 必须共用本函数，保证同一份 YAML 两条路径读到的参数名完全一致。
+inline std::string vp(const std::string& name) { return "super_livo_visual." + name; }
+// ----------------------------------------------------------------------------
+
 /// 方案 A 视觉辅助节点。
 class VisualANode : public rclcpp::Node {
  public:

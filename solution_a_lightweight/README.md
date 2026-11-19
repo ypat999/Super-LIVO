@@ -107,6 +107,9 @@ Super-LIO 主干 + 视觉支路），与纯 LIO 的 `super_lio_node` 互不影�
 
 > 视觉更新库内默认关闭（`VisualUpdate::Options::enable = false`），NTU 实验配置
 > `visual_a_ntu.yaml` 中已显式打开（`update.enable: true`）。
+> 本文所有参数名均为 params 文件里 `super_livo_visual:` 分支内的**短名**（省略前缀写法），
+> 真实参数名与 `-p` 覆盖要带 `super_livo_visual.` 前缀，规则见根
+> [README「参数文件规范」](../README.md#参数文件规范ros-2-params-yaml)。
 
 ## 8. 退化对抗（当前实现与结论）
 

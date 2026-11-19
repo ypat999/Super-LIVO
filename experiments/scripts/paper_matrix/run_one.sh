@@ -136,7 +136,7 @@ esac
 # move_livoxclk 写的 0.0，这里按实测差值覆盖，否则 t_img 会落到 2026 年。
 VOVER=()
 [ -n "${MOVE_IMG_OFF:-}" ] && [ "$ARM" != "sl" ] && [ "$ARM" != "fl2" ] && \
-  VOVER=(-p img_time_offset:=$MOVE_IMG_OFF)
+  VOVER=(-p super_livo_visual.img_time_offset:=$MOVE_IMG_OFF)
 
 mkdir -p "$OUT"
 rm -rf "$OUT/odom" "$OUT/pcd" "$OUT/latency.csv" "$OUT/meta.txt" "$OUT/done"
@@ -312,7 +312,7 @@ else
     if [ "$SEQ" = "ntu01" ] || [ "$SEQ" = "ntu03" ]; then
       APP_ARGS+=(-p lio.observe.degeneracy_detect_en:=true -p lio.observe.degen_trans_only:=1)
     fi
-    APP_ARGS+=("${VOVER[@]}" -p pcd.save_dir:="$OUT/pcd")
+    APP_ARGS+=("${VOVER[@]}" -p super_livo_visual.pcd.save_dir:="$OUT/pcd")
     ros2 run "$NODE_PKG" "$NODE_EXE" "${APP_ARGS[@]}" > "$OUT/node.log" 2>&1 &
     NODE_PID=$!
   else
@@ -326,7 +326,7 @@ else
     NODE_PID=$!
     sleep 6
     ros2 run "$NODE_PKG" "$NODE_EXE" --ros-args --params-file "$VCFG" \
-      "${VOVER[@]}" -p pcd.save_dir:="$OUT/pcd" > "$OUT/node.log" 2>&1 &
+      "${VOVER[@]}" -p super_livo_visual.pcd.save_dir:="$OUT/pcd" > "$OUT/node.log" 2>&1 &
     NODE_PID=$!
   fi
 fi

@@ -44,7 +44,7 @@ sed "s|^ *pcd.save_dir:.*|    pcd.save_dir: \"$OUT\"|" "$VPARAM" > "$OUT/visual_
 
 ARGS=(--params-file "$REPO/config/retail_lio.yaml" --params-file "$OUT/visual_params.yaml")
 # 只有 B 声明了 app.visual_inject；给 A 传未声明参数会被 rclcpp 直接拒绝启动
-[ "$LINE" = "b" ] && ARGS+=(-p app.visual_inject:=true)
+[ "$LINE" = "b" ] && ARGS+=(-p super_livo_visual.inject:=true)
 
 ros2 run "$APP" "$EXE" --ros-args "${ARGS[@]}" > "$OUT/node.log" 2>&1 &
 NODE_PID=$!

@@ -50,7 +50,7 @@ ros2 run super_lio super_lio_node --ros-args \
 LIO_PID=$!
 ros2 run super_livo_visual_a visual_a_node --ros-args \
   --params-file "$VIS_CFG" \
-  -p pcd.save_dir:="$OUT" -p pcd.save_interval_sec:=0.0 \
+  -p super_livo_visual.pcd.save_dir:="$OUT" -p super_livo_visual.pcd.save_interval_sec:=0.0 \
   > "$OUT/vis.log" 2>&1 &
 VIS_PID=$!
 printf '%s\n%s\n%s\n%s\n' "$RELAY_PID" "$REC_PID" "$LIO_PID" "$VIS_PID" > "$PIDF"

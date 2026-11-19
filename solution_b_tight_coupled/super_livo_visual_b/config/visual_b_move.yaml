@@ -12,34 +12,39 @@
 # 写成 super_livo_visual_b 时用 ros2 run 起会整块不生效。
 /**:
   ros__parameters:
-    image_topic: /left_camera/image
-    imu_topic: /livox/imu
-    cam_width: 1280
-    cam_height: 1024
-    cam_fx: 7.0863125924497740e+02
-    cam_fy: 7.0871513587278127e+02
-    cam_cx: 6.4449372682521789e+02
-    cam_cy: 4.9588359175254533e+02
-    cam_d: [5.4466418090825280e-02, -4.5147373415016401e-02,
-            8.5461102120314711e-06, 1.0486594840736336e-03]
-    # LiDAR -> Camera（p_cam = Rcl * P_lidar + Pcl），与方案 A 同一标定结果
-    # FAST-Calib 重标（all_ros2 + img_0120.png，本地标定参数，RMSE 7.9 mm）
-    # holefix：真实板面 RANSAC 法向 + 前表面 + 1° 扇区最小半径重解 4 孔心 → Kabsch，
-    # 四孔 3D 对应点 RMSE 3.2 mm（优于 FAST-Calib 直出的 7.9 mm）。2026-11-17 重写。
-    Rcl: [-0.017100, -0.999833, -0.006427,
-           0.482159, -0.002615, -0.876080,
-           0.875917, -0.018080,  0.482123]
-    Pcl: [0.027840, -0.172288, -0.047550]
-    img_time_offset: 0.0
-    # 相机与雷达扫描存在相位差（最近邻 dt 中位 16.7ms、最大 74ms），放宽同步窗。
-    color.sync_max_offset: 0.1
+    # ---- 视觉支路参数（方案 A / 方案 B 共用同一套名字）----
+    # rcl 会把本分支摊平成 super_livo_visual.<name>，代码侧读取时必须带这个前缀；
+    # 官方 super_lio_node 不认识本分支，未声明的 override 被静默忽略，故同一份文件
+    # 直接喂 super_lio_node 也能跑（这就是本仓库统一参数格式的目的）。
+    super_livo_visual:
+        image_topic: /left_camera/image
+        imu_topic: /livox/imu
+        cam_width: 1280
+        cam_height: 1024
+        cam_fx: 7.0863125924497740e+02
+        cam_fy: 7.0871513587278127e+02
+        cam_cx: 6.4449372682521789e+02
+        cam_cy: 4.9588359175254533e+02
+        cam_d: [5.4466418090825280e-02, -4.5147373415016401e-02,
+                8.5461102120314711e-06, 1.0486594840736336e-03]
+        # LiDAR -> Camera（p_cam = Rcl * P_lidar + Pcl），与方案 A 同一标定结果
+        # FAST-Calib 重标（all_ros2 + img_0120.png，本地标定参数，RMSE 7.9 mm）
+        # holefix：真实板面 RANSAC 法向 + 前表面 + 1° 扇区最小半径重解 4 孔心 → Kabsch，
+        # 四孔 3D 对应点 RMSE 3.2 mm（优于 FAST-Calib 直出的 7.9 mm）。2026-11-17 重写。
+        Rcl: [-0.017100, -0.999833, -0.006427,
+               0.482159, -0.002615, -0.876080,
+               0.875917, -0.018080,  0.482123]
+        Pcl: [0.027840, -0.172288, -0.047550]
+        img_time_offset: 0.0
+        # 相机与雷达扫描存在相位差（最近邻 dt 中位 16.7ms、最大 74ms），放宽同步窗。
+        color.sync_max_offset: 0.1
 
-    # 彩色点云落盘：<save_dir>/super_livo_visual_b_colored.pcd
-    pcd:
-      save_dir: "/home/ywj/slam_data/output/move_b"
-      # 必须 <=0（只在退出时存一次）：周期落盘发生在单线程 executor 里，
-      # 200 万点写盘会阻塞约 1 s，实测直接造成 0.92 s IMU 丢包 + 图像帧丢弃，
-      # 恢复后姿态/速度被伪加速度泵飞（|v| 1.69 m/s、路径多 1.2 m）。
-      # 评测运行只需要最终的合并 pcd，退出时存一次即可。
-      save_interval_sec: 0.0
-      max_points: 20000000
+        # 彩色点云落盘：<save_dir>/super_livo_visual_b_colored.pcd
+        pcd:
+          save_dir: "/home/ywj/slam_data/output/move_b"
+          # 必须 <=0（只在退出时存一次）：周期落盘发生在单线程 executor 里，
+          # 200 万点写盘会阻塞约 1 s，实测直接造成 0.92 s IMU 丢包 + 图像帧丢弃，
+          # 恢复后姿态/速度被伪加速度泵飞（|v| 1.69 m/s、路径多 1.2 m）。
+          # 评测运行只需要最终的合并 pcd，退出时存一次即可。
+          save_interval_sec: 0.0
+          max_points: 20000000

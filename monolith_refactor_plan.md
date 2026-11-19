@@ -4,6 +4,10 @@
 > 范围：`solution_a_lightweight` + `solution_b_tight_coupled` 两条视觉支路，以及公共库 `third_party/Super-LIO`（`liblio`）。
 > 目标：把"一个进程内两个 ROS 节点靠 DDS 回环取 LIO 输出"改成"单节点、进程内推式共享缓冲"，视觉逻辑退化为 ROS 无关的流水线类。ROS 只保留外部输入（LiDAR/IMU/图像）与对外输出（可视化/录制）。
 > 当前进度与实测数据见 [monolith_refactor_progress.md](monolith_refactor_progress.md)。
+> **参数命名（2026-11-19 统一）**：本文涉及的支路开关已全部收进 params 的 `super_livo_visual`
+> 分支（顶层 `/**` + `ros__parameters`，摊平后真实名带 `super_livo_visual.` 前缀），旧的 `app.*`
+> 一族改名为 `super_livo_visual.embed` / `.inject` / `.inject_max_dt` / `.lio_source`；
+> 规则与改名对照表见根 [README「参数文件规范」](README.md#参数文件规范ros-2-params-yaml)。
 
 ---
 
@@ -26,7 +30,7 @@
 ## 2. 现状架构与视觉写回 ESKF 机制
 
 ### 2.1 方案 A（轻量、后处理式，不写回 ESKF）
-`visual_a_app` 是**单进程单节点**（只有 `ROSWrapper`），`app.lio_source` 决定视觉输入来源：
+`visual_a_app` 是**单进程单节点**（只有 `ROSWrapper`），`super_livo_visual.lio_source` 决定视觉输入来源：
 
 - `internal`（默认）：`VisualASuperLIO` 覆写 `onLioOutput` / `onDenseCloud`，把位姿、
   世界云、机体系全量云直推 `VisualPipeline`（ROS 无关类，**单工作线程 + 任务队列**）；
@@ -34,7 +38,7 @@
   落盘定时器都建在 `ROSWrapper` 上。进程内**无 DDS 回环**。
 - `topic`（S0 对照）：同进程再建 `VisualANode`，两者进同一个 `MultiThreadedExecutor(6)`，
   视觉侧订阅 `lio/odom`、`lio/cloud_world`、`lio/cloud_body_dense`、`lio/degeneracy`、图像。
-- `app.embed_visual=false`：只跑纯 LIO。
+- `super_livo_visual.embed=false`：只跑纯 LIO。
 
 视觉修正**不写回 ESKF**：用 `pose_offset_` 左乘（带泄漏衰减）或 `update.reinject`
 写回 `own_pose_cache_`，发布 `super_livo_visual_a/odom`。另提供 TUM 轨迹落盘
@@ -58,11 +62,11 @@ Super-LIO 处理线程 VisualBSuperLIO::ExternalObserve()
 - 视觉约束由 B 自带的 `UnifiedEstimator`（30 维影子滤波器）产出：IMU 传播直订 `/livox/imu`，
   位姿先验订 10 Hz `/lio/odom`（激光帧后验、base_link 系，用 app 注入的 `odom_robo⁻¹`
   换回 IMU 系）做 `lidarUpdate`，再 `visualUpdate`，输出 6×6 `appliedVisual()`。
-  注入侧还有 `app.visual_inject_max_dt` 时间门控（本机定为 0.4 s，见 §9.3）。
+  注入侧还有 `super_livo_visual.inject_max_dt` 时间门控（本机定为 0.4 s，见 §9.3）。
 - 部署形态（**过渡态，不是终点**）：`visual_b_app` 在同一个进程内建
   `ROSWrapper`(LIO) + `VisualBNode`(视觉) 两个节点，两者仍进同一个
   `MultiThreadedExecutor`；视觉→LIO 的写回走 `ConstraintBridge` 直接函数调用
-  （`app.visual_inject`），**只有 LIO→视觉这一侧还是 DDS 订阅**。
+  （`super_livo_visual.inject`），**只有 LIO→视觉这一侧还是 DDS 订阅**。
   B 的目标形态与 A 相同：**单进程单节点**，`VisualBNode` 最终被 `VisualPipeline`
   取代并删除（§7）。
 - 节点内部已线程化（commit `b0f5adc`），拆成三条线程：
@@ -185,7 +189,7 @@ B 的输入侧改造时再决定是否需要；不要在 A 已经跑通的路径
 3. **已实现** `visual_a_app.cpp`：`internal` 分支不建 `VisualANode`、不
    `executor.add_node(visual)`；图像订阅、彩色云 / odom / path 发布、落盘定时器
    都建在 `ROSWrapper` 上（`setupMonolithIo()`）。
-4. **已实现** 观察窗口：参数 `app.lio_source`（`internal` 默认 / `topic` 对照），
+4. **已实现** 观察窗口：参数 `super_livo_visual.lio_source`（`internal` 默认 / `topic` 对照），
    `topic` 分支保留 `VisualANode`（见 §8）。
 5. 新增输出能力（commit `d66beb6`）：TUM 轨迹 `evo.*`（`timestamp tx ty tz qx qy qz qw`，
    每 LiDAR 帧一行）与 PNG 图像 `image_save.*`（文件名用 LIO 时域时间戳，固定 6 位小数），
@@ -251,7 +255,7 @@ S0 对照保留；最终由 ROS 无关的 `VisualPipeline` 承接它的全部逻
 6. `visual_b_app.cpp` 改为**单节点**：`VisualBSuperLIO` 覆写 `onLioOutput` /
    `onDenseCloud` 直推 `VisualPipeline`；图像订阅、彩色云 / 相机 odom /
    path 发布、落盘线程都挂在 `ROSWrapper` 上；不再 `add_node(visual)`。
-7. 观察窗口保留：`app.lio_source` 开关，`topic` 分支临时保留 `VisualBNode` 作对照；
+7. 观察窗口保留：`super_livo_visual.lio_source` 开关，`topic` 分支临时保留 `VisualBNode` 作对照；
    S2 时随对照路径一起删除，届时 B 与 A 的差异只剩"写回 ESKF"。
 
 8. **直接吃内部观测信息**：B 的 `UnifiedEstimator::lidarUpdate` 不再从 `lio/odom`
@@ -265,8 +269,8 @@ S0 对照保留；最终由 ROS 无关的 `VisualPipeline` 承接它的全部逻
 
 | 阶段 | A | B | 状态 |
 |---|---|---|---|
-| S0 基线 | `app.lio_source=topic`（`VisualANode` + DDS） | `VisualBNode` 直接订阅 | A 可用；B 即当前形态 |
-| S1 单体 | `app.lio_source=internal`（钩子直推 + `VisualPipeline`） | 单节点 `VisualPipeline` + 内部通信 | A **已完成**；B 未开始 |
+| S0 基线 | `super_livo_visual.lio_source=topic`（`VisualANode` + DDS） | `VisualBNode` 直接订阅 | A 可用；B 即当前形态 |
+| S1 单体 | `super_livo_visual.lio_source=internal`（钩子直推 + `VisualPipeline`） | 单节点 `VisualPipeline` + 内部通信 | A **已完成**；B 未开始 |
 | S1.5 过渡 | — | 进程内注入 + 回调/工作/落盘三线程（commit `b0f5adc`） | B **已完成**，仅作过渡，输入仍走 DDS |
 | S2 收敛 | 删除 `topic` 分支与 `VisualANode` | 删除 `VisualBNode` 及其 DDS 订阅 | 未开始 |
 
@@ -279,7 +283,7 @@ S0 对照保留；最终由 ROS 无关的 `VisualPipeline` 承接它的全部逻
 
 ## 9. 验证与回归口径
 
-- `app.embed_visual=false`：纯 LIO 逐位回归（现成保留）。
+- `super_livo_visual.embed=false`：纯 LIO 逐位回归（现成保留）。
 - S0 vs S1：`tools/latency_probe*`、`tools/odom_vs_gt.py` 比对轨迹与端到端延迟。
 - 退化门控：发布端已补（`ROSWrapper::pub_degeneracy()`），S1 后退化签名由内存快照直供
   或经 `lio/degeneracy` 转发，均可验证 A/B 的退化分支不再恒假。见 §9.2 实测：
@@ -314,8 +318,9 @@ B 的 S1.5（线程化 + 进程内注入），视觉注入 off / on 两轮，同
 
 ### 9.2 已实测（livo_bag 四包，按已知标定）
 
-形态：单进程 B（`visual_b_app`，`app.visual_inject=true`），参数 `lio_move.yaml` +
+形态：单进程 B（`visual_b_app`，`super_livo_visual.inject=true`），参数 `lio_move.yaml` +
 `visual_b_move.yaml`；图像时钟按已知标定换算到雷达时钟：
+（下表跑批在参数改名前执行，当时命令行写的是 `app.visual_inject` / `app.visual_inject_max_dt`）
 
 | bag | 图像 → 雷达时钟偏移 | 时长 | degen 条数 | cond6 p50（min–max） | active | 视觉帧处理 | push / 生效 | ERROR |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -350,7 +355,7 @@ B 的 S1.5（线程化 + 进程内注入），视觉注入 off / on 两轮，同
   雷达更新（≤100 ms），实测 avg≈0.32–0.35 s。`[年龄]` 直方图显示 0.2 s 门限只能接
   34.4%、0.4 s 能接 71.4%；两档生效数 521 vs 1089，与直方图一致。
 - 两档成图逐格对比一致（5 cm 栅格 IoU 0.88、点数 8.289M vs 8.298M、范围相同、无重影），
-  故 `app.visual_inject_max_dt` 定为 `0.4`，不再上调。降时差应减结构延迟，而不是放门限。
+  故 `super_livo_visual.inject_max_dt` 定为 `0.4`，不再上调。降时差应减结构延迟，而不是放门限。
 - 跨运行的"过期数"不可比（bag 回放抖动会让时差整体后移），判据固定用同一趟数据的
   `[年龄]` 分布。
 
@@ -363,8 +368,8 @@ B 的 S1.5（线程化 + 进程内注入），视觉注入 off / on 两轮，同
   B 的输入队列上限 2048 条事件（一帧原图 4 MB，不设限会吃几十 GB），超限丢最旧。
 - **线程安全**：A 只有一条工作线程独占全部视觉状态；B 同为"单工作线程独占状态"，
   仅 `degen_sig_` 有独立 mutex（退化回调仍直接绑在 executor 上，见 §7 已知不一致）。
-- **回滚**：A 可切回 `app.lio_source=topic`；B 目前没有 `app.lio_source` 分支开关，
-  只能靠 `app.embed_visual` / `app.visual_inject` 关闭。两节点并行只是**过渡**，
+- **回滚**：A 可切回 `super_livo_visual.lio_source=topic`；B 目前没有 `super_livo_visual.lio_source` 分支开关，
+  只能靠 `super_livo_visual.embed` / `super_livo_visual.inject` 关闭。两节点并行只是**过渡**，
   S2 前可用，之后按单进程单节点收敛。
 
 ---
@@ -377,7 +382,7 @@ B 的 S1.5（线程化 + 进程内注入），视觉注入 off / on 两轮，同
 1. ~~公共库钩子 + 退化/观测信息快照（`liblio`）~~ —— **已完成**（`f9b77d6`）。
 2. ~~公共 mailbox（common）~~ —— **最小件已完成**（`latest_sample_buffer.hpp`）；
    聚合型 mailbox 未做，A 改用 pipeline 内部任务队列。
-3. ~~方案 A：抽 `VisualPipeline` + 单节点接线 + `app.lio_source` 开关；S0/S1 对比~~ —— **已完成**（`b284f93`、`d66beb6`）。
+3. ~~方案 A：抽 `VisualPipeline` + 单节点接线 + `super_livo_visual.lio_source` 开关；S0/S1 对比~~ —— **已完成**（`b284f93`、`d66beb6`）。
 4. 方案 B：抽 `VisualPipeline` + 输入侧改为内部直推（保留 `ConstraintBridge`）；
    目标是**单进程单节点**，S0/S1 对比。
    - 已完成中间态（`b0f5adc`）：进程内注入 + 回调/工作/落盘三线程（过渡，不是终点）。

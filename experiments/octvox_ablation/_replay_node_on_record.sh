@@ -28,19 +28,19 @@ pkill -x visual_b_node >/dev/null 2>&1
 sleep 1
 
 "$BIN" --ros-args --params-file "$CFG" \
-  -p image_topic:=/left_camera/image \
-  -p odom_topic:=/aft_mapped_lidar_to_init \
-  -p body_cloud_topic:=/cloud_registered_body \
-  -p cloud_topic:=/cloud_registered \
-  -p color.use_own_odom:=false \
-  -p color.cam_odom_topic:=/vio/odom_lidar \
-  -p color.patch_radius:=${PATCH_R:-0} \
-  -p color.patch_color_tol:=${PATCH_TOL:-20.0} \
-  -p color.check_depth_edges:=${CHECK_EDGES:-true} \
-  -p color.depth_tolerance:=${DEPTH_TOL:-0.1} \
-  -p color.min_quality:=${MINQ:-0.2} \
-  -p pcd.save_dir:="$OUT" -p pcd.save_interval_sec:=0.0 \
-  -p pcd.median_voxel_size:=${MEDIAN_VOXEL:-0.01} \
+  -p super_livo_visual.image_topic:=/left_camera/image \
+  -p super_livo_visual.odom_topic:=/aft_mapped_lidar_to_init \
+  -p super_livo_visual.body_cloud_topic:=/cloud_registered_body \
+  -p super_livo_visual.cloud_topic:=/cloud_registered \
+  -p super_livo_visual.color.use_own_odom:=false \
+  -p super_livo_visual.color.cam_odom_topic:=/vio/odom_lidar \
+  -p super_livo_visual.color.patch_radius:=${PATCH_R:-0} \
+  -p super_livo_visual.color.patch_color_tol:=${PATCH_TOL:-20.0} \
+  -p super_livo_visual.color.check_depth_edges:=${CHECK_EDGES:-true} \
+  -p super_livo_visual.color.depth_tolerance:=${DEPTH_TOL:-0.1} \
+  -p super_livo_visual.color.min_quality:=${MINQ:-0.2} \
+  -p super_livo_visual.pcd.save_dir:="$OUT" -p super_livo_visual.pcd.save_interval_sec:=0.0 \
+  -p super_livo_visual.pcd.median_voxel_size:=${MEDIAN_VOXEL:-0.01} \
   > "$OUT/vis.log" 2>&1 &
 VIS=$!
 sleep 4

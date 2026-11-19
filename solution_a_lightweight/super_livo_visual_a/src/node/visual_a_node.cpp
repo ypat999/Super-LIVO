@@ -69,11 +69,11 @@ Eigen::Matrix3d so3Exp(const Eigen::Vector3d& w) {
 VisualANode::VisualANode(const rclcpp::NodeOptions& options)
     : Node("super_livo_visual_a", options) {
   // ---- 先声明 topic 参数（订阅/发布器创建前需要） -------------------------
-  const std::string image_topic = this->declare_parameter<std::string>("image_topic", "/left_camera/image");
-  const std::string odom_topic = this->declare_parameter<std::string>("odom_topic", "lio/odom");
-  const std::string cloud_topic = this->declare_parameter<std::string>("cloud_topic", "lio/cloud_world");
+  const std::string image_topic = this->declare_parameter<std::string>(vp("image_topic"), "/left_camera/image");
+  const std::string odom_topic = this->declare_parameter<std::string>(vp("odom_topic"), "lio/odom");
+  const std::string cloud_topic = this->declare_parameter<std::string>(vp("cloud_topic"), "lio/cloud_world");
   const std::string body_cloud_topic =
-      this->declare_parameter<std::string>("body_cloud_topic", "lio/cloud_body_dense");
+      this->declare_parameter<std::string>(vp("body_cloud_topic"), "lio/cloud_body_dense");
 
   // ---- 创建订阅器 ---------------------------------------------------------
   // 图像订阅 QoS 默认 reliable/depth 10，与 Rosbag2 回放端（以及 FL2 的 200000 深队列
@@ -82,7 +82,7 @@ VisualANode::VisualANode(const rclcpp::NodeOptions& options)
   // 连并行的 reliable 计数订阅也一起掉（发布端被阻塞），A 臂因此拿不到图。
   // 若真实相机驱动发布 best_effort，需把 image.qos_reliable 设为 false。
   const bool image_qos_reliable =
-      this->declare_parameter<bool>("image.qos_reliable", true);
+      this->declare_parameter<bool>(vp("image.qos_reliable"), true);
   if (image_qos_reliable) {
     image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
         image_topic, rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
@@ -103,7 +103,7 @@ VisualANode::VisualANode(const rclcpp::NodeOptions& options)
   body_cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       body_cloud_topic, rclcpp::QoS(rclcpp::KeepLast(50)).best_effort(),
       std::bind(&VisualANode::onBodyCloud, this, std::placeholders::_1));
-  degen_topic_ = this->declare_parameter<std::string>("degen_topic", "lio/degeneracy");
+  degen_topic_ = this->declare_parameter<std::string>(vp("degen_topic"), "lio/degeneracy");
   degen_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
       degen_topic_,
       rclcpp::SensorDataQoS(),
@@ -125,7 +125,7 @@ VisualANode::VisualANode(const rclcpp::NodeOptions& options)
   // 对齐完成后回调里直接返回，不再做任何配对。
   if (align_enable_) {
     const std::string imu_topic =
-        this->declare_parameter<std::string>("imu_topic", "/livox/imu");
+        this->declare_parameter<std::string>(vp("imu_topic"), "/livox/imu");
     imu_align_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
         imu_topic, rclcpp::QoS(rclcpp::KeepLast(200)).best_effort(),
         std::bind(&VisualANode::onAlignImu, this, std::placeholders::_1));
@@ -165,15 +165,15 @@ void VisualANode::loadParameters() {
   // ==========================================================================
   // 相机内参与畸变（来自 camera_pinhole.yaml，scale 0.5 后）
   // ==========================================================================
-  scale_ = this->declare_parameter<double>("scale", 0.5);
-  intrinsics_.width = this->declare_parameter<int>("cam_width", 640);
-  intrinsics_.height = this->declare_parameter<int>("cam_height", 512);
-  intrinsics_.fx = this->declare_parameter<double>("cam_fx", 646.78);
-  intrinsics_.fy = this->declare_parameter<double>("cam_fy", 646.66);
-  intrinsics_.cx = this->declare_parameter<double>("cam_cx", 313.46);
-  intrinsics_.cy = this->declare_parameter<double>("cam_cy", 261.40);
+  scale_ = this->declare_parameter<double>(vp("scale"), 0.5);
+  intrinsics_.width = this->declare_parameter<int>(vp("cam_width"), 640);
+  intrinsics_.height = this->declare_parameter<int>(vp("cam_height"), 512);
+  intrinsics_.fx = this->declare_parameter<double>(vp("cam_fx"), 646.78);
+  intrinsics_.fy = this->declare_parameter<double>(vp("cam_fy"), 646.66);
+  intrinsics_.cx = this->declare_parameter<double>(vp("cam_cx"), 313.46);
+  intrinsics_.cy = this->declare_parameter<double>(vp("cam_cy"), 261.40);
   distortion_ = this->declare_parameter<std::vector<double>>(
-      "cam_d", std::vector<double>{-0.076160, 0.123001, -0.00113, 0.000251});
+      vp("cam_d"), std::vector<double>{-0.076160, 0.123001, -0.00113, 0.000251});
 
   // ==========================================================================
   // 相机-LiDAR 外参（来自 avia_lvi.yaml 的 Rcl/Pcl）
@@ -182,33 +182,33 @@ void VisualANode::loadParameters() {
 
   // 图像真实采集时刻 = header.stamp + 该偏移（秒），仅用于取相机位姿。
   // 默认值与官方 avia.yaml 一致（0.1 s），本数据集已通过 offset 扫描验证最优。
-  img_time_offset_ = this->declare_parameter<double>("img_time_offset", 0.1);
+  img_time_offset_ = this->declare_parameter<double>(vp("img_time_offset"), 0.1);
 
   // 启动时间对齐：off = −(D + a)，D 由 IMU 桥每次会话现测，a 为相机打戳延迟标定值。
   // align.enable=false 时退回上面手填的 img_time_offset。
-  align_enable_ = this->declare_parameter<bool>("align.enable", true);
+  align_enable_ = this->declare_parameter<bool>(vp("align.enable"), true);
   align_samples_ = static_cast<std::size_t>(
-      this->declare_parameter<int>("align.samples", 20));
-  align_window_ms_ = this->declare_parameter<double>("align.window_ms", 50.0);
+      this->declare_parameter<int>(vp("align.samples"), 20));
+  align_window_ms_ = this->declare_parameter<double>(vp("align.window_ms"), 50.0);
   align_img_stamp_latency_s_ =
-      this->declare_parameter<double>("align.img_stamp_latency_s", 0.111);
+      this->declare_parameter<double>(vp("align.img_stamp_latency_s"), 0.111);
   align_clock_lag_max_s_ =
-      this->declare_parameter<double>("align.clock_lag_max_s", 2.0);
-  align_timeout_s_ = this->declare_parameter<double>("align.timeout_s", 10.0);
+      this->declare_parameter<double>(vp("align.clock_lag_max_s"), 2.0);
+  align_timeout_s_ = this->declare_parameter<double>(vp("align.timeout_s"), 10.0);
 
   // ==========================================================================
   // 前端 KltFrontend
   // ==========================================================================
-  klt_options_.max_features = this->declare_parameter<int>("klt.max_features", 150);
-  klt_options_.pyramid_levels = this->declare_parameter<int>("klt.pyramid_levels", 3);
-  klt_options_.min_distance = this->declare_parameter<double>("klt.min_distance", 10.0);
-  klt_options_.fb_error_threshold = this->declare_parameter<double>("klt.fb_error_threshold", 1.0);
-  klt_options_.min_track_length = this->declare_parameter<int>("klt.min_track_length", 3);
-  klt_options_.trace_window = this->declare_parameter<int>("klt.trace_window", 5);
-  klt_options_.use_fast = this->declare_parameter<bool>("klt.use_fast", true);
-  klt_options_.fast_threshold = this->declare_parameter<int>("klt.fast_threshold", 20);
-  klt_options_.quality_level = this->declare_parameter<double>("klt.quality_level", 0.01);
-  klt_options_.lk_window = this->declare_parameter<int>("klt.lk_window", 21);
+  klt_options_.max_features = this->declare_parameter<int>(vp("klt.max_features"), 150);
+  klt_options_.pyramid_levels = this->declare_parameter<int>(vp("klt.pyramid_levels"), 3);
+  klt_options_.min_distance = this->declare_parameter<double>(vp("klt.min_distance"), 10.0);
+  klt_options_.fb_error_threshold = this->declare_parameter<double>(vp("klt.fb_error_threshold"), 1.0);
+  klt_options_.min_track_length = this->declare_parameter<int>(vp("klt.min_track_length"), 3);
+  klt_options_.trace_window = this->declare_parameter<int>(vp("klt.trace_window"), 5);
+  klt_options_.use_fast = this->declare_parameter<bool>(vp("klt.use_fast"), true);
+  klt_options_.fast_threshold = this->declare_parameter<int>(vp("klt.fast_threshold"), 20);
+  klt_options_.quality_level = this->declare_parameter<double>(vp("klt.quality_level"), 0.01);
+  klt_options_.lk_window = this->declare_parameter<int>(vp("klt.lk_window"), 21);
   frontend_ = std::make_unique<KltFrontend>(klt_options_);
 
   // ==========================================================================
@@ -220,12 +220,12 @@ void VisualANode::loadParameters() {
   depth_options_.cy = intrinsics_.cy;
   depth_options_.image_width = intrinsics_.width;
   depth_options_.image_height = intrinsics_.height;
-  depth_options_.pixel_radius = this->declare_parameter<int>("depth.pixel_radius", 3);
-  depth_options_.search_radius = this->declare_parameter<double>("depth.search_radius", 0.3);
-  depth_options_.min_depth = this->declare_parameter<double>("depth.min_depth", 0.5);
-  depth_options_.max_depth = this->declare_parameter<double>("depth.max_depth", 80.0);
-  depth_options_.max_neighbors = this->declare_parameter<int>("depth.max_neighbors", 5);
-  depth_options_.anchor_window = this->declare_parameter<int>("depth.anchor_window", 5);
+  depth_options_.pixel_radius = this->declare_parameter<int>(vp("depth.pixel_radius"), 3);
+  depth_options_.search_radius = this->declare_parameter<double>(vp("depth.search_radius"), 0.3);
+  depth_options_.min_depth = this->declare_parameter<double>(vp("depth.min_depth"), 0.5);
+  depth_options_.max_depth = this->declare_parameter<double>(vp("depth.max_depth"), 80.0);
+  depth_options_.max_neighbors = this->declare_parameter<int>(vp("depth.max_neighbors"), 5);
+  depth_options_.anchor_window = this->declare_parameter<int>(vp("depth.anchor_window"), 5);
   depth_assoc_ = std::make_unique<LidarDepthAssociation>(depth_options_);
 
   // ==========================================================================
@@ -235,26 +235,26 @@ void VisualANode::loadParameters() {
   reproj_options_.fy = intrinsics_.fy;
   reproj_options_.cx = intrinsics_.cx;
   reproj_options_.cy = intrinsics_.cy;
-  reproj_options_.huber_delta = this->declare_parameter<double>("reproj.huber_delta", 1.0);
-  reproj_options_.min_constraints = this->declare_parameter<int>("reproj.min_constraints", 8);
-  reproj_options_.max_pixel_error = this->declare_parameter<double>("reproj.max_pixel_error", 8.0);
+  reproj_options_.huber_delta = this->declare_parameter<double>(vp("reproj.huber_delta"), 1.0);
+  reproj_options_.min_constraints = this->declare_parameter<int>(vp("reproj.min_constraints"), 8);
+  reproj_options_.max_pixel_error = this->declare_parameter<double>(vp("reproj.max_pixel_error"), 8.0);
   // 测量噪声模型：没有它等价于 σ=1 px、且认为 LiDAR 深度关联完全准确。
-  reproj_options_.sigma_pix = this->declare_parameter<double>("reproj.sigma_pix", 1.5);
-  reproj_options_.sigma_anchor = this->declare_parameter<double>("reproj.sigma_anchor", 0.05);
+  reproj_options_.sigma_pix = this->declare_parameter<double>(vp("reproj.sigma_pix"), 1.5);
+  reproj_options_.sigma_anchor = this->declare_parameter<double>(vp("reproj.sigma_anchor"), 0.05);
   reproj_ = std::make_unique<ReprojectionConstraint>(reproj_options_);
 
   // ==========================================================================
   // 退化门控 DegeneracyGate
   // ==========================================================================
-  gate_options_.min_tracked_features = this->declare_parameter<int>("gate.min_tracked_features", 30);
-  gate_options_.max_reprojection_rmse = this->declare_parameter<double>("gate.max_reprojection_rmse", 2.0);
-  gate_options_.min_spread = this->declare_parameter<double>("gate.min_spread", 0.15);
-  gate_options_.max_condition = this->declare_parameter<double>("gate.max_condition", 1.0e3);
-  gate_options_.assist_weight = this->declare_parameter<double>("gate.assist_weight", 0.3);
-  gate_options_.high_weight = this->declare_parameter<double>("gate.high_weight", 0.8);
+  gate_options_.min_tracked_features = this->declare_parameter<int>(vp("gate.min_tracked_features"), 30);
+  gate_options_.max_reprojection_rmse = this->declare_parameter<double>(vp("gate.max_reprojection_rmse"), 2.0);
+  gate_options_.min_spread = this->declare_parameter<double>(vp("gate.min_spread"), 0.15);
+  gate_options_.max_condition = this->declare_parameter<double>(vp("gate.max_condition"), 1.0e3);
+  gate_options_.assist_weight = this->declare_parameter<double>(vp("gate.assist_weight"), 0.3);
+  gate_options_.high_weight = this->declare_parameter<double>(vp("gate.high_weight"), 0.8);
   // 退化阈值参数化：默认 0.3/0.7（原硬编码）；设 0.0 可让视觉常开做判别实验。
-  gate_options_.assist_degeneracy = this->declare_parameter<double>("gate.assist_degeneracy", 0.3);
-  gate_options_.high_degeneracy = this->declare_parameter<double>("gate.high_degeneracy", 0.7);
+  gate_options_.assist_degeneracy = this->declare_parameter<double>(vp("gate.assist_degeneracy"), 0.3);
+  gate_options_.high_degeneracy = this->declare_parameter<double>(vp("gate.high_degeneracy"), 0.7);
   gate_ = std::make_unique<DegeneracyGate>(gate_options_);
 
   // 退化严重度映射：cond_t（H_tt 最大/最小特征值）在对数刻度上线性映射到 [0,1]。
@@ -262,34 +262,34 @@ void VisualANode::loadParameters() {
   // 就被无端松开（旧默认 10/100 使 cond_t=33 映射成 sev≈0.5）。
   // 完全退化（n_effect=0，cond=1e12）由 axes/active 硬触发直接置 1，不走该映射。
   gate_cond_lo_ = this->declare_parameter<double>(
-      "gate.cond_lo", superlivo_common::DegeneracyScale{}.cond_lo);
+      vp("gate.cond_lo"), superlivo_common::DegeneracyScale{}.cond_lo);
   gate_cond_hi_ = this->declare_parameter<double>(
-      "gate.cond_hi", superlivo_common::DegeneracyScale{}.cond_hi);
+      vp("gate.cond_hi"), superlivo_common::DegeneracyScale{}.cond_hi);
   degen_timeout_ = this->declare_parameter<double>(
-      "gate.degen_timeout", superlivo_common::DegeneracyScale{}.timeout_sec);
+      vp("gate.degen_timeout"), superlivo_common::DegeneracyScale{}.timeout_sec);
 
   // ==========================================================================
   // 视觉更新 VisualUpdate
   // ==========================================================================
-  update_options_.enable = this->declare_parameter<bool>("update.enable", true);
-  update_options_.max_dx_norm = this->declare_parameter<double>("update.max_dx_norm", 0.5);
+  update_options_.enable = this->declare_parameter<bool>(vp("update.enable"), true);
+  update_options_.max_dx_norm = this->declare_parameter<double>(vp("update.max_dx_norm"), 0.5);
   // LiDAR 先验信息量（贝叶斯正则），使门控权重 w 真正起作用。
-  update_options_.prior_rot_sigma = this->declare_parameter<double>("update.prior_rot_sigma", 0.02);
-  update_options_.prior_pos_sigma = this->declare_parameter<double>("update.prior_pos_sigma", 0.05);
+  update_options_.prior_rot_sigma = this->declare_parameter<double>(vp("update.prior_rot_sigma"), 0.02);
+  update_options_.prior_pos_sigma = this->declare_parameter<double>(vp("update.prior_pos_sigma"), 0.05);
   // 退化时把位置先验做成各向异性：退化方向松开、垂直方向收紧。
   update_options_.directional_prior_en =
-      this->declare_parameter<bool>("update.directional_prior_en", true);
+      this->declare_parameter<bool>(vp("update.directional_prior_en"), true);
   update_options_.prior_pos_sigma_healthy =
-      this->declare_parameter<double>("update.prior_pos_sigma_healthy", 0.005);
+      this->declare_parameter<double>(vp("update.prior_pos_sigma_healthy"), 0.005);
   update_options_.prior_pos_sigma_degen =
-      this->declare_parameter<double>("update.prior_pos_sigma_degen", 1.0);
+      this->declare_parameter<double>(vp("update.prior_pos_sigma_degen"), 1.0);
   // 持久偏移的衰减（健康方向 τ≈1/rate 秒）。视觉更新只在退化帧被接受，
   // 因此偏移若只增不减，健康期就永远冻结在最后一次退化时累积的值。
-  offset_decay_en_ = this->declare_parameter<bool>("update.offset_decay_en", true);
-  offset_decay_rate_ = this->declare_parameter<double>("update.offset_decay_rate", 1.0);
+  offset_decay_en_ = this->declare_parameter<bool>(vp("update.offset_decay_en"), true);
+  offset_decay_rate_ = this->declare_parameter<double>(vp("update.offset_decay_rate"), 1.0);
   // 状态回灌（取代"持久偏移"模式）：把每帧视觉 dx 直接写回修正轨迹采样，
   // 之后 LIO 帧间增量挂接在修正轨迹上，约束跨帧累积且不会被原始轨迹抹掉。
-  reinject_ = this->declare_parameter<bool>("update.reinject", true);
+  reinject_ = this->declare_parameter<bool>(vp("update.reinject"), true);
   visual_update_ = std::make_unique<VisualUpdate>(update_options_);
 
   // ==========================================================================
@@ -297,31 +297,31 @@ void VisualANode::loadParameters() {
   // ==========================================================================
   colorizer_options_.intrinsics = intrinsics_;
   // 着色轨迹源：默认 false=/lio/odom；true=本节点视觉修正后的 odom（own_pose_cache_）。
-  color_use_own_odom_ = this->declare_parameter<bool>("color.use_own_odom", false);
+  color_use_own_odom_ = this->declare_parameter<bool>(vp("color.use_own_odom"), false);
   // 视觉链路位姿时刻：true=图像曝光时刻插值（正确），false=最新一条 lio/odom（旧行为）。
-  use_exposure_pose_ = this->declare_parameter<bool>("visual.use_exposure_pose", true);
+  use_exposure_pose_ = this->declare_parameter<bool>(vp("visual.use_exposure_pose"), true);
   // TODO(flash)：colorizer 的 Options.T_cl 语义实为 T_cw（世界->相机，逐帧变化）。
   //  此处先置单位阵，runColorizer 里按每帧相机位姿重建 pipeline 或修正库后再填。
   colorizer_options_.T_cl = Eigen::Matrix4d::Identity();
-  colorizer_options_.sync.max_offset = this->declare_parameter<double>("color.sync_max_offset", 0.02);
-  colorizer_options_.sync.use_exposure_mid = this->declare_parameter<bool>("color.use_exposure_mid", true);
-  colorizer_options_.occlusion.depth_tolerance = this->declare_parameter<double>("color.depth_tolerance", 0.1);
-  colorizer_options_.occlusion.check_depth_edges = this->declare_parameter<bool>("color.check_depth_edges", true);
-  colorizer_options_.occlusion.edge_threshold = this->declare_parameter<double>("color.edge_threshold", 0.5);
-  colorizer_options_.rgb.bilinear = this->declare_parameter<bool>("color.bilinear", true);
-  colorizer_options_.rgb.keep_best_quality = this->declare_parameter<bool>("color.keep_best_quality", true);
-  colorizer_options_.rgb.min_quality = this->declare_parameter<float>("color.min_quality", 0.2F);
+  colorizer_options_.sync.max_offset = this->declare_parameter<double>(vp("color.sync_max_offset"), 0.02);
+  colorizer_options_.sync.use_exposure_mid = this->declare_parameter<bool>(vp("color.use_exposure_mid"), true);
+  colorizer_options_.occlusion.depth_tolerance = this->declare_parameter<double>(vp("color.depth_tolerance"), 0.1);
+  colorizer_options_.occlusion.check_depth_edges = this->declare_parameter<bool>(vp("color.check_depth_edges"), true);
+  colorizer_options_.occlusion.edge_threshold = this->declare_parameter<double>(vp("color.edge_threshold"), 0.5);
+  colorizer_options_.rgb.bilinear = this->declare_parameter<bool>(vp("color.bilinear"), true);
+  colorizer_options_.rgb.keep_best_quality = this->declare_parameter<bool>(vp("color.keep_best_quality"), true);
+  colorizer_options_.rgb.min_quality = this->declare_parameter<float>(vp("color.min_quality"), 0.2F);
   // 邻域均值取样（默认关闭）：抑制投影落点偏差取到相邻表面颜色。
-  colorizer_options_.rgb.patch_radius = this->declare_parameter<int>("color.patch_radius", 0);
+  colorizer_options_.rgb.patch_radius = this->declare_parameter<int>(vp("color.patch_radius"), 0);
   colorizer_options_.rgb.patch_color_tol =
-      this->declare_parameter<float>("color.patch_color_tol", 20.0F);
+      this->declare_parameter<float>(vp("color.patch_color_tol"), 20.0F);
   colorizer_ = std::make_unique<colorizer::ColorizerPipeline>(colorizer_options_);
 
   // 相机位姿源（官方口径）：publish_frame_world 用 LIO 位姿把点云变到世界系，
   // 相机位姿却取 VIO 光度修正后的 T_f_w_。两者不是同一条轨迹：只喂 LIO 位姿会让
   // 投影整体带一个残余姿态误差（实测色差约翻 7 倍）。留空表示与 odom_topic 同源。
   const std::string cam_odom_topic =
-      this->declare_parameter<std::string>("color.cam_odom_topic", "");
+      this->declare_parameter<std::string>(vp("color.cam_odom_topic"), "");
   if (!cam_odom_topic.empty()) {
     cam_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
         cam_odom_topic, rclcpp::SensorDataQoS(),
@@ -333,14 +333,14 @@ void VisualANode::loadParameters() {
   // ==========================================================================
   // 彩色地图落盘（把跑完的彩色点云输出为 PCD）
   // ==========================================================================
-  pcd_save_dir_ = this->declare_parameter<std::string>("pcd.save_dir", "/home/ywj/slam_data/pcd");
-  pcd_save_interval_sec_ = this->declare_parameter<double>("pcd.save_interval_sec", 30.0);
+  pcd_save_dir_ = this->declare_parameter<std::string>(vp("pcd.save_dir"), "/home/ywj/slam_data/pcd");
+  pcd_save_interval_sec_ = this->declare_parameter<double>(vp("pcd.save_interval_sec"), 30.0);
   max_colored_map_points_ = static_cast<std::size_t>(
-      this->declare_parameter<int>("pcd.max_points", 20000000));
+      this->declare_parameter<int>(vp("pcd.max_points"), 20000000));
   // 时间中位数体素边长（米）。>0 时对同一格子的最近 6 帧观测取逐通道中位数，
   // 替代直接 append；中位数对椒盐鲁棒（6 帧中 2 帧错色仍可正确恢复）。
   median_map_.set_voxel_size(
-      static_cast<float>(this->declare_parameter<double>("pcd.median_voxel_size", 0.01)));
+      static_cast<float>(this->declare_parameter<double>(vp("pcd.median_voxel_size"), 0.01)));
 
   params_loaded_ = true;
 }
@@ -1512,9 +1512,9 @@ Eigen::Matrix4d VisualANode::makeTlcFromRclPcl() {
   // 而本节点内部统一使用 T_lc（Camera -> LiDAR），所以这里要求逆。
   //   （若把 Rcl 直接当 T_lc，点会投到图像外，彩色点云会 0 点上色。）
   const auto rcl = this->declare_parameter<std::vector<double>>(
-      "Rcl", std::vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1});
+      vp("Rcl"), std::vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1});
   const auto pcl = this->declare_parameter<std::vector<double>>(
-      "Pcl", std::vector<double>{0, 0, 0});
+      vp("Pcl"), std::vector<double>{0, 0, 0});
   Eigen::Matrix4d T_cl = Eigen::Matrix4d::Identity();
   if (rcl.size() >= 9) {
     for (int r = 0; r < 3; ++r) {

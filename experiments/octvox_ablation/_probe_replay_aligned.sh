@@ -17,13 +17,13 @@ ABIN=/home/ywj/git/Super-LIVO/install/super_livo_visual_a/lib/super_livo_visual_
 
 pkill -x visual_a_node >/dev/null 2>&1; sleep 1
 "$ABIN" --ros-args --params-file "$ACFG" \
-  -p image_topic:=/left_camera/image \
-  -p odom_topic:=/aft_mapped_lidar_to_init \
-  -p body_cloud_topic:=/cloud_registered_body \
-  -p cloud_topic:=/cloud_registered \
-  -p color.use_own_odom:=false \
-  -p color.cam_odom_topic:=/vio/odom_lidar \
-  -p pcd.save_dir:="$OUT" -p pcd.save_interval_sec:=0.0 \
+  -p super_livo_visual.image_topic:=/left_camera/image \
+  -p super_livo_visual.odom_topic:=/aft_mapped_lidar_to_init \
+  -p super_livo_visual.body_cloud_topic:=/cloud_registered_body \
+  -p super_livo_visual.cloud_topic:=/cloud_registered \
+  -p super_livo_visual.color.use_own_odom:=false \
+  -p super_livo_visual.color.cam_odom_topic:=/vio/odom_lidar \
+  -p super_livo_visual.pcd.save_dir:="$OUT" -p super_livo_visual.pcd.save_interval_sec:=0.0 \
   > "$OUT/vis.log" 2>&1 &
 VIS=$!
 sleep 4

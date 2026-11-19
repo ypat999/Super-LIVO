@@ -4,42 +4,47 @@
 # ⚠️ Rcl/Pcl 必须与 config/move_fastcalib.yaml、两份 *_move.yaml、20_move_a_node.yaml 逐字一致。
 /**:
   ros__parameters:
-    # 自采 move_ros2 bag（MV-CB013 1280x1024 全局快门 + MID360）。
-    # 与 20_move_a_node.yaml 同一 LIO 主干 + 同一 clock_shift_relay 时间域，
-    # 只有视觉支路（A 轻量 / B 紧耦合）不同；外参三臂逐字一致。
-    image_topic: "/left_camera/image"
-    imu_topic: "/livox/imu"
-    odom_topic: "lio/odom_shift"
-    cloud_topic: "lio/cloud_world_shift"
-    body_cloud_topic: "lio/cloud_body_dense_shift"
-    # 退化签名用到达时刻（this->now()）判超时，不需要平移时间戳，直连原始话题。
-    degen_topic: "lio/degeneracy"
+    # ---- 视觉支路参数（方案 A / 方案 B 共用同一套名字）----
+    # rcl 会把本分支摊平成 super_livo_visual.<name>，代码侧读取时必须带这个前缀；
+    # 官方 super_lio_node 不认识本分支，未声明的 override 被静默忽略，故同一份文件
+    # 直接喂 super_lio_node 也能跑（这就是本仓库统一参数格式的目的）。
+    super_livo_visual:
+        # 自采 move_ros2 bag（MV-CB013 1280x1024 全局快门 + MID360）。
+        # 与 20_move_a_node.yaml 同一 LIO 主干 + 同一 clock_shift_relay 时间域，
+        # 只有视觉支路（A 轻量 / B 紧耦合）不同；外参三臂逐字一致。
+        image_topic: "/left_camera/image"
+        imu_topic: "/livox/imu"
+        odom_topic: "lio/odom_shift"
+        cloud_topic: "lio/cloud_world_shift"
+        body_cloud_topic: "lio/cloud_body_dense_shift"
+        # 退化签名用到达时刻（this->now()）判超时，不需要平移时间戳，直连原始话题。
+        degen_topic: "lio/degeneracy"
 
-    scale: 1.0
-    cam_width: 1280
-    cam_height: 1024
-    cam_fx: 708.63125924497740
-    cam_fy: 708.71513587278127
-    cam_cx: 644.49372682521789
-    cam_cy: 495.88359175254533
-    cam_d: [0.054466418090825280, -0.045147373415016401,
-           0.0000085461102120314711, 0.0010486594840736336]
+        scale: 1.0
+        cam_width: 1280
+        cam_height: 1024
+        cam_fx: 708.63125924497740
+        cam_fy: 708.71513587278127
+        cam_cx: 644.49372682521789
+        cam_cy: 495.88359175254533
+        cam_d: [0.054466418090825280, -0.045147373415016401,
+               0.0000085461102120314711, 0.0010486594840736336]
 
-    # holefix 重写解（2026-11-17），语义 p_cam = Rcl·p_lidar + Pcl（与 FAST-LIVO2 一致）
-    # 四孔 3D 对应点 RMSE 3.2 mm；FAST-Calib 直出为 7.9 mm
-    Rcl: [-0.017100, -0.999833, -0.006427,
-           0.482159, -0.002615, -0.876080,
-           0.875917, -0.018080,  0.482123]
-    Pcl: [0.027840, -0.172288, -0.047550]
+        # holefix 重写解（2026-11-17），语义 p_cam = Rcl·p_lidar + Pcl（与 FAST-LIVO2 一致）
+        # 四孔 3D 对应点 RMSE 3.2 mm；FAST-Calib 直出为 7.9 mm
+        Rcl: [-0.017100, -0.999833, -0.006427,
+               0.482159, -0.002615, -0.876080,
+               0.875917, -0.018080,  0.482123]
+        Pcl: [0.027840, -0.172288, -0.047550]
 
-    # 时间域已由 relay 平移，节点内不再加偏移
-    img_time_offset: 0.0
+        # 时间域已由 relay 平移，节点内不再加偏移
+        img_time_offset: 0.0
 
-    # 同 A：dense cloud stamp 是帧末（比雷达 header 晚约 0.1 s），放宽到 0.2 s
-    color.sync_max_offset: 0.2
+        # 同 A：dense cloud stamp 是帧末（比雷达 header 晚约 0.1 s），放宽到 0.2 s
+        color.sync_max_offset: 0.2
 
-    # B 无法优雅退出（SIGINT 不落盘），必须靠周期落盘取最后一帧
-    pcd:
-      save_dir: "/mnt/dataset/slam_data/calib/results/move_hf_b"
-      save_interval_sec: 15.0
-      max_points: 20000000
+        # B 无法优雅退出（SIGINT 不落盘），必须靠周期落盘取最后一帧
+        pcd:
+          save_dir: "/mnt/dataset/slam_data/calib/results/move_hf_b"
+          save_interval_sec: 15.0
+          max_points: 20000000

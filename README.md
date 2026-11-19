@@ -26,6 +26,11 @@
 
 ## 更新日志
 
+- **2026-11-19**：**全仓 params YAML 统一为单一格式**（顶层 `/**` + `ros__parameters`，视觉支路全部收进
+  `super_livo_visual:` 分支，A/B 同类参数合并改名，B 的 `lv.*` / `app.*` / `est.enable_visual` 并入 A 的
+  `reproj.*` / `depth.*` / `update.*` 与分支根的 `embed` / `inject` / `inject_max_dt`）。合并后的同一份文件
+  既能喂 `visual_{a,b}_app`，也能直接喂官方 `super_lio_node` 跑纯 LIO。规范与改名表见
+  「[参数文件规范](#参数文件规范ros-2-params-yaml)」，过程与验收见 [exp_records §40](experiments/exp_records.md)。
 - **2026-11-19**：方案 B 完成单体化（S2）并修掉退出落盘。`visual_b_app` 现在一个进程、一个节点
   （`ROSWrapper` + `VisualPipeline`），LIO→视觉全部进程内直推，`visual_b_node` 删除；
   配套把 `run_one.sh` 的 b 臂改起单进程、三份数据集配置顶层键改 `/**`（单体节点名是
@@ -35,7 +40,7 @@
   按设计回退配置 `img_time_offset`。A 侧同批加入启动时间对齐与位姿按曝光时刻取用。
   见 [方案 B README §9.11](solution_b_tight_coupled/README.md)、
   [monolith_refactor_progress.md](monolith_refactor_progress.md)。
-  ⚠️ 单体路径 `app.visual_inject` 默认开，b 臂从此真正把视觉约束写回 ESKF，
+  ⚠️ 单体路径 `super_livo_visual.inject`（旧名 `app.visual_inject`）默认开，b 臂从此真正把视觉约束写回 ESKF，
   `paper_20261119` 的双进程 B 结果不可与之混比。
 - **2026-11**：方案 B 前端与位姿链路加固：Patch 跟踪由单层 SSD 改**金字塔 LK**（Retail_Street 大位移下视觉相对旋转偏 1.5–2° 的问题消除）；`b_own` 速度观测 / 守卫 / 10 Hz 同频三层修复，彩色点云 634 万 → **1711 万点**；新增旋转后处理通道（默认关，eee_01 上 0.1 s 区间旋转 RMS 0.281° → 0.257°，偏航略退化）。见 [方案 B README](solution_b_tight_coupled/README.md#97-patch-前端单层-ssd--金字塔-lk)。
 - **2026-11**：标定板法向退化修正（holefix）重标 A/B 外参，四孔重投影 5.83 → 1.00 px（2026-11-16 用 all bag 全量点云 + 同步后的标定参数复标定：FAST-Calib RMSE 7.9 mm、holefix 1.00/1.62 px）；FAST-Calib-ROS2 改动推入自有 fork（`bb1e748`、`8963f32`）。见「相机-雷达外参标定流程」。
@@ -71,6 +76,68 @@ colcon build --packages-select super_livo_common pointcloud_colorizer \
 - **必须 Release 构建**：Debug 下着色耗时从 4~5 ms 劣化到几十 ms。
 - `direct_visual_lidar_calibration` 自带子模块（iridescence 等），需 `git submodule update --init --recursive` 递归拉取后才能编译。
 - bag 回放、绑核测速、评测命令与已知坑见 [freqcmd.txt](freqcmd.txt)；两套方案的算法细节见 [solution_a_lightweight](solution_a_lightweight/README.md) / [solution_b_tight_coupled](solution_b_tight_coupled/README.md) 的 README。
+- 所有 `--params-file` 与 `-p` 覆盖的写法遵循下一节「[参数文件规范](#参数文件规范ros-2-params-yaml)」：
+  视觉参数挂在 `super_livo_visual` 分支下，`-p` 必须写带前缀的全名。
+
+## 参数文件规范（ROS 2 params YAML）
+
+仓库内所有 params YAML（A/B 支路配置、LIO 主干配置、跑批用的合并文件）统一为同一种格式：
+**顶层只允许 `/**` 通配 + `ros__parameters`，禁止在顶层写死节点名**。
+
+```yaml
+/**:
+  ros__parameters:
+    lio.ros.lidar_topic: "/livox/lidar"     # ① 原版 Super-LIO 主干段：扁平 lio.* 名字，与上游一字不动
+    super_livo_visual:                       # ② 视觉支路段（方案 A / 方案 B 共用同一套名字，同类已合并）
+        cam_width: 1280
+        Rcl: [-0.0171, -0.9998, -0.0064, ...]
+        gate.max_reprojection_rmse: 6.0
+        pcd:
+            save_dir: "/home/ywj/slam_data/output/move_a"
+```
+
+- **摊平机制**：Humble 的 rcl 会把 `ros__parameters:` 下的嵌套 map 摊平成点号参数名，落到参数服务
+  上的真实名字是 `super_livo_visual.cam_width`、`super_livo_visual.pcd.save_dir`。代码侧读取必须带
+  这个前缀：A 侧集中在
+  `solution_a_lightweight/super_livo_visual_a/include/super_livo_visual_a/node/visual_a_node.hpp`
+  的 `vp("name")` helper；B 侧在
+  `solution_b_tight_coupled/super_livo_visual_b/src/app/visual_b_app.cpp` 的 `getOrDeclare` 内用
+  `kVisualParamPrefix` 统一加。**文档里写分支内短名（`gate.*`、`pcd.save_dir` 等）时一律省略前缀；
+  命令行 `-p` 覆盖必须写全名**（`-p super_livo_visual.pcd.save_dir:=…`）。
+- **同一份文件可直接喂官方 `super_lio_node` 跑纯 LIO**：主干不认识 `super_livo_visual` 分支，
+  rclcpp 对未声明的 override 静默忽略，因此不必再为"纯 LIO / 带视觉"维护两份配置。
+- **消灭的历史坑**：此前 B 的三份配置顶层写死 `super_livo_visual_b:`，而单体进程里节点名是
+  `super_lio`，整块参数不匹配 ⇒ 内参、时延、各开关全部回落代码默认值且**不报错**。
+
+### A/B 同类参数的合并改名
+
+方案 B 旧名（`lv.*` / `app.*` / `est.enable_visual`）中与方案 A 语义相同的一律并入 A 的命名族；
+其余名字不变，只是整体加上 `super_livo_visual.` 前缀：
+
+| B 旧名 | 新名（分支内短名） | 说明 |
+| --- | --- | --- |
+| `lv.huber_delta` / `sigma_pix` / `sigma_anchor` / `min_constraints` / `max_pixel_error` / `max_pixel_error_anchored` | `reproj.*` 同名 | 与 A 的 `reproj.*` 合并 |
+| `lv.pixel_radius` | `depth.pixel_radius` | 与 A 的 `depth.pixel_radius` 同一概念（两处都喂 `associationVariance`） |
+| `lv.anchor_keep_sec` | `depth.anchor_keep_sec` | — |
+| `lv.prior_pos_sigma` / `prior_pos_sigma_degen` / `prior_pos_sigma_healthy` / `prior_rot_sigma` / `prior_vel_sigma` | `update.prior_*` | 与 A 的 `update.prior_*` 合并 |
+| `lv.prior_directional_en` | `update.directional_prior_en` | — |
+| `est.enable_visual` | `update.enable` | 与 A 的 `update.enable` 同义 |
+| `app.embed_visual` / `app.visual_inject` / `app.visual_inject_max_dt` | `embed` / `inject` / `inject_max_dt` | 挂在 `super_livo_visual` 分支根下 |
+
+刻意**不合并**的三组（机制不同，强行合并会改行为）：A 的 `gate.*`（退化时整帧门控 / 降权阈值）、
+B 的 `est.visual_info_ratio(_degen)`（信息矩阵比例）、B 的 `guard.*`（LIO 跳变守护）。
+
+| 归属 | 参数族 |
+| --- | --- |
+| A 独有 | `gate.*`、`klt.*`、`evo.*`、`image_save.*`、`odom_topic`、`cloud_topic`、`body_cloud_topic`、`degen_topic`、`lio_source` |
+| B 独有 | `est.*`、`msckf.*`、`photo.*`、`rot_refine.*`、`scheduler.*`、`lifecycle.*`、`kf.*`、`guard.*`、`patch.*`、`e2.*` |
+| A/B 同名 | `cam_*`、`Rcl`、`Pcl`、`scale`、`image_topic`、`imu_topic`、`align.*`、`color.*`、`pcd.*`、`image.qos_reliable` |
+
+> `experiments/config/livox_360_visa*.yaml` 里的 `lio.visual.*` 是**上游 Super-LIO 自带视觉**的参数，
+> 属于 ① 主干段，不参与合并、不改名。
+
+统一过程、改名对照的实测验收与受影响文件清单见
+[experiments/exp_records.md §40](experiments/exp_records.md)。
 
 ## 方案目录
 

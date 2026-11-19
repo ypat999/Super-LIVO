@@ -10,7 +10,9 @@
 #   ros2 run super_livo_visual_a visual_a_app --ros-args \
 #     --params-file config/retail_lio.yaml \
 #     --params-file solution_a_lightweight/super_livo_visual_a/config/visual_a_params.yaml
-super_lio:
+# 顶层键统一用 /** 通配：单体路径的节点名是 Super-LIO 的 super_lio，写死节点名
+# 在另一条路径上会整块静默失效（键名本身仍须是 lio.* 扁平结构）。
+/**:
   ros__parameters:
     # ---------------- ROS 话题 / QoS ----------------
     lio.ros.lidar_topic: "/livox/lidar"
@@ -72,7 +74,10 @@ super_lio:
 
     lio.eva.timer: true
 
-    # ---------------- 同进程视觉支路 ----------------
-    app.embed_visual: true
-    app.visual_inject: false          # B 方案由启动命令覆盖为 true
-    app.visual_inject_max_dt: 0.5
+    # ---------------- 同进程视觉支路（A/B 单体 app 用）----------------
+    # 官方 super_lio_node 不认识 super_livo_visual 分支，未声明的 override 静默忽略，
+    # 因此本文件可以直接喂 super_lio_node 跑纯 LIO。
+    super_livo_visual:
+        embed: true
+        inject: false          # B 方案由启动命令覆盖为 true
+        inject_max_dt: 0.5

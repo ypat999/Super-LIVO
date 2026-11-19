@@ -49,6 +49,8 @@
 
 namespace {
 
+using superlivo_a::vp;
+
 /// 秒 -> ROS 时间戳（bag 的时间戳为传感器时钟，秒值 ~9.4e8，仍在 int32 内）。
 builtin_interfaces::msg::Time toRosStamp(double sec) {
   builtin_interfaces::msg::Time stamp;
@@ -57,30 +59,16 @@ builtin_interfaces::msg::Time toRosStamp(double sec) {
   return stamp;
 }
 
-/// 方案 A 视觉参数的 YAML 分支前缀。
-/// visual_a_move.yaml 的层级是 super_lio → ros__parameters → super_livo_visual_a，
-/// rcl 会把它展开成 "super_livo_visual_a.<name>"。这里优先按该前缀读取；
-/// 前缀不存在时回退到扁平名，保证 -p <name>:=... 的进程级覆盖仍可用。
-constexpr char kVisualParamPrefix[] = "super_livo_visual_a.";
-
-/// 参数是否来自 --params-file / -p 的原始覆盖（未声明也能查到）。
-bool hasParamOverride(rclcpp::Node& node, const std::string& name) {
-  const auto& overrides = node.get_node_parameters_interface()->get_parameter_overrides();
-  return overrides.find(name) != overrides.end();
-}
-
 /// 读取参数：已声明则取值，否则按默认值声明。
 /// 之所以不直接 declare：本节点复用 ROSWrapper（Super-LIO 参数已在 init 里声明），
 /// 个别参数名可能与 LIO 侧重合，直接 declare 会抛 ParameterAlreadyDeclared。
+/// name 必须是 super_livo_visual.<参数名>（调用点用 vp 生成），与节点路径完全一致。
 template <typename T>
 T getOrDeclare(rclcpp::Node& node, const std::string& name, const T& def) {
-  const std::string prefixed = std::string(kVisualParamPrefix) + name;
-  const bool use_prefixed = node.has_parameter(prefixed) || hasParamOverride(node, prefixed);
-  const std::string& key = use_prefixed ? prefixed : name;
-  if (node.has_parameter(key)) {
-    return node.get_parameter(key).get_value<T>();
+  if (node.has_parameter(name)) {
+    return node.get_parameter(name).get_value<T>();
   }
-  return node.declare_parameter<T>(key, def);
+  return node.declare_parameter<T>(name, def);
 }
 
 /// 从 nav_msgs::Odometry 取 T_wl；四元数非法时返回 false。
@@ -106,117 +94,117 @@ superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
   superlivo_a::VisualPipelineOptions opt;
 
   // ---- 相机内参 / 畸变 / 外参 ----
-  opt.intrinsics.width = getOrDeclare<int>(node, "cam_width", 640);
-  opt.intrinsics.height = getOrDeclare<int>(node, "cam_height", 512);
-  opt.intrinsics.fx = getOrDeclare<double>(node, "cam_fx", 646.78);
-  opt.intrinsics.fy = getOrDeclare<double>(node, "cam_fy", 646.66);
-  opt.intrinsics.cx = getOrDeclare<double>(node, "cam_cx", 313.46);
-  opt.intrinsics.cy = getOrDeclare<double>(node, "cam_cy", 261.40);
+  opt.intrinsics.width = getOrDeclare<int>(node, vp("cam_width"), 640);
+  opt.intrinsics.height = getOrDeclare<int>(node, vp("cam_height"), 512);
+  opt.intrinsics.fx = getOrDeclare<double>(node, vp("cam_fx"), 646.78);
+  opt.intrinsics.fy = getOrDeclare<double>(node, vp("cam_fy"), 646.66);
+  opt.intrinsics.cx = getOrDeclare<double>(node, vp("cam_cx"), 313.46);
+  opt.intrinsics.cy = getOrDeclare<double>(node, vp("cam_cy"), 261.40);
   opt.distortion = getOrDeclare<std::vector<double>>(
-      node, "cam_d", std::vector<double>{-0.076160, 0.123001, -0.00113, 0.000251});
+      node, vp("cam_d"), std::vector<double>{-0.076160, 0.123001, -0.00113, 0.000251});
   opt.Rcl = getOrDeclare<std::vector<double>>(
-      node, "Rcl", std::vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1});
-  opt.Pcl = getOrDeclare<std::vector<double>>(node, "Pcl", std::vector<double>{0, 0, 0});
-  opt.img_time_offset = getOrDeclare<double>(node, "img_time_offset", 0.1);
+      node, vp("Rcl"), std::vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1});
+  opt.Pcl = getOrDeclare<std::vector<double>>(node, vp("Pcl"), std::vector<double>{0, 0, 0});
+  opt.img_time_offset = getOrDeclare<double>(node, vp("img_time_offset"), 0.1);
 
   // ---- 前端 ----
-  opt.klt.max_features = getOrDeclare<int>(node, "klt.max_features", 150);
-  opt.klt.pyramid_levels = getOrDeclare<int>(node, "klt.pyramid_levels", 3);
-  opt.klt.min_distance = getOrDeclare<double>(node, "klt.min_distance", 10.0);
-  opt.klt.fb_error_threshold = getOrDeclare<double>(node, "klt.fb_error_threshold", 1.0);
-  opt.klt.min_track_length = getOrDeclare<int>(node, "klt.min_track_length", 3);
-  opt.klt.trace_window = getOrDeclare<int>(node, "klt.trace_window", 5);
-  opt.klt.use_fast = getOrDeclare<bool>(node, "klt.use_fast", true);
-  opt.klt.fast_threshold = getOrDeclare<int>(node, "klt.fast_threshold", 20);
-  opt.klt.quality_level = getOrDeclare<double>(node, "klt.quality_level", 0.01);
-  opt.klt.lk_window = getOrDeclare<int>(node, "klt.lk_window", 21);
+  opt.klt.max_features = getOrDeclare<int>(node, vp("klt.max_features"), 150);
+  opt.klt.pyramid_levels = getOrDeclare<int>(node, vp("klt.pyramid_levels"), 3);
+  opt.klt.min_distance = getOrDeclare<double>(node, vp("klt.min_distance"), 10.0);
+  opt.klt.fb_error_threshold = getOrDeclare<double>(node, vp("klt.fb_error_threshold"), 1.0);
+  opt.klt.min_track_length = getOrDeclare<int>(node, vp("klt.min_track_length"), 3);
+  opt.klt.trace_window = getOrDeclare<int>(node, vp("klt.trace_window"), 5);
+  opt.klt.use_fast = getOrDeclare<bool>(node, vp("klt.use_fast"), true);
+  opt.klt.fast_threshold = getOrDeclare<int>(node, vp("klt.fast_threshold"), 20);
+  opt.klt.quality_level = getOrDeclare<double>(node, vp("klt.quality_level"), 0.01);
+  opt.klt.lk_window = getOrDeclare<int>(node, vp("klt.lk_window"), 21);
 
   // ---- 深度关联 ----
-  opt.depth.pixel_radius = getOrDeclare<int>(node, "depth.pixel_radius", 3);
-  opt.depth.search_radius = getOrDeclare<double>(node, "depth.search_radius", 0.3);
-  opt.depth.min_depth = getOrDeclare<double>(node, "depth.min_depth", 0.5);
-  opt.depth.max_depth = getOrDeclare<double>(node, "depth.max_depth", 80.0);
-  opt.depth.max_neighbors = getOrDeclare<int>(node, "depth.max_neighbors", 5);
-  opt.depth.anchor_window = getOrDeclare<int>(node, "depth.anchor_window", 5);
+  opt.depth.pixel_radius = getOrDeclare<int>(node, vp("depth.pixel_radius"), 3);
+  opt.depth.search_radius = getOrDeclare<double>(node, vp("depth.search_radius"), 0.3);
+  opt.depth.min_depth = getOrDeclare<double>(node, vp("depth.min_depth"), 0.5);
+  opt.depth.max_depth = getOrDeclare<double>(node, vp("depth.max_depth"), 80.0);
+  opt.depth.max_neighbors = getOrDeclare<int>(node, vp("depth.max_neighbors"), 5);
+  opt.depth.anchor_window = getOrDeclare<int>(node, vp("depth.anchor_window"), 5);
 
   // ---- 重投影 ----
-  opt.reproj.huber_delta = getOrDeclare<double>(node, "reproj.huber_delta", 1.0);
-  opt.reproj.min_constraints = getOrDeclare<int>(node, "reproj.min_constraints", 8);
-  opt.reproj.max_pixel_error = getOrDeclare<double>(node, "reproj.max_pixel_error", 8.0);
-  opt.reproj.sigma_pix = getOrDeclare<double>(node, "reproj.sigma_pix", 1.5);
-  opt.reproj.sigma_anchor = getOrDeclare<double>(node, "reproj.sigma_anchor", 0.05);
+  opt.reproj.huber_delta = getOrDeclare<double>(node, vp("reproj.huber_delta"), 1.0);
+  opt.reproj.min_constraints = getOrDeclare<int>(node, vp("reproj.min_constraints"), 8);
+  opt.reproj.max_pixel_error = getOrDeclare<double>(node, vp("reproj.max_pixel_error"), 8.0);
+  opt.reproj.sigma_pix = getOrDeclare<double>(node, vp("reproj.sigma_pix"), 1.5);
+  opt.reproj.sigma_anchor = getOrDeclare<double>(node, vp("reproj.sigma_anchor"), 0.05);
 
   // ---- 门控 ----
-  opt.gate.min_tracked_features = getOrDeclare<int>(node, "gate.min_tracked_features", 30);
-  opt.gate.max_reprojection_rmse = getOrDeclare<double>(node, "gate.max_reprojection_rmse", 2.0);
-  opt.gate.min_spread = getOrDeclare<double>(node, "gate.min_spread", 0.15);
-  opt.gate.max_condition = getOrDeclare<double>(node, "gate.max_condition", 1.0e3);
-  opt.gate.assist_weight = getOrDeclare<double>(node, "gate.assist_weight", 0.3);
-  opt.gate.high_weight = getOrDeclare<double>(node, "gate.high_weight", 0.8);
-  opt.gate.assist_degeneracy = getOrDeclare<double>(node, "gate.assist_degeneracy", 0.3);
-  opt.gate.high_degeneracy = getOrDeclare<double>(node, "gate.high_degeneracy", 0.7);
-  opt.gate_cond_lo = getOrDeclare<double>(node, "gate.cond_lo",
+  opt.gate.min_tracked_features = getOrDeclare<int>(node, vp("gate.min_tracked_features"), 30);
+  opt.gate.max_reprojection_rmse = getOrDeclare<double>(node, vp("gate.max_reprojection_rmse"), 2.0);
+  opt.gate.min_spread = getOrDeclare<double>(node, vp("gate.min_spread"), 0.15);
+  opt.gate.max_condition = getOrDeclare<double>(node, vp("gate.max_condition"), 1.0e3);
+  opt.gate.assist_weight = getOrDeclare<double>(node, vp("gate.assist_weight"), 0.3);
+  opt.gate.high_weight = getOrDeclare<double>(node, vp("gate.high_weight"), 0.8);
+  opt.gate.assist_degeneracy = getOrDeclare<double>(node, vp("gate.assist_degeneracy"), 0.3);
+  opt.gate.high_degeneracy = getOrDeclare<double>(node, vp("gate.high_degeneracy"), 0.7);
+  opt.gate_cond_lo = getOrDeclare<double>(node, vp("gate.cond_lo"),
                                           superlivo_common::DegeneracyScale{}.cond_lo);
-  opt.gate_cond_hi = getOrDeclare<double>(node, "gate.cond_hi",
+  opt.gate_cond_hi = getOrDeclare<double>(node, vp("gate.cond_hi"),
                                           superlivo_common::DegeneracyScale{}.cond_hi);
-  opt.degen_timeout = getOrDeclare<double>(node, "gate.degen_timeout",
+  opt.degen_timeout = getOrDeclare<double>(node, vp("gate.degen_timeout"),
                                            superlivo_common::DegeneracyScale{}.timeout_sec);
 
   // ---- 视觉更新 ----
-  opt.update.enable = getOrDeclare<bool>(node, "update.enable", true);
-  opt.update.max_dx_norm = getOrDeclare<double>(node, "update.max_dx_norm", 0.5);
-  opt.update.prior_rot_sigma = getOrDeclare<double>(node, "update.prior_rot_sigma", 0.02);
-  opt.update.prior_pos_sigma = getOrDeclare<double>(node, "update.prior_pos_sigma", 0.05);
+  opt.update.enable = getOrDeclare<bool>(node, vp("update.enable"), true);
+  opt.update.max_dx_norm = getOrDeclare<double>(node, vp("update.max_dx_norm"), 0.5);
+  opt.update.prior_rot_sigma = getOrDeclare<double>(node, vp("update.prior_rot_sigma"), 0.02);
+  opt.update.prior_pos_sigma = getOrDeclare<double>(node, vp("update.prior_pos_sigma"), 0.05);
   opt.update.directional_prior_en =
-      getOrDeclare<bool>(node, "update.directional_prior_en", true);
+      getOrDeclare<bool>(node, vp("update.directional_prior_en"), true);
   opt.update.prior_pos_sigma_healthy =
-      getOrDeclare<double>(node, "update.prior_pos_sigma_healthy", 0.005);
+      getOrDeclare<double>(node, vp("update.prior_pos_sigma_healthy"), 0.005);
   opt.update.prior_pos_sigma_degen =
-      getOrDeclare<double>(node, "update.prior_pos_sigma_degen", 1.0);
-  opt.offset_decay_en = getOrDeclare<bool>(node, "update.offset_decay_en", true);
-  opt.offset_decay_rate = getOrDeclare<double>(node, "update.offset_decay_rate", 1.0);
-  opt.reinject = getOrDeclare<bool>(node, "update.reinject", true);
+      getOrDeclare<double>(node, vp("update.prior_pos_sigma_degen"), 1.0);
+  opt.offset_decay_en = getOrDeclare<bool>(node, vp("update.offset_decay_en"), true);
+  opt.offset_decay_rate = getOrDeclare<double>(node, vp("update.offset_decay_rate"), 1.0);
+  opt.reinject = getOrDeclare<bool>(node, vp("update.reinject"), true);
 
   // ---- 彩色点云 ----
-  opt.color_use_own_odom = getOrDeclare<bool>(node, "color.use_own_odom", false);
-  opt.use_exposure_pose = getOrDeclare<bool>(node, "visual.use_exposure_pose", true);
-  opt.colorizer.sync.max_offset = getOrDeclare<double>(node, "color.sync_max_offset", 0.02);
+  opt.color_use_own_odom = getOrDeclare<bool>(node, vp("color.use_own_odom"), false);
+  opt.use_exposure_pose = getOrDeclare<bool>(node, vp("visual.use_exposure_pose"), true);
+  opt.colorizer.sync.max_offset = getOrDeclare<double>(node, vp("color.sync_max_offset"), 0.02);
   opt.colorizer.sync.use_exposure_mid =
-      getOrDeclare<bool>(node, "color.use_exposure_mid", true);
+      getOrDeclare<bool>(node, vp("color.use_exposure_mid"), true);
   opt.colorizer.occlusion.depth_tolerance =
-      getOrDeclare<double>(node, "color.depth_tolerance", 0.1);
+      getOrDeclare<double>(node, vp("color.depth_tolerance"), 0.1);
   opt.colorizer.occlusion.check_depth_edges =
-      getOrDeclare<bool>(node, "color.check_depth_edges", true);
+      getOrDeclare<bool>(node, vp("color.check_depth_edges"), true);
   opt.colorizer.occlusion.edge_threshold =
-      getOrDeclare<double>(node, "color.edge_threshold", 0.5);
-  opt.colorizer.rgb.bilinear = getOrDeclare<bool>(node, "color.bilinear", true);
+      getOrDeclare<double>(node, vp("color.edge_threshold"), 0.5);
+  opt.colorizer.rgb.bilinear = getOrDeclare<bool>(node, vp("color.bilinear"), true);
   opt.colorizer.rgb.keep_best_quality =
-      getOrDeclare<bool>(node, "color.keep_best_quality", true);
-  opt.colorizer.rgb.min_quality = getOrDeclare<float>(node, "color.min_quality", 0.2F);
-  opt.colorizer.rgb.patch_radius = getOrDeclare<int>(node, "color.patch_radius", 0);
+      getOrDeclare<bool>(node, vp("color.keep_best_quality"), true);
+  opt.colorizer.rgb.min_quality = getOrDeclare<float>(node, vp("color.min_quality"), 0.2F);
+  opt.colorizer.rgb.patch_radius = getOrDeclare<int>(node, vp("color.patch_radius"), 0);
   opt.colorizer.rgb.patch_color_tol =
-      getOrDeclare<float>(node, "color.patch_color_tol", 20.0F);
+      getOrDeclare<float>(node, vp("color.patch_color_tol"), 20.0F);
 
   // ---- 落盘 ----
   opt.pcd_save_dir =
-      getOrDeclare<std::string>(node, "pcd.save_dir", "/home/ywj/slam_data/pcd");
+      getOrDeclare<std::string>(node, vp("pcd.save_dir"), "/home/ywj/slam_data/pcd");
   opt.max_colored_map_points = static_cast<std::size_t>(
-      getOrDeclare<int>(node, "pcd.max_points", 20000000));
+      getOrDeclare<int>(node, vp("pcd.max_points"), 20000000));
   opt.median_voxel_size =
-      static_cast<float>(getOrDeclare<double>(node, "pcd.median_voxel_size", 0.01));
+      static_cast<float>(getOrDeclare<double>(node, vp("pcd.median_voxel_size"), 0.01));
 
   // ---- 轨迹 / 图像落盘（与 FAST-LIVO2 的 evo / image_save 同口径） ----
   // 轨迹：<evo.save_dir>/<evo.seq_name>.txt，TUM 格式，每行
   //       timestamp tx ty tz qx qy qz qw（camera_init 系下 LiDAR 位姿）。
   // 图像：<image_save.dir>/<timestamp>.png，时间戳固定 6 位小数。
   // 目录留空时分别落到 pcd.save_dir 与 <pcd.save_dir>/image。
-  opt.pose_output_en = getOrDeclare<bool>(node, "evo.pose_output_en", false);
-  opt.pose_save_dir = getOrDeclare<std::string>(node, "evo.save_dir", "");
-  opt.pose_seq_name = getOrDeclare<std::string>(node, "evo.seq_name", "scene_move");
-  opt.pose_save_interval = getOrDeclare<int>(node, "evo.interval", 1);
-  opt.img_save_en = getOrDeclare<bool>(node, "image_save.img_save_en", false);
-  opt.img_save_dir = getOrDeclare<std::string>(node, "image_save.dir", "");
-  opt.img_save_interval = getOrDeclare<int>(node, "image_save.interval", 1);
+  opt.pose_output_en = getOrDeclare<bool>(node, vp("evo.pose_output_en"), false);
+  opt.pose_save_dir = getOrDeclare<std::string>(node, vp("evo.save_dir"), "");
+  opt.pose_seq_name = getOrDeclare<std::string>(node, vp("evo.seq_name"), "scene_move");
+  opt.pose_save_interval = getOrDeclare<int>(node, vp("evo.interval"), 1);
+  opt.img_save_en = getOrDeclare<bool>(node, vp("image_save.img_save_en"), false);
+  opt.img_save_dir = getOrDeclare<std::string>(node, vp("image_save.dir"), "");
+  opt.img_save_interval = getOrDeclare<int>(node, vp("image_save.interval"), 1);
 
   // 启动自检：分支式 YAML 一旦键名/层级写错会静默退回默认值，这里把关键项打出来。
   RCLCPP_INFO(node.get_logger(),
@@ -390,8 +378,8 @@ std::shared_ptr<MonolithVisualIo> setupMonolithIo(
 
   // ---- 图像订阅（外部输入，仍走 ROS） ----
   const std::string image_topic =
-      getOrDeclare<std::string>(node, "image_topic", "/left_camera/image");
-  const bool image_qos_reliable = getOrDeclare<bool>(node, "image.qos_reliable", true);
+      getOrDeclare<std::string>(node, vp("image_topic"), "/left_camera/image");
+  const bool image_qos_reliable = getOrDeclare<bool>(node, vp("image.qos_reliable"), true);
   rclcpp::SubscriptionOptions sub_options;
   sub_options.callback_group =
       node.create_callback_group(rclcpp::CallbackGroupType::Reentrant);
@@ -420,7 +408,7 @@ std::shared_ptr<MonolithVisualIo> setupMonolithIo(
 
   // ---- 可选：独立相机位姿源（color.cam_odom_topic） ----
   const std::string cam_odom_topic =
-      getOrDeclare<std::string>(node, "color.cam_odom_topic", "");
+      getOrDeclare<std::string>(node, vp("color.cam_odom_topic"), "");
   if (!cam_odom_topic.empty()) {
     io->cam_odom_sub = node.create_subscription<nav_msgs::msg::Odometry>(
         cam_odom_topic, rclcpp::SensorDataQoS(),
@@ -434,7 +422,7 @@ std::shared_ptr<MonolithVisualIo> setupMonolithIo(
 
   // ---- 周期性彩色地图落盘 ----
   const double save_interval =
-      getOrDeclare<double>(node, "pcd.save_interval_sec", 30.0);
+      getOrDeclare<double>(node, vp("pcd.save_interval_sec"), 30.0);
   if (save_interval > 0.0) {
     io->save_timer = node.create_wall_timer(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -464,9 +452,9 @@ int main(int argc, char** argv) {
   // ---- 选择 LIO 数据来源 -------------------------------------------------
   // internal：进程内钩子直推（默认，无 DDS 回环）
   // topic   ：保留旧 VisualANode 子节点，走 lio/* 话题（S0 对照，验证后删除）
-  const bool embed_visual = getOrDeclare<bool>(*wrapper, "app.embed_visual", true);
+  const bool embed_visual = getOrDeclare<bool>(*wrapper, vp("embed"), true);
   const std::string lio_source =
-      getOrDeclare<std::string>(*wrapper, "app.lio_source", "internal");
+      getOrDeclare<std::string>(*wrapper, vp("lio_source"), "internal");
 
   std::shared_ptr<superlivo_a::VisualANode> visual_node;
   std::shared_ptr<MonolithVisualIo> io;

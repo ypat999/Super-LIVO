@@ -16,9 +16,15 @@
   `visual_b_app` 单进程单节点：`ROSWrapper` + `VisualPipeline`，LIO→视觉改由
   `onLioOutput` / `onDenseCloud` / `degeneracySnapshot` 直推，旧 `visual_b_node` 与其
   DDS 订阅已删除。节点内部保持回调 / 计算 / 落盘三线程；odom 源为 10 Hz `/lio/odom`
-  （用 `odom_robo` 外参换回 IMU 系），视觉注入时间门控 `app.visual_inject_max_dt` 定为 `0.4`。
+  （用 `odom_robo` 外参换回 IMU 系），视觉注入时间门控 `super_livo_visual.inject_max_dt` 定为 `0.4`。
   配套接线：三份数据集配置顶层键改 `/**`、`run_one.sh` b 臂改起单进程、退出改为
   **同步落盘**（`shutdownAndSave()`），详见 [方案 B README §9.11](solution_b_tight_coupled/README.md)。
+- **参数格式（2026-11-19 统一）**：全仓 params YAML 收为 `/**` + `ros__parameters`，视觉支路统一放
+  `super_livo_visual:` 分支，A/B 同类参数合并改名（B 的 `lv.*` / `app.*` / `est.enable_visual` 并入
+  `reproj.*` / `depth.*` / `update.*` 与分支根的 `embed` / `inject` / `inject_max_dt`），合并后的同一份
+  文件也能直接喂官方 `super_lio_node` 跑纯 LIO。规范、改名表与实测验收见根
+  [README「参数文件规范」](README.md#参数文件规范ros-2-params-yaml) 与
+  [exp_records §40](experiments/exp_records.md)。
 - **未开始**：A 的视觉回灌 ESKF（§6.5 的 8 个参数）、B 直吃 `last_HTVH`、单测。
 
 ---
@@ -55,12 +61,12 @@ A 最终没有用它——`VisualPipeline` 内部是"任务队列 + 单工作线
 | --- | --- |
 | `solution_a_lightweight/super_livo_visual_a/include/super_livo_visual_a/pipeline/visual_pipeline.hpp` | `VisualPipelineOptions` + `VisualPipeline`，**不依赖 rclcpp** |
 | `.../src/pipeline/visual_pipeline.cpp` | 原 `VisualANode` 的逻辑逐项迁移：去畸变、KLT、曝光时刻插值、深度关联、重投影法方程、退化门控、`VisualUpdate`、持久偏移/回灌、上色、落盘 |
-| `.../src/app/visual_a_app.cpp` | `VisualASuperLIO` 覆写两个钩子直推 pipeline；`setupMonolithIo()` 只保留图像订阅 + 彩色云/odom/path 发布 + 落盘定时器；`app.lio_source` 开关 |
+| `.../src/app/visual_a_app.cpp` | `VisualASuperLIO` 覆写两个钩子直推 pipeline；`setupMonolithIo()` 只保留图像订阅 + 彩色云/odom/path 发布 + 落盘定时器；`super_livo_visual.lio_source` 开关 |
 
 - 线程模型：`VisualPipeline` 内**单工作线程 + 任务队列**，`OutputThread`/`DenseThread`
   只做拷贝入队，不会被视觉阻塞；退化快照读取单独加锁。
 - 远端新增输出（commit `d66beb6`）：TUM 轨迹 `evo.*`、PNG 图像 `image_save.*`，默认关。
-- `app.lio_source`：`internal`（默认，单体）/ `topic`（S0 双节点对照）。
+- `super_livo_visual.lio_source`：`internal`（默认，单体）/ `topic`（S0 双节点对照）。
 
 ### 2.4 方案 B：进程内注入 + 三线程（commit `b0f5adc` + 本地未提交修正，过渡形态）
 
@@ -71,6 +77,11 @@ A 最终没有用它——`VisualPipeline` 内部是"任务队列 + 单工作线
 > **2026-11-19（S2 已完成）**：上表 `VisualBNode` 侧的全部改造已整体搬进
 > `super_livo_visual_b/{include,src}/pipeline/visual_pipeline.{hpp,cpp}`，`visual_b_node.*`
 > 已删除；本节的文件名字面保留为历史记录。
+>
+> **参数命名（2026-11-19 统一）**：本表中 `app.embed_visual` / `app.visual_inject` /
+> `app.visual_inject_max_dt` 为**改名前命名**，现分别是 `super_livo_visual.embed` /
+> `super_livo_visual.inject` / `super_livo_visual.inject_max_dt`（规则见根
+> [README「参数文件规范」](README.md#参数文件规范ros-2-params-yaml)）。
 
 | 改动 | 说明 |
 | --- | --- |
@@ -94,6 +105,8 @@ executor 上，是唯一没进 `input_queue_` 的回调。`degen_sig_` 有独立
 
 > **2026-11-19 更新**：下列改动均已随 `bb712d6`（单体化 S2）与 `bf916ef`（退出同步落盘 +
 > 跑批接线）提交并推送，`git pull` 可取；本节保留为当时的改动清单。
+> 同理，本节列出的 `app.visual_inject_max_dt` 等键名为**改名前命名**，
+> 现写作 `super_livo_visual.inject_max_dt`。
 
 以下改动在**本机工作区尚未提交**，`git pull` 不会带过去：
 
@@ -127,7 +140,7 @@ colcon build --packages-select super_livo_common super_lio super_livo_visual_a \
 
 ### 3.2 方案 A：S0 vs S1（同一 bag、同一配置）
 
-| 项 | S0（`app.lio_source:=topic`） | S1（`internal`） |
+| 项 | S0（`super_livo_visual.lio_source:=topic`） | S1（`internal`） |
 | --- | --- | --- |
 | logger 名 | `super_livo_visual_a` | `super_lio` |
 | 跟踪特征 | `tracked=115/54` | `tracked=115/45` |
@@ -262,12 +275,14 @@ source install/setup.bash
 ### 4.2 跑方案 A
 
 ```bash
-# S1：单体（默认 app.lio_source=internal）
+# S1：单体（默认 super_livo_visual.lio_source=internal）
 ros2 run super_livo_visual_a visual_a_app --ros-args \
   --params-file config/retail_lio.yaml \
   --params-file solution_a_lightweight/super_livo_visual_a/config/visual_a_params.yaml
 
-# S0：旧双节点对照，追加 -p app.lio_source:=topic
+# S0：旧双节点对照，追加 -p super_livo_visual.lio_source:=topic
+# 两份 params 均为 /** → ros__parameters → (lio.* | super_livo_visual.) 统一格式，
+# 纯 LIO 时用同一份文件直接起 super_lio_node 即可。
 ```
 
 ### 4.3 跑方案 B
@@ -279,7 +294,7 @@ ros2 run super_livo_visual_a visual_a_app --ros-args \
 ros2 run super_livo_visual_b visual_b_app --ros-args \
   --params-file config/retail_lio.yaml \
   --params-file solution_b_tight_coupled/super_livo_visual_b/config/visual_b_params.yaml \
-  -p app.visual_inject:=true
+  -p super_livo_visual.inject:=true
 ```
 
 同时另开终端回放：
@@ -290,8 +305,8 @@ ros2 bag play /home/ywj/slam_data/Retail_Street --rate 1.0
 
 注意：
 
-- `config/retail_lio.yaml` 里 `app.visual_inject: false`，B 必须在命令行覆盖为 `true`。
-- `visual_b_params.yaml` 用 `/**` 通配，换机器要改 `pcd.save_dir`。
+- `config/retail_lio.yaml` 里 `super_livo_visual.inject: false`，B 必须在命令行覆盖为 `true`。
+- `visual_b_params.yaml` 用 `/**` 通配，换机器要改 `super_livo_visual.pcd.save_dir`。
 - Retail_Street 的 lidar 是 `livox_ros_driver2/CustomMsg`，`lio.sensor.lidar_type: 1` 已对。
 - `experiments/scripts/retail_ab/run_ab_retail.sh` 默认 `BAG=.../Retail_Street_d2`，
   本机该路径不存在，要么改脚本、要么直接 `ros2 bag play .../Retail_Street`。
@@ -333,7 +348,7 @@ ros2 bag play /home/ywj/slam_data/Retail_Street --rate 1.0
    `ROSWrapper` 一个节点，图像与 IMU 订阅、输出发布与周期落盘都挂上去；
    `VisualBNode` 及其 DDS 订阅已删除（S2）。
 3. **B 直吃 `last_HTVH`**：`UnifiedEstimator::lidarUpdate` 由合成强先验改为消费快照 `info`。
-4. **S2 清理（剩余）**：删除 `app.lio_source=topic` 对照路径与 A 的旧 `visual_a_node`
+4. **S2 清理（剩余）**：删除 `super_livo_visual.lio_source=topic` 对照路径与 A 的旧 `visual_a_node`
    （B 的 `visual_b_node` 已随 S2 删除）。
 
 ### 5.3 标定前置数据（A 已具备，B 仍缺）
@@ -367,7 +382,7 @@ ros2 bag play /home/ywj/slam_data/Retail_Street --rate 1.0
    `imu loop back, clear buffer`。用 `--clock` / `use_sim_time` 或回放前统一时间。
 5. **`third_party/Super-LIO` 是子模块**：钩子改动要先提交并推送子模块，父仓库再更新指针，
    否则另一台机器 `git pull` 只拿到旧指针。
-6. **`pcd.save_dir` 默认 `/home/ywj/slam_data/pcd`**，换机器记得改。
+6. **`super_livo_visual.pcd.save_dir` 默认 `/home/ywj/slam_data/pcd`**，换机器记得改。
 7. **彩色 PCD 落盘必须走独立线程且增量移交**：周期落盘或整图移交都会拖停回调，
    实测分别丢 293 帧 / 阻塞 1267 ms。
 8. **退出时的最终落盘必须同步**（2026-11-19 修）：投给异步 save 线程会随进程退出被杀，
@@ -391,12 +406,12 @@ sleep 1
 
 MODE="${1:-internal}"
 EXTRA=""
-[ "$MODE" = "topic" ] && EXTRA="-p app.lio_source:=topic"
+[ "$MODE" = "topic" ] && EXTRA="-p super_livo_visual.lio_source:=topic"
 
 ros2 run super_livo_visual_a visual_a_app --ros-args \
   --params-file config/retail_lio.yaml \
   --params-file solution_a_lightweight/super_livo_visual_a/config/visual_a_params.yaml \
-  -p image_topic:=/camera/color/image_raw \
+  -p super_livo_visual.image_topic:=/camera/color/image_raw \
   -p lio.sensor.lidar_type:=0 \
   -p lio.ros.lidar_topic:=/livox/lidar \
   -p lio.ros.imu_topic:=/livox/imu \

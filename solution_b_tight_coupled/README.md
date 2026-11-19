@@ -90,6 +90,15 @@ Super-LIO 主干 + B 视觉支路，视觉约束通过 `super_lio` 暴露的通�
 不经过任何话题。单体只有一个 ROS 节点，节点名沿用 `ROSWrapper` 的 `super_lio`，
 因此 **B 的配置顶层键必须写 `/**`**（写 `super_livo_visual_b:` 整块不生效，见 §9.11）。
 
+> 配置格式（2026-11-19 统一）：B 的所有 params 文件为
+> `/** → ros__parameters → super_livo_visual:` 两段式——① `lio.*` 主干段与上游一字不动，
+> ② 视觉支路段收在 `super_livo_visual` 分支下，与方案 A **共用同一套名字**（同类已合并）。
+> rcl 会把分支摊平成 `super_livo_visual.<name>`，代码侧由 `getOrDeclare` 里的
+> `kVisualParamPrefix` 统一加前缀；命令行 `-p` 覆盖**必须写全名**
+> （`-p super_livo_visual.inject:=true`）。下文参数名一律是**分支内短名**（省略前缀）。
+> 同一份文件也可直接喂官方 `super_lio_node` 跑纯 LIO（未声明的 override 被静默忽略）。
+> 规范全文与 B 旧名 → 新名对照表见根 [README「参数文件规范」](../README.md#参数文件规范ros-2-params-yaml)。
+
 ```
 图像 / IMU 订阅（app）→ VisualPipeline::submitImage / submitImu
 SuperLIO::onLioOutput / onDenseCloud / degeneracySnapshot → submitOdom / submitWorldCloud
@@ -108,12 +117,12 @@ SuperLIO::onLioOutput / onDenseCloud / degeneracySnapshot → submitOdom / submi
 | 残差符号 | `r = −L⁻¹b`：B 内部 `b` 是"预测−观测"，ESKF 的 `r` 约定为"观测−预测" |
 | 扰动系 | B 的相机扰动是世界系左扰动 ξ，ESKF 是机体系右扰动 δ，`ξ = R_wi·δ`，故 H 旋转块右乘当前 `R_wi` |
 | 状态列序 | `H18` 为 6×18，只填 rot(0-2) / pos(3-5)，其余列（v/bg/ba/g）为 0 |
-| 时间门控 | `app.visual_inject_max_dt`（默认 0.2 s）：视觉帧与当前 ESKF 时刻差超限则丢弃并计 `过期` |
+| 时间门控 | `inject_max_dt`（默认 0.2 s）：视觉帧与当前 ESKF 时刻差超限则丢弃并计 `过期` |
 
 两个开关：
 
-- `app.embed_visual`：是否同进程创建 B 视觉支路（false 时退化为纯 LIO）；
-- `app.visual_inject`：是否把视觉约束注入 ESKF（false 时 B 视觉仍跑，但 `/lio/odom`
+- `embed`（旧名 `app.embed_visual`）：是否同进程创建 B 视觉支路（false 时退化为纯 LIO）；
+- `inject`（旧名 `app.visual_inject`）：是否把视觉约束注入 ESKF（false 时 B 视觉仍跑，但 `/lio/odom`
   与纯 LIO 逐位一致，可用于回归对比）。
 
 自采 room bag（160 s）实测：`push=1103 / 生效=1073 / 过期=6 / 被拒=0`，`/lio/odom` 1594 帧
@@ -176,7 +185,7 @@ SuperLIO::onLioOutput / onDenseCloud / degeneracySnapshot → submitOdom / submi
 - 新建特征两级关联：先把**全部持久锚点**投影建栅格（hgrid，8 px cell），命中则优先继承
   历史锚点（`anchored=true`，走 60 px 宽门限）；未命中再退回当前帧漂移地图栅格。
 - 关联门限通过才提交锚点并推进 `last_seen`（健康期建立的锚点不会被退化段的漂移观测污染）。
-- 过期与容量：`lv.anchor_keep_sec`（默认 20 s，按 `frame_stamp − last_seen`）清除；
+- 过期与容量：`depth.anchor_keep_sec`（旧名 `lv.anchor_keep_sec`；默认 20 s，按 `frame_stamp − last_seen`）清除；
   超过 `max_anchors`（20000）用 `nth_element` 按最久未观测淘汰。
 - 效果：退化段观测仍能锚回健康期建立的世界坐标，产生真实纠正力（这是此前缺失的那一环）。
 
@@ -284,7 +293,8 @@ cond_t≈33 误映射成 0.5，健康段就无端松开先验，已修）。完�
    `/lio/degeneracy` 时该分支永假。改为无条件生效，上限 3.0 → **6.0 m/s**（退化段仍按
    `vel_ref × vel_ratio` 收紧）。
 2. **速度无观测**：原先只在先验帧才写速度观测，LIO 高频先验下 `b_own` 长期裸积分。新增
-   `lioVelocity()` 用 **0.1 s 基线差分**注入（`lv.prior_vel_sigma=0.25`），并把
+   `lioVelocity()` 用 **0.1 s 基线差分**注入（`lv.prior_vel_sigma=0.25`，该记录为改名前命名，现名
+   `update.prior_vel_sigma`），并把
    `lidarUpdate` 的传播步数按实际先验间隔放宽（`k = min(10, max(1, dt/0.1))`）。
 3. **own 与 `/lio/odom` 不同频**：`pushOwnPoseSample()` 改为零阶保持，own 帧与 LIO 帧一一对应；
    own 发布前用 `color.own_res_max_pos=0.5 m` / `own_res_max_rot=0.035 rad` 做信任域截断，
@@ -340,6 +350,13 @@ B 收敛为单进程单节点（`visual_b_app` = `ROSWrapper` + `VisualPipeline`
 各开关全部回落默认值且**不报错**。已统一改为 `/**`（`visual_b_params.yaml`、
 `visual_b_ntu.yaml` 原本就是 `/**`），CLI `-p` 覆盖仍优先于 YAML（实测生效）。
 
+> 同批（2026-11-19）进一步统一为 `/** → ros__parameters → super_livo_visual:`：视觉参数全部收进
+> `super_livo_visual` 分支，B 的 `lv.*` / `app.*` / `est.enable_visual` 并入方案 A 的同类命名
+> （`reproj.*` / `depth.*` / `update.*` 与分支根的 `embed` / `inject` / `inject_max_dt`），
+> 摊平后真实参数名带 `super_livo_visual.` 前缀，`-p` 覆盖必须写全名。改名表与验收见根
+> [README「参数文件规范」](../README.md#参数文件规范ros-2-params-yaml) 与
+> [exp_records §40](../experiments/exp_records.md)。本节下方记录的旧名保留为当时的实称。
+
 **② 跑批脚本**：`experiments/scripts/paper_matrix/run_one.sh` 的 b 臂原起
 `super_lio_node` + `visual_b_node` 两个进程，现改为单个 `visual_b_app`、同时喂
 LIO 与视觉两份 params-file（不再 `sleep 6` 等主干）；残留清理正则与
@@ -359,6 +376,7 @@ LIO 与视觉两份 params-file（不再 `sleep 6` 等主干）；残留清理�
 **验证**（test4/b 全量 1x，FastDDS、`ROS_DOMAIN_ID=95`）：`pcd=56M files=1`
 （3,642,499 点）、`odom_rows=502`、`latency_lines=1407`、`dt_img_cloud=+0.0035 s`。
 
-**口径变化提醒**：单体路径 `app.visual_inject` 默认 `true`，b 臂从此**真正把视觉约束写回
+**口径变化提醒**：单体路径 `inject`（现名 `super_livo_visual.inject`，本条记录时叫
+`app.visual_inject`）默认 `true`，b 臂从此**真正把视觉约束写回
 ESKF**；而 `paper_20261119` 的 B 数据出自双进程跑批（跨进程无法注入）。两者不可混比，
 论文矩阵的 B 行需用单体形态重跑。

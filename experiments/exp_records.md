@@ -656,7 +656,7 @@ ATE 0.0291±0.0008 vs 0.0425±0.0039，逐轮 +16.8/+15.1/+8.5 mm（均值 +13.4
 **修复（三处，均在 `super_livo_visual_b`）**
 
 1. `guard` 重构：绝对速度上限改为**无条件生效**（原挂在退化分支内），退化段仍按 `vel_ref × vel_ratio` 收紧并再压到绝对上限之下；`guard.vel_abs_cap` 由 3.0 提到 6.0。
-2. `buildLidarPrior` 增补**速度观测块**：新增 `lioVelocity(t_pose)`，在 `/lio/odom` 缓存上取 ~0.1 s 基线差分（要求 `dt∈[0.05,0.30]`、`|v|<10 m/s`，位置取 `(T_wl·T_li)` 平移），按 `lv.prior_vel_sigma=0.25` 注入 `H(kVel,kVel)`。配套把 `UnifiedEstimator::lidarUpdate` 的步长限幅按**实际先验间隔**放宽：新增 `lidar_dt_accum_`，`k=min(10, max(1, lidar_dt_accum_/0.1))`，限幅逐项 ×k（1 Hz 视觉时 k=10），否则 1 s 间隔的先验会被按 0.1 s 标定的限幅压死。
+2. `buildLidarPrior` 增补**速度观测块**：新增 `lioVelocity(t_pose)`，在 `/lio/odom` 缓存上取 ~0.1 s 基线差分（要求 `dt∈[0.05,0.30]`、`|v|<10 m/s`，位置取 `(T_wl·T_li)` 平移），按 `lv.prior_vel_sigma=0.25`（该记录为改名前命名，现名 `update.prior_vel_sigma`）注入 `H(kVel,kVel)`。配套把 `UnifiedEstimator::lidarUpdate` 的步长限幅按**实际先验间隔**放宽：新增 `lidar_dt_accum_`，`k=min(10, max(1, lidar_dt_accum_/0.1))`，限幅逐项 ×k（1 Hz 视觉时 k=10），否则 1 s 间隔的先验会被按 0.1 s 标定的限幅压死。
 3. **own 轨迹与 `/lio/odom` 同频**（关键）：新增 `pushOwnPoseSample()`，对最近一次视觉锚点的融合残差做零阶保持 —— `R_own = ΔR_anchor·R_lio`、`p_own = p_lio + Δp_anchor`，残差带信任域截断 `color.own_res_max_pos=0.5 m` / `color.own_res_max_rot=0.035 rad(≈2°)`；`onLivOdom` 每帧（10 Hz）落 `own_pose_cache_`，`poseAtStamp` 在 own 口径改查该缓存。1 Hz 锚点不再造成位姿空洞。
 
 **结果**（`BAG_RATE=1.0 SUB_DIV=2 KNN_K=5 SYNC_MAX=0.15 TAGS=own`，LIO 建图参数与 §34 b_lio 基线一致）
@@ -677,7 +677,7 @@ ATE 0.0291±0.0008 vs 0.0425±0.0039，逐轮 +16.8/+15.1/+8.5 mm（均值 +13.4
 - own 图比 b_lio 更"散"（**机制在 §36 已定因，不是出图质量波动**）：1 cm 体素内色 std 10.79 vs 7.21、多点数体素 4.7% vs 18.5%、5 cm 体素数 1.76 M vs 0.61 M、bbox 长边 +27 m。**成因是同一帧存在两个位姿源**：逐帧点云的几何/去畸变与地图世界变换走 `/lio/odom`，而图像投影与 own 残差走 `own_pose_cache_`（锚点间零阶保持，下一个 1 s 锚点到来时残差整体跳变）⇒ 两套位姿的**差**被直接注入彩色点，表现为分层/散色。这正是 pose_refiner 方案要消除的 `b_own` 双位姿源缺陷的产物级证据，**不能作为"紧耦合更差"的判据**（见下条结论边界）。
 - 结论边界：**b_own 可用于出图，但仍不能作为"紧耦合优于 b_lio"的判据**；层裂/发糊对比仍以 §34 的 b_lio 为准。
 
-**产物**：代码 `solution_b_tight_coupled/super_livo_visual_b/src/node/visual_b_node.{hpp,cpp}`（`prior_vel_sigma_`、`own_res_max_pos_/rot_`、`own_anchor_dp_/dR_/t_`、`lioVelocity()`、`pushOwnPoseSample()`、`buildLidarPrior` 增加 `t_pose` 形参、`onLivOdom` 内 10 Hz own 落缓存、守卫块重构）、`src/estimator/unified_estimator.{hpp,cpp}`（`lidar_dt_accum_` 与步长放宽）、`config/visual_b_params.yaml`（`lv.prior_vel_sigma: 0.25`、`guard.vel_abs_cap: 6.0`）。数据 `/home/ywj/slam_data/colored_superlio_b_20261115_fix34/b_own/`（最终产物 273,813,196 B），同级 `b_own_step1_velobs/`、`b_own_step2_capdt/` 为两次中间态留证；b_lio 基线沿用 `/home/ywj/slam_data/colored_superlio_b_20261115/b_lio/`。
+**产物**：代码 `solution_b_tight_coupled/super_livo_visual_b/src/node/visual_b_node.{hpp,cpp}`（`prior_vel_sigma_`、`own_res_max_pos_/rot_`、`own_anchor_dp_/dR_/t_`、`lioVelocity()`、`pushOwnPoseSample()`、`buildLidarPrior` 增加 `t_pose` 形参、`onLivOdom` 内 10 Hz own 落缓存、守卫块重构）、`src/estimator/unified_estimator.{hpp,cpp}`（`lidar_dt_accum_` 与步长放宽）、`config/visual_b_params.yaml`（`lv.prior_vel_sigma: 0.25`、`guard.vel_abs_cap: 6.0`；此处键名为改名前写法，现分别写作 `update.prior_vel_sigma` 与 `guard.vel_abs_cap`，且都在 `super_livo_visual` 分支下）。数据 `/home/ywj/slam_data/colored_superlio_b_20261115_fix34/b_own/`（最终产物 273,813,196 B），同级 `b_own_step1_velobs/`、`b_own_step2_capdt/` 为两次中间态留证；b_lio 基线沿用 `/home/ywj/slam_data/colored_superlio_b_20261115/b_lio/`。
 
 ## 36. pose_refiner Phase 0 离线判决：口径订正 + 图像旋转通道能力实测（P0-A~F 全部完成，2026-11-15~16）
 
@@ -1319,9 +1319,9 @@ N=1 是**构造恒等**（链的区间就是 `R_vis`），含义是"若完全信
 
 ## 37. 方案 B 现状态 Retail_Street 跑批：三轮参数对照（2026-11-16）
 
-**前提/动机**：在 `visual_b_app`（进程内 Super-LIO + B 视觉支路，`app.visual_inject:=true`）的**当前代码与配置**下，于 Retail_Street 跑一轮完整 B 方案，产出可核对的轨迹与彩色点云，并确认相对 2026-11-14 旧结果没有回归。
+**前提/动机**：在 `visual_b_app`（进程内 Super-LIO + B 视觉支路，`app.visual_inject:=true`，该记录为改名前命名，现名 `super_livo_visual.inject`）的**当前代码与配置**下，于 Retail_Street 跑一轮完整 B 方案，产出可核对的轨迹与彩色点云，并确认相对 2026-11-14 旧结果没有回归。
 
-**配置（三轮共用）**：`config/retail_lio.yaml` + `solution_b_tight_coupled/super_livo_visual_b/config/visual_b_params.yaml`（Retail 相机内参、`scale 0.5`、`color.use_own_odom false`、`rot_refine.enable false`、`est.enable_visual true`、`lio.ros.lidar_qos_reliable false`、`lio.ros.imu_qos_reliable false`）；`RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`、`ROS_DOMAIN_ID=86`、`ros2 bag play /home/ywj/slam_data/Retail_Street_d2 --rate 1.0`。每轮并行录 `/lio/odom`、`/super_livo_visual_b/odom`、`/lio/degeneracy`（rosbag2）+ `odom_recorder.py` CSV。
+**配置（三轮共用）**：`config/retail_lio.yaml` + `solution_b_tight_coupled/super_livo_visual_b/config/visual_b_params.yaml`（下列键名为该记录当时的写法，2026-11-19 格式统一后全部收进 `super_livo_visual` 分支，见 §40.3；Retail 相机内参、`scale 0.5`、`color.use_own_odom false`、`rot_refine.enable false`、`est.enable_visual true`、`lio.ros.lidar_qos_reliable false`、`lio.ros.imu_qos_reliable false`）；`RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`、`ROS_DOMAIN_ID=86`、`ros2 bag play /home/ywj/slam_data/Retail_Street_d2 --rate 1.0`。每轮并行录 `/lio/odom`、`/super_livo_visual_b/odom`、`/lio/degeneracy`（rosbag2）+ `odom_recorder.py` CSV。
 
 **三轮只改一个变量**：
 
@@ -1448,7 +1448,8 @@ Pcl = [0.016642, -0.113077, -0.037398]
 ### 39.3 发现的三处缺口
 
 1. **`run_one.sh` b 臂仍起两个进程**（`super_lio_node` + 已删除的 `visual_b_node`）⇒ 跑不起来。改为单个 `visual_b_app`、同时喂 `livox_360.yaml` 与 `visual_b_move.yaml`；残留清理正则与 `tools/ros_batch_guard.sh` 的 `_LIVEPAT` 加入 `visual_b_app`。
-2. **配置整块静默失效**：`visual_b_move/rtk/room.yaml` 顶层键写 `super_livo_visual_b:`，而单体节点名是 `super_lio` ⇒ 内参、`img_time_offset`、开关全部回落默认值且无告警。三份统一改 `/**`。
+2. **配置整块静默失效**：`visual_b_move/rtk/room.yaml` 顶层键写 `super_livo_visual_b:`，而单体节点名是 `super_lio` ⇒ 内参、`img_time_offset`、开关全部回落默认值且无告警。三份统一改 `/**`（2026-11-19 的 §40 在此基础上进一步把视觉参数收进
+   `super_livo_visual:` 分支并做 A/B 同类合并改名）。
 3. **退出时 PCD 不落盘**（本轮主问题）：见 §39.4。
 
 ### 39.4 退出落盘：异步投递被进程退出杀掉
@@ -1473,9 +1474,122 @@ Pcl = [0.016642, -0.113077, -0.037398]
 | `dt_img_cloud` | +0.0036 s | +0.0035 s |
 | 退出码 | 0 | 0（同步落盘在退出前完成） |
 
-**口径变化**：单体路径 `app.visual_inject` 默认 `true`，b 臂从此**真正把视觉约束写回 ESKF**；
+**口径变化**：单体路径 `app.visual_inject`（该记录为改名前命名，现名 `super_livo_visual.inject`）默认 `true`，b 臂从此**真正把视觉约束写回 ESKF**；
 `paper_20261119` 的 B 行出自双进程跑批（跨进程无法注入，见 §38 / `paper_compare/REPORT.md` 前言）。
 论文矩阵的 B 行需用单体形态重跑后才可与其他臂并列，**不可混用两轮数据**。
 
 **产物**：`/home/ywj/slam_data/test4_check_b{,2}/`（修前，无 PCD）、`/home/ywj/slam_data/test4_smoke_b/`（15 s smoke）、`/home/ywj/slam_data/test4_check_b3/`（修后，含 PCD）；诊断脚本 `/tmp/repro_b_exit.sh`、`/tmp/diag_b_save.sh` 为临时探针，不入库。代码改动：`bf916ef`。
+
+---
+
+## 40. 全仓 params YAML 格式统一与 A/B 同类参数合并改名（2026-11-19）
+
+**结论**：仓库所有 ROS 2 params YAML 收为同一套格式——顶层只写 `/**` + `ros__parameters`，
+原版 Super-LIO 主干参数保持扁平 `lio.*` 名字不动，两条视觉支路的参数统一收进
+`super_livo_visual` 分支并**共用同一套键名**（B 与 A 语义相同的旧名并入 A 的命名族）。
+合并后的同一份文件既能喂 `visual_a_app` / `visual_b_app`，也能直接喂官方 `super_lio_node`
+跑纯 LIO；历史上"顶层写死节点名导致整块参数静默失效"的坑（§39.3 ①）一并消灭。
+**本轮只动配置与文档 + 读取侧前缀，未改任何算法逻辑。**
+
+### 40.1 规则原文
+
+```yaml
+/**:
+  ros__parameters:
+    lio.ros.lidar_topic: "/livox/lidar"     # ① 原版 Super-LIO 主干段：扁平 lio.* 名字，与上游一字不动
+    super_livo_visual:                       # ② 视觉支路段（方案 A / 方案 B 共用同一套名字，同类已合并）
+        cam_width: 1280
+        Rcl: [-0.0171, -0.9998, -0.0064, ...]
+        gate.max_reprojection_rmse: 6.0
+        pcd:
+            save_dir: "/home/ywj/slam_data/output/move_a"
+```
+
+三条硬约束：① 顶层一律 `/**`，**禁止写死节点名**（`super_livo_visual_a:` / `super_livo_visual_b:`
+都不允许）；② 视觉参数只能挂在 `super_livo_visual:` 分支下，分支内允许 `a.b` 扁平键与
+`pcd:` 嵌套块混用；③ `experiments/config/livox_360_visa*.yaml` 里的 `lio.visual.*` 是
+**上游 Super-LIO 自带视觉**的参数，属于 ① 段，不迁移、不改名。
+
+### 40.2 摊平机制与读取侧
+
+Humble 的 rcl 会把 `ros__parameters:` 下的**嵌套 map 摊平成点号参数名**，因此分支里的键最终
+在 ROS 参数服务上的真实名字是 `super_livo_visual.cam_width`、`super_livo_visual.pcd.save_dir`。
+
+| 侧 | 加前缀的位置 |
+| --- | --- |
+| A | `solution_a_lightweight/super_livo_visual_a/include/super_livo_visual_a/node/visual_a_node.hpp` 里的 `vp("name")` helper，声明/读取统一走它 |
+| B | `solution_b_tight_coupled/super_livo_visual_b/src/app/visual_b_app.cpp` 的 `getOrDeclare` 内用常量 `kVisualParamPrefix` 统一加 |
+
+推论：命令行 `-p` 覆盖**必须写全名**（`-p super_livo_visual.pcd.save_dir:=…`），写短名等于给一个
+未声明的参数赋值 ⇒ 静默无效。文档与注释里写分支内短名（`gate.*`、`pcd.save_dir`）时一律省略前缀。
+
+### 40.3 B 侧旧名 → 新名（同类合并）
+
+其余名字不变，只是整体加上 `super_livo_visual.` 前缀。
+
+| B 旧名 | 新名（分支内短名） | 说明 |
+| --- | --- | --- |
+| `lv.huber_delta` / `lv.sigma_pix` / `lv.sigma_anchor` / `lv.min_constraints` / `lv.max_pixel_error` / `lv.max_pixel_error_anchored` | `reproj.` 同名 | 与 A 的 `reproj.*` 合并 |
+| `lv.pixel_radius` | `depth.pixel_radius` | 与 A 的 `depth.pixel_radius` 同一概念（两处都喂 `associationVariance`） |
+| `lv.anchor_keep_sec` | `depth.anchor_keep_sec` | — |
+| `lv.prior_pos_sigma` / `prior_pos_sigma_degen` / `prior_pos_sigma_healthy` / `prior_rot_sigma` / `prior_vel_sigma` | `update.prior_*` | 与 A 的 `update.prior_*` 合并 |
+| `lv.prior_directional_en` | `update.directional_prior_en` | — |
+| `est.enable_visual` | `update.enable` | 与 A 的 `update.enable` 同义 |
+| `app.embed_visual` / `app.visual_inject` / `app.visual_inject_max_dt` | `embed` / `inject` / `inject_max_dt` | 挂在 `super_livo_visual` 分支根下 |
+
+**刻意不合并**的三组（机制不同，强行合并会改行为）：A 的 `gate.*`（退化时整帧门控 / 降权阈值）、
+B 的 `est.visual_info_ratio(_degen)`（信息矩阵比例）、B 的 `guard.*`（LIO 跳变守护）。
+
+| 归属 | 参数族 |
+| --- | --- |
+| A 独有 | `gate.*`、`klt.*`、`evo.*`、`image_save.*`、`odom_topic`、`cloud_topic`、`body_cloud_topic`、`degen_topic`、`lio_source` |
+| B 独有 | `est.*`、`msckf.*`、`photo.*`、`rot_refine.*`、`scheduler.*`、`lifecycle.*`、`kf.*`、`guard.*`、`patch.*`、`e2.*` |
+| A/B 同名 | `cam_*`、`Rcl`、`Pcl`、`scale`、`image_topic`、`imu_topic`、`align.*`、`color.*`、`pcd.*`、`image.qos_reliable` |
+
+### 40.4 验收（实测）
+
+| # | 判据 | 结果 |
+| --- | --- | --- |
+| 1 | 同一份合并 YAML 可直接喂官方 `super_lio_node` 跑纯 LIO（未声明的 override 被 rclcpp 静默忽略） | ✅ `ros2 param get /super_lio super_livo_visual.embed` 返回 `Parameter not set`；`lio.sensor.blind`、`lio.kf.kf_max_iterations` 正常生效 |
+| 2 | `visual_a_app` 读到分支内参数 | ✅ `super_livo_visual.cam_width=1280`、`gate.max_reprojection_rmse=6.0` |
+| 3 | `visual_b_app` 读到合并改名后的参数 | ✅ `reproj.sigma_pix=1.5`、`update.enable=True`、`depth.pixel_radius=3`、`inject=True` |
+
+收益：`super_livo_visual` 分支对主干是透明的，纯 LIO / 带视觉不必再维护两份配置。
+
+### 40.5 改动文件
+
+14 份 YAML：`common/super_livo_common/config/lio_move.yaml`、`config/retail_lio.yaml`、
+`experiments/octvox_ablation/20_move_{a,b}_node.yaml`、
+`solution_a_lightweight/super_livo_visual_a/config/visual_a_{params,move,ntu,room,rtk}.yaml`、
+`solution_b_tight_coupled/super_livo_visual_b/config/visual_b_{params,move,ntu,room,rtk}.yaml`。
+
+代码（仅读取侧加前缀）：`visual_a_node.hpp`（`vp()`）、`visual_a_node.cpp`、`visual_a_app.cpp`、
+`visual_b_app.cpp`（`kVisualParamPrefix`）、`pipeline/visual_pipeline.cpp`。
+
+17 个脚本共 **96 处 `-p` 覆盖**改为全名，按参数名分布：
+
+| 参数名 | 处数 | 参数名 | 处数 |
+| --- | --- | --- | --- |
+| `pcd.save_dir` | 17 | `pcd.save_interval_sec` | 15 |
+| `odom_topic` | 10 | `cloud_topic` | 10 |
+| `body_cloud_topic` | 10 | `color.use_own_odom` | 8 |
+| `color.cam_odom_topic` | 6 | `image_topic` | 5 |
+| `color.sync_max_offset` | 2 | `inject` / `img_time_offset` / `image.qos_reliable` / `gate.cond_lo` / `gate.cond_hi` / `pcd.median_voxel_size` / `color.{patch_radius,patch_color_tol,own_res_max_rot,own_res_max_pos,min_quality,depth_tolerance,check_depth_edges}` | 各 1 |
+
+脚本清单：`experiments/octvox_ablation/{10,11,12,13,14}_run_colored_*.sh`、
+`experiments/octvox_ablation/16_run_superlio_a_color.sh`、`16b_run_superlio_b_color.sh`、
+`20a_run_move_a.sh`、`20b_run_move_b.sh`、`_probe_body_qos.sh`、`_probe_replay_aligned.sh`、
+`_probe_replay_monitor.sh`、`_probe_two_bag_node.sh`、`_replay_node_on_record.sh`、
+`experiments/scripts/paper_matrix/run_one.sh`、`experiments/scripts/retail_ab/run_ab_retail.sh`、
+`tools/run_ntu.sh`。
+
+文档同步：根 `README.md`（新增「参数文件规范」小节）、`solution_b_tight_coupled/README.md`、
+`monolith_refactor_plan.md`、`monolith_refactor_progress.md`、`experiments/paper_compare/REPORT.md`。
+
+### 40.6 历史口径提醒
+
+本文档 §1–§39 与 `solution_b_tight_coupled/README.md` §9、`monolith_refactor_progress.md` §2
+中已跑完的实验记录**保留当时的旧参数名与数值**（`lv.*` / `app.*` / `est.enable_visual` /
+短名 `-p img_time_offset:=…`），未回填改写；涉及处已就地标注"该记录为改名前命名"。
+`paper_20261119`、`test4_check_b*` 等历史结果如需复现，按旧名写 `-p` 不会生效，须用 §40.3 的新名。
 

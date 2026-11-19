@@ -4,7 +4,9 @@
 # 用法：
 #   ros2 run super_livo_visual_a visual_a_app --ros-args \
 #     --params-file <本文件> --params-file visual_a_move.yaml
-super_lio:
+# 顶层键统一用 /** 通配：单体路径的节点名是 Super-LIO 的 super_lio，写死节点名
+# 在另一条路径上会整块静默失效（键名本身仍须是 lio.* / app.* 扁平结构）。
+/**:
   ros__parameters:
     # ---------------- ROS 话题 ----------------
     lio.ros.lidar_topic: "/livox/lidar"
@@ -59,7 +61,10 @@ super_lio:
     lio.kf.kf_max_iterations: 4
     lio.kf.kf_align_gravity: true
 
-    # ---- visual_b_app 专用开关（A 只用 embed_visual）----
-    app.embed_visual: true            # 同进程创建视觉支路
-    app.visual_inject: true           # B：视觉约束经 ExternalObserve 写回 ESKF
-    app.visual_inject_max_dt: 0.5
+    # ---- 视觉支路开关（本文件只带这几个，其余视觉参数在 visual_{a,b}_move.yaml）----
+    # 官方 super_lio_node 不认识 super_livo_visual 分支，未声明的 override 会被静默忽略，
+    # 所以本文件可以直接喂 super_lio_node 跑纯 LIO。
+    super_livo_visual:
+        embed: true                   # 同进程创建视觉支路（A/B 单体 app 用）
+        inject: true                  # B：视觉约束经 ExternalObserve 写回 ESKF
+        inject_max_dt: 0.5

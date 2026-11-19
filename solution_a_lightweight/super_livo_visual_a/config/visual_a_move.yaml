@@ -1,60 +1,66 @@
 # move bag（1280x1024 bgr8 全局快门相机 + Livox CustomMsg）——方案 A 支路参数。
 # 外参 Rcl/Pcl 由 FAST-Calib 标定结果回填（标定 bag：livo_bag/all_ros2）。
 #
-# 命名约定：顶层键必须是节点名 super_livo_visual_a（同 room/rtk），否则
-# `visual_a_node --params-file` 读不到任何一项，会静默退回代码默认值
-# （相机 640x512、外参 avia↔OAK、gate 2.0 px），实测 move/a 因此一直跑的是默认参数。
-super_livo_visual_a:
+# 命名约定：顶层键统一用 `/**` 通配，两条启动路径都能命中（`ros2 run ... visual_a_node`
+# 双节点、单体 `visual_a_app`）。写具体节点名会在另一条路径上整块静默失效——
+# 曾经用 `super_livo_visual_a:` 时 move/a 读不到任何一项，一直跑代码默认值
+# （相机 640x512、外参 avia↔OAK、gate 2.0 px），且没有任何告警。
+/**:
   ros__parameters:
-    image_topic: /left_camera/image
-    cam_width: 1280
-    cam_height: 1024
-    cam_fx: 7.0863125924497740e+02
-    cam_fy: 7.0871513587278127e+02
-    cam_cx: 6.4449372682521789e+02
-    cam_cy: 4.9588359175254533e+02
-    cam_d: [5.4466418090825280e-02, -4.5147373415016401e-02,
-            8.5461102120314711e-06, 1.0486594840736336e-03]
-    # LiDAR -> Camera（p_cam = Rcl * P_lidar + Pcl）
-    # FAST-Calib 重标（all_ros2 + img_0120.png，本地标定参数，RMSE 7.9 mm）
-    # holefix：真实板面 RANSAC 法向 + 前表面 + 1° 扇区最小半径重解 4 孔心 → Kabsch，
-    # 四孔 3D 对应点 RMSE 3.2 mm（优于 FAST-Calib 直出的 7.9 mm）。2026-11-17 重写。
-    Rcl: [-0.017100, -0.999833, -0.006427,
-           0.482159, -0.002615, -0.876080,
-           0.875917, -0.018080,  0.482123]
-    Pcl: [0.027840, -0.172288, -0.047550]
-    img_time_offset: 0.0
-    # 相机曝光与雷达扫描起止存在相位差：实测最近邻 dt 中位 16.7ms、最大 74ms，
-    # 默认同步窗 0.02 不够，放宽到 0.1。
-    color.sync_max_offset: 0.1
+    # ---- 视觉支路参数（方案 A / 方案 B 共用同一套名字）----
+    # rcl 会把本分支摊平成 super_livo_visual.<name>，代码侧读取时必须带这个前缀；
+    # 官方 super_lio_node 不认识本分支，未声明的 override 被静默忽略，故同一份文件
+    # 直接喂 super_lio_node 也能跑（这就是本仓库统一参数格式的目的）。
+    super_livo_visual:
+        image_topic: /left_camera/image
+        cam_width: 1280
+        cam_height: 1024
+        cam_fx: 7.0863125924497740e+02
+        cam_fy: 7.0871513587278127e+02
+        cam_cx: 6.4449372682521789e+02
+        cam_cy: 4.9588359175254533e+02
+        cam_d: [5.4466418090825280e-02, -4.5147373415016401e-02,
+                8.5461102120314711e-06, 1.0486594840736336e-03]
+        # LiDAR -> Camera（p_cam = Rcl * P_lidar + Pcl）
+        # FAST-Calib 重标（all_ros2 + img_0120.png，本地标定参数，RMSE 7.9 mm）
+        # holefix：真实板面 RANSAC 法向 + 前表面 + 1° 扇区最小半径重解 4 孔心 → Kabsch，
+        # 四孔 3D 对应点 RMSE 3.2 mm（优于 FAST-Calib 直出的 7.9 mm）。2026-11-17 重写。
+        Rcl: [-0.017100, -0.999833, -0.006427,
+               0.482159, -0.002615, -0.876080,
+               0.875917, -0.018080,  0.482123]
+        Pcl: [0.027840, -0.172288, -0.047550]
+        img_time_offset: 0.0
+        # 相机曝光与雷达扫描起止存在相位差：实测最近邻 dt 中位 16.7ms、最大 74ms，
+        # 默认同步窗 0.02 不够，放宽到 0.1。
+        color.sync_max_offset: 0.1
 
-    update:
-      enable: true               # 退化门控视觉更新（健康段自动回退纯 LIO）
-      reinject: true
+        update:
+          enable: true               # 退化门控视觉更新（健康段自动回退纯 LIO）
+          reinject: true
 
-    # 重投影门限：代码默认 2.0 px 是按 Retail（1.6~2.9 px）定的，直接用在 move 上
-    # 会让健康段的全部视觉帧被判 "reprojection rmse too large"（实测 rmse 中位 2.92 /
-    # p90 3.97 / max 4.62 px，bias 中位 0.53 px ⇒ 不是外参系统偏差，是 0.25 m 体素
-    # 地图的深度关联噪声）。按 1.3× 实测最大值取 6.0。
-    gate.max_reprojection_rmse: 6.0
+        # 重投影门限：代码默认 2.0 px 是按 Retail（1.6~2.9 px）定的，直接用在 move 上
+        # 会让健康段的全部视觉帧被判 "reprojection rmse too large"（实测 rmse 中位 2.92 /
+        # p90 3.97 / max 4.62 px，bias 中位 0.53 px ⇒ 不是外参系统偏差，是 0.25 m 体素
+        # 地图的深度关联噪声）。按 1.3× 实测最大值取 6.0。
+        gate.max_reprojection_rmse: 6.0
 
-    # 彩色点云落盘：<save_dir>/super_livo_visual_a_colored.pcd
-    pcd:
-      save_dir: "/home/ywj/slam_data/output/move_a"
-      # 只在退出时存一次：周期写盘会阻塞单线程回调，实测造成 0.5~0.7 s 的
-      # 图像/odom 断档（评测只需要最终的合并 pcd）。
-      save_interval_sec: 0.0
-      max_points: 20000000
+        # 彩色点云落盘：<save_dir>/super_livo_visual_a_colored.pcd
+        pcd:
+          save_dir: "/home/ywj/slam_data/output/move_a"
+          # 只在退出时存一次：周期写盘会阻塞单线程回调，实测造成 0.5~0.7 s 的
+          # 图像/odom 断档（评测只需要最终的合并 pcd）。
+          save_interval_sec: 0.0
+          max_points: 20000000
 
-    # 轨迹 / 图像落盘（参照 FAST-LIVO2 的 evo / image_save）
-    #   轨迹：<save_dir>/<seq_name>.txt，TUM 格式
-    #   图像：<image_save.dir>/<timestamp>.png（目录留空 = <pcd.save_dir>/image）
-    evo:
-      pose_output_en: false
-      save_dir: ""                 # 空 = pcd.save_dir
-      seq_name: "scene_move"       # → scene_move.txt
-      interval: 1
-    image_save:
-      img_save_en: false
-      dir: ""                      # 空 = <pcd.save_dir>/image
-      interval: 1
+        # 轨迹 / 图像落盘（参照 FAST-LIVO2 的 evo / image_save）
+        #   轨迹：<save_dir>/<seq_name>.txt，TUM 格式
+        #   图像：<image_save.dir>/<timestamp>.png（目录留空 = <pcd.save_dir>/image）
+        evo:
+          pose_output_en: false
+          save_dir: ""                 # 空 = pcd.save_dir
+          seq_name: "scene_move"       # → scene_move.txt
+          interval: 1
+        image_save:
+          img_save_en: false
+          dir: ""                      # 空 = <pcd.save_dir>/image
+          interval: 1

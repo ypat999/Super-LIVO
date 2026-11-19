@@ -42,17 +42,28 @@
 
 namespace {
 
+// 全仓库统一的参数文件约定：视觉支路在 YAML 里写成嵌套 map
+//   /**: ros__parameters: { super_livo_visual: { ... } }
+// rcl 会把嵌套 map 摊平成 "super_livo_visual.xxx"，所以代码侧最终读到的
+// 名字一律带这个前缀。前缀只在本 helper 里注入一次：RosParamSource 的取值
+// 方法与本文件直接调用 getOrDeclare 的 ROSWrapper 路径共用同一个入口，
+// 两条路径的参数名因此必然完全一致。调用方一律传相对名字（如 "embed"）。
+constexpr char kVisualParamPrefix[] = "super_livo_visual.";
+
 /// 取参数：未声明则用默认值声明，已声明（YAML 覆盖）则直接读。
+/// 入参 name 是 super_livo_visual. 下的相对名，前缀在此统一补齐。
 template <typename T>
 T getOrDeclare(rclcpp::Node& node, const std::string& name, const T& def) {
-  if (node.has_parameter(name)) {
-    return node.get_parameter(name).get_value<T>();
+  const std::string full = std::string(kVisualParamPrefix) + name;
+  if (node.has_parameter(full)) {
+    return node.get_parameter(full).get_value<T>();
   }
-  return node.declare_parameter<T>(name, def);
+  return node.declare_parameter<T>(full, def);
 }
 
 /// 把 VisualPipeline 的参数读取接到 ROS 参数服务上。
-/// 流水线内部保持原有参数名与默认值，YAML 的 /** 通配块可直接覆盖。
+/// 流水线内部使用 super_livo_visual. 下的相对参数名与默认值，
+/// YAML 的 /** 通配块可直接覆盖（前缀由 getOrDeclare 统一注入）。
 class RosParamSource : public superlivo_b::ParamSource {
  public:
   explicit RosParamSource(rclcpp::Node& node) : node_(node) {}
@@ -464,12 +475,12 @@ int main(int argc, char** argv) {
 
   // ---- 视觉支路开关 ------------------------------------------------------
   const bool embed_visual =
-      getOrDeclare<bool>(*wrapper, "app.embed_visual", true);
-  // app.visual_inject：是否把视觉约束经 ExternalObserve() 写回 ESKF。
+      getOrDeclare<bool>(*wrapper, "embed", true);
+  // super_livo_visual.inject：是否把视觉约束经 ExternalObserve() 写回 ESKF。
   const bool inject_visual =
-      getOrDeclare<bool>(*wrapper, "app.visual_inject", true);
+      getOrDeclare<bool>(*wrapper, "inject", true);
   const double inject_max_dt =
-      getOrDeclare<double>(*wrapper, "app.visual_inject_max_dt", 0.2);
+      getOrDeclare<double>(*wrapper, "inject_max_dt", 0.2);
 
   std::shared_ptr<superlivo_b::ConstraintBridge> bridge;
   if (embed_visual && inject_visual) {
@@ -479,7 +490,8 @@ int main(int argc, char** argv) {
 
   std::shared_ptr<MonolithVisualIo> io;
   if (!embed_visual) {
-    RCLCPP_INFO(wrapper->get_logger(), "app.embed_visual=false：只运行纯 LIO");
+    RCLCPP_INFO(wrapper->get_logger(),
+                "super_livo_visual.embed=false：只运行纯 LIO");
   } else {
     RosParamSource param_source(*wrapper);
     pipeline = std::make_shared<superlivo_b::VisualPipeline>(param_source, bridge);
