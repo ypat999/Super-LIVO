@@ -1,8 +1,10 @@
 [Unit]
 Description=FAST-LIVO realtime mapping (Super-LIVO solution A: Livox MID360 + Hik camera)
 Documentation=file:///home/ztl/git/sl_ws/Super-LIVO/docs/RK3588_DEPLOY_AND_BENCH.md
-After=network-online.target
-Wants=network-online.target
+# 刻意不依赖 network-online.target：实测本机 systemd-networkd-wait-online 在开机时
+# 要等约 100 s 才判定 online，把建图服务一起拖到 1 分半后才启动。雷达走链路本地
+# 以太网、相机走 USB，都不需要"网络在线"；话题未就绪由脚本自身重试覆盖。
+After=local-fs.target
 
 [Service]
 Type=simple
