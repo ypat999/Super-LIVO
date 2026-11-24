@@ -39,20 +39,25 @@ namespace superlivo_a {
 // 本类是 VisualANode 的"去 ROS 化"等价实现：所有输入都是普通类型（cv::Mat /
 // Eigen::Matrix4d / std::vector），所有输出走 std::function 回调。
 //
-// 单体化后的数据流（进程内、无 DDS），内部三条线程（与方案 B 同构）：
-//   ① submit*（ROS 回调 / SuperLIO 输出线程）：只把带类型的 InputEvent 放进
-//      input_queue_，零算法、立即返回；
-//   ② 工作线程：按 FIFO 串行执行全部算法（所有算法状态仅此线程访问），
-//      并把彩色地图新增段按 ColorSegment 增量移交给落盘线程；
-//   ③ 落盘线程：只做彩色地图增量段合并 + PCD 写盘，落盘不再阻塞计算。
-//   工作线程 ──► ColoredCloudCallback / OdomCallback ──► ROS 发布（对外输出）
+// 单体化后的数据流（进程内、无 DDS），内部四条线程：
+//   ① submit*（ROS 回调 / SuperLIO 输出线程）：只把带类型的事件放进对应队列
+//      （机体系点云进 color_queue_，其余进 input_queue_），零算法、立即返回；
+//   ② 工作线程：按 FIFO 串行执行视觉定位算法（去畸变 + KLT/深度/重投影/门控/
+//      更新），并把去畸变图像与位姿采样镜像进着色线程的缓存；
+//   ③ 着色线程：消费点云队列，配对图像 → 投影上色 → 累积彩色地图，按 ColorSegment
+//      增量移交落盘线程（与 VIO 并行，互不阻塞）；
+//   ④ 落盘线程：只做彩色地图增量段合并 + PCD 写盘，落盘不再阻塞计算。
+//   工作线程 ──► OdomCallback；着色线程 ──► ColoredCloudCallback ──► ROS 发布
 //
-// 为什么算法保持单工作线程：
-//   * 原始 VisualANode 的状态（frontend_/pose_cache_/pending_*/pose_offset_ 等）
-//     全部依赖回调串行访问；原实现靠 MultiThreadedExecutor + 逻辑上的先后关系，
-//     实际存在数据竞争窗口。这里显式串行化，行为更严格且可复现。
-//   * SuperLIO 的 OutputThread/DenseThread 只做 memcpy + 入队，不会被视觉处理阻塞。
-//   * 整图 PCD 重写从工作线程挪到独立落盘线程，计算与 IO 互不阻塞。
+// 为什么这样拆线程：
+//   * 实测 RK3588 上单 worker 串行跑 VIO（~130ms/帧）+ 着色（10Hz）吞吐饱和，
+//     排队超时丢弃上万事件、着色帧覆盖率仅 30%。着色链路与 VIO 只共享"图像 +
+//     位姿缓存"这类只读输入，天然可并行，拆到独立线程后两者互不拖累。
+//   * 算法状态按线程归属严格拆分：VIO 状态（frontend_/pose_cache_/pending_* 等）
+//     仍只被工作线程无锁访问；彩色状态（pending_clouds_/colored_map_/median_map_）
+//     只被着色线程访问。跨线程交接只经由加锁的镜像缓存（color_*_cache_）与
+//     原子计数器，不给 worker 的 pose_cache_ 加锁共用。
+//   * 整图 PCD 重写从计算线程挪到独立落盘线程，计算与 IO 互不阻塞。
 //
 // 算法模块（KLT/深度关联/重投影/门控/更新/上色）一行未改，全部沿用原参数语义。
 // ============================================================================
@@ -188,16 +193,17 @@ class VisualPipeline {
   /// 世界系点云（原 lio/cloud_world）：当前扫描 + 局部地图（供深度关联）。
   void submitWorldCloud(const std::vector<Eigen::Vector3d>& points_world);
   /// 机体系全量点云（原 lio/cloud_body_dense）：仅用于彩色点云。
+  /// 直接进着色线程的 color_queue_（带排队时延保护），不占 worker 输入队列。
   void submitBodyCloud(const std::vector<Eigen::Vector3f>& points_lidar, double stamp);
   /// 退化签名（原 lio/degeneracy；单体内由 SuperLIO 快照直供）。
   void submitDegeneracy(const superlivo_common::DegeneracySignature& sig);
 
   // ---- 控制 ----
-  /// 请求一次彩色地图落盘（投 kSaveSnapshot 事件：工作线程切增量段移交
-  /// 落盘线程写盘，不阻塞调用方）。
+  /// 请求一次彩色地图落盘（投 kSaveSnapshot 事件到着色队列：着色线程切增量段
+  /// 移交落盘线程写盘，不阻塞调用方）。
   void requestSaveColoredMap();
-  /// 等待已入队事件全部处理完（投 barrier 事件，30 s 超时打 WARN；
-  /// 用于退出前补完尾段）。
+  /// 等待已入队事件全部处理完（先 worker 后着色线程各投一个 barrier 事件，
+  /// 30 s 超时打 WARN；用于退出前补完尾段）。
   void flush();
   /// 停机并**同步**写出最终彩色地图（幂等，可重复调用，std::call_once）。
   /// 退出前必须调用：异步 save 线程会随进程结束被直接杀掉，长序列上
@@ -222,29 +228,47 @@ class VisualPipeline {
     double t_cloud{0.0};
     std::chrono::steady_clock::time_point queued_at;
   };
+  /// 着色线程每轮处理前对镜像缓存取的一致性快照：持锁短暂拷贝后整轮无锁使用，
+  /// 避免在 colorizeFrame/accumulateColoredMap 的重计算期间阻塞工作线程推送。
+  struct ColorSnapshot {
+    std::vector<colorizer::TimedImage> images;
+    std::vector<colorizer::PoseSample> poses;      ///< 镜像自 worker pose_cache_
+    std::vector<colorizer::PoseSample> cam_poses;  ///< 镜像自 worker cam_pose_cache_
+    std::vector<colorizer::PoseSample> own_poses;  ///< 镜像自 worker own_pose_cache_
+  };
 
   // ---- 输入处理（仅工作线程执行） ----
   void handleImage(const cv::Mat& bgr, double stamp);
   void handleOdom(const Eigen::Matrix4d& T_wl, double stamp);
   void handleCamOdom(const Eigen::Matrix4d& T_wl, double stamp);
   void handleWorldCloud(const std::vector<Eigen::Vector3d>& points_world);
-  void handleBodyCloud(const std::vector<Eigen::Vector3f>& points_lidar, double stamp);
   void handleDegeneracy(const superlivo_common::DegeneracySignature& sig);
 
   // ---- 主流程 ----
   void processVisualFrame(const cv::Mat& gray, double stamp);
-  void runColorizer();
-  void drainPendingClouds();
-  void drainPendingColorization();
-  bool colorizeFrame(const PendingColorFrame& frame);
 
-  // ---- 位姿查询 ----
+  // ---- 着色链路（仅着色线程执行；shutdown join 后由收尾线程调用 drain*） ----
+  /// 一帧点云入待配对队列（含非有限点过滤与重复帧去重）。
+  void handleBodyCloudColor(const std::vector<Eigen::Vector3f>& points_lidar, double stamp);
+  void drainPendingClouds(const ColorSnapshot& snap);
+  void drainPendingColorization(const ColorSnapshot& snap);
+  bool colorizeFrame(const PendingColorFrame& frame, const ColorSnapshot& snap);
+
+  // ---- 位姿查询（工作线程：VIO 用 worker 私有缓存；着色线程：查快照） ----
+  /// 通用版：在给定采样缓存上插值/clamp。
+  bool poseAtFromCache(const std::vector<colorizer::PoseSample>& cache, double stamp,
+                       Eigen::Matrix4d& T_wl, bool clamp_future) const;
   /// clamp_future：视觉定位路径专用。相机与雷达硬件级触发同步，按图像时刻查询时
   /// 最新采样通常只早几毫秒，直接取最新采样而不是等下一帧 odom。
   bool poseAtStamp(double stamp, Eigen::Matrix4d& T_wl, bool clamp_future = false) const;
   bool poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl,
                             bool clamp_future = false) const;
   bool camPoseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const;
+  /// 着色线程版本：语义与 poseAtStamp/camPoseAtStamp 完全一致，只是查快照。
+  bool poseAtStampColor(const ColorSnapshot& snap, double stamp, Eigen::Matrix4d& T_wl,
+                        bool clamp_future = false) const;
+  bool camPoseAtStampColor(const ColorSnapshot& snap, double stamp,
+                           Eigen::Matrix4d& T_wl) const;
 
   // ---- 辅助 ----
   cv::Mat rectifyBgr(const cv::Mat& bgr) const;
@@ -254,7 +278,9 @@ class VisualPipeline {
                                         const Eigen::VectorXd& dx) const;
   bool degeneracySignature(double& severity, Eigen::Vector3d& dir_w) const;
   void decayPoseOffset(double dt, double severity, const Eigen::Vector3d& dir_w);
-  void accumulateColoredMap(const std::vector<colorizer::ColoredPoint>& points, double stamp);
+  /// 累积彩色地图（着色线程；位姿取快照的镜像 pose 缓存）。
+  void accumulateColoredMap(const std::vector<colorizer::ColoredPoint>& points, double stamp,
+                            const ColorSnapshot& snap);
   void saveColoredMap();
   void savePose(const Eigen::Matrix4d& T_wl, double stamp);
   void saveImage(const cv::Mat& bgr, double stamp);
@@ -275,9 +301,7 @@ class VisualPipeline {
       kOdom,
       kCamOdom,
       kCloud,
-      kBodyCloud,
       kDegeneracy,
-      kSaveSnapshot,
       kBarrier,
       kQuit
     };
@@ -287,25 +311,51 @@ class VisualPipeline {
     double stamp{0.0};
     Eigen::Matrix4d T{Eigen::Matrix4d::Identity()};
     std::vector<Eigen::Vector3d> points_world;
-    std::vector<Eigen::Vector3f> points_body;
     superlivo_common::DegeneracySignature degen;
+    std::shared_ptr<std::promise<void>> barrier;
+    std::chrono::steady_clock::time_point enqueued{};
+  };
+
+  /// 着色线程事件：点云直接进 color_queue_，落盘快照/barrier 也走这条队列，
+  /// 保证「快照切段」发生在其之前的所有点云着色完成之后。
+  struct ColorEvent {
+    enum class Kind : std::uint8_t { kBodyCloud, kSaveSnapshot, kBarrier, kQuit };
+    Kind kind{Kind::kQuit};
+    std::vector<Eigen::Vector3f> points_body;
+    double stamp{0.0};
     std::shared_ptr<std::promise<void>> barrier;
     std::chrono::steady_clock::time_point enqueued{};
   };
 
   void startWorkerThreads();
   void stopWorkerThreads(bool keep_save_thread = false);
+  /// 停止着色线程并等它排空 color_queue_（幂等）。
+  void stopColorThread();
   /// 停止落盘线程并等它写完队列里剩下的段（幂等）。
   void stopSaveThread();
   bool pushInputEvent(InputEvent event);
+  bool pushColorEvent(ColorEvent event);
   void workerLoop();
+  void colorLoop();
   void saveLoop();
+  /// 对镜像缓存取一致性快照（着色线程每轮开头调用）。
+  ColorSnapshot takeColorSnapshot() const;
+  // ---- 工作线程 → 着色线程镜像推送（短临界区 + 唤醒） ----
+  void pushColorImage(const cv::Mat& rectified, double stamp);
+  void pushColorPose(const colorizer::PoseSample& sample);
+  void pushColorCamPose(const colorizer::PoseSample& sample);
+  void pushColorOwnPose(const colorizer::PoseSample& sample);
+  /// 回灌模式下 processVisualFrame 会改写 own_pose_cache_ 尾采样，同步镜像。
+  void updateColorOwnPoseBack(const Eigen::Matrix4d& T_wl, double stamp);
   /// 每 60 s 打印一次延时窗口（timing_en 开启且有记录时），工作线程调用
   void maybePrintLatencyWindow();
 
   struct ColorSegment {
     pcl::PointCloud<pcl::PointXYZRGB> points;
     std::shared_ptr<colorizer::VoxelColorMedian> median;
+    /// 分片模式下颜色已在移交时刻用实时 median_map_ 回填完毕（与"拷贝快照后
+    /// 回填"同一时点、同一 colorAt，结果逐点一致），落盘线程不再二次回填。
+    bool color_resolved{false};
   };
 
   void requestColoredMapSave();
@@ -318,10 +368,26 @@ class VisualPipeline {
   std::atomic<std::size_t> stat_input_dropped_{0};
   std::thread worker_;
 
-  // 延时计时：img_enqueue_wall_ / last_timing_report_ 仅工作线程读写；
+  // ---- 着色线程：独立事件队列 + 镜像缓存 ----
+  std::deque<ColorEvent> color_queue_;
+  std::mutex color_mutex_;
+  std::condition_variable color_cv_;
+  bool color_stop_{false};
+  /// worker 推入新图像/位姿后置真并 notify，唤醒着色线程重试待配对帧。
+  std::atomic<bool> color_wake_{false};
+  std::thread color_thread_;
+  /// 保护 color_*_cache_（worker 写、着色线程读快照）。
+  mutable std::mutex color_cache_mutex_;
+  std::vector<colorizer::TimedImage> color_image_cache_;
+  std::vector<colorizer::PoseSample> color_pose_cache_;
+  std::vector<colorizer::PoseSample> color_cam_pose_cache_;
+  std::vector<colorizer::PoseSample> color_own_pose_cache_;
+
+  // 延时计时：img_enqueue_wall_ 由 worker 写、着色线程读（原子交接）；
+  // last_timing_report_ 仅工作线程读写；
   // latency_timer_ 内部加锁（退出总报告可能来自 shutdown 线程）。
   superlivo_common::LatencyTimer latency_timer_;
-  std::chrono::steady_clock::time_point img_enqueue_wall_{};
+  std::atomic<std::chrono::steady_clock::time_point> img_enqueue_wall_{};
   std::chrono::steady_clock::time_point last_timing_report_{};
 
   std::size_t save_handed_points_{0};
@@ -376,15 +442,11 @@ class VisualPipeline {
   mutable cv::Mat rectify_map1_;
   mutable cv::Mat rectify_map2_;
 
-  // ---- 数据缓存 ----
-  std::vector<colorizer::TimedImage> image_cache_;
+  // ---- 数据缓存（仅工作线程访问；彩色所需副本经 color_*_cache_ 镜像交接） ----
   std::vector<colorizer::PoseSample> pose_cache_;
   std::vector<colorizer::PoseSample> cam_pose_cache_;
   std::vector<Eigen::Vector3d> local_map_;
   std::vector<Eigen::Vector3d> sweep_;
-  std::vector<Eigen::Vector3f> body_points_;
-  double body_stamp_{0.0};
-  bool world_cloud_valid_{false};
 
   // ---- 视觉修正状态 ----
   Eigen::Matrix4d pose_offset_{Eigen::Matrix4d::Identity()};
@@ -401,7 +463,7 @@ class VisualPipeline {
   bool degen_stale_warned_{false};
   bool degen_seen_{false};
 
-  // ---- 彩色地图 ----
+  // ---- 彩色地图（着色线程独占；shutdown join 后由收尾线程补完尾段） ----
   pcl::PointCloud<pcl::PointXYZRGB> colored_map_;
   colorizer::VoxelColorMedian median_map_;
   bool pcd_capacity_warned_{false};
@@ -416,20 +478,20 @@ class VisualPipeline {
   std::size_t pose_frame_count_{0};
   std::size_t img_frame_count_{0};
 
-  // ---- 统计 ----
-  std::size_t stat_colorizer_calls_{0};
-  std::size_t stat_colored_frames_{0};
-  std::size_t stat_drop_no_image_{0};
-  std::size_t stat_drop_pose_{0};
-  std::size_t stat_deferred_{0};
-  std::size_t stat_skip_duplicate_{0};
-  std::size_t stat_drop_accum_{0};
+  // ---- 统计（worker / 着色线程 / statsString 读取线程三方触碰，全部原子化） ----
+  std::atomic<std::size_t> stat_colorizer_calls_{0};
+  std::atomic<std::size_t> stat_colored_frames_{0};
+  std::atomic<std::size_t> stat_drop_no_image_{0};
+  std::atomic<std::size_t> stat_drop_pose_{0};
+  std::atomic<std::size_t> stat_deferred_{0};
+  std::atomic<std::size_t> stat_skip_duplicate_{0};
+  std::atomic<std::size_t> stat_drop_accum_{0};
   /// 视觉抽帧跳过的图像数（visual_decimate > 1 时）。
-  std::size_t stat_visual_skipped_{0};
-  /// 延时保护丢弃的输入事件数（排队超过 max_queue_latency）。
-  std::size_t stat_drop_stale_{0};
+  std::atomic<std::size_t> stat_visual_skipped_{0};
+  /// 延时保护丢弃的输入事件数（排队超过 max_queue_latency；worker 与着色线程共用）。
+  std::atomic<std::size_t> stat_drop_stale_{0};
   /// 已入队的图像计数（抽帧用）。
-  std::size_t img_seen_{0};
+  std::atomic<std::size_t> img_seen_{0};
 };
 
 }  // namespace superlivo_a
