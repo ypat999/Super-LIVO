@@ -74,7 +74,7 @@
 
 | 位置 | 内容 |
 | --- | --- |
-| `include/lio/super_lio.h` | `virtual void onLioOutput(const OutputData&)`（`OutputThread` 末尾，10 Hz，含 odom/body/world 云）<br>`virtual void onDenseCloud(const CloudPtr&, double stamp)`（`DenseThread` 发布前）<br>`DegeneracySnapshot{ok, cond, axes, active, dir_w, has_info, info}` + `degeneracySnapshot() const` |
+| `include/lio/super_lio.h` | `virtual void onLioOutput(const OutputData&)`（`OutputThread` 末尾，10 Hz，含 odom/body/world 云）<br>`virtual void onDenseCloud(const CloudPtr&, double stamp, double receive_time)`（`DenseThread` 发布前；`receive_time` 为该帧到达宿主 ROS 回调的墙钟，用于在线标定图像-雷达时钟偏移）<br>`DegeneracySnapshot{ok, cond, axes, active, dir_w, has_info, info}` + `degeneracySnapshot() const` |
 | `src/lio/super_lio.cpp` | 两处钩子调用；`Observe()` 把 `last_HTVH`（6×6 位姿观测 Hessian，布局 `[rot(0-2), pos(3-5)]`）与退化状态机结果写入快照（mutex 保护） |
 
 未实现 `onImuOdom`：B 的传播直订原始 IMU、先验用 10 Hz odom，不需要 200 Hz `NavState`。

@@ -64,7 +64,9 @@ VisualPipeline::VisualPipeline(const VisualPipelineOptions& options) : opt_(opti
   intrinsics_ = opt_.intrinsics;
   distortion_ = opt_.distortion;
   T_lc_ = makeTlcFromRclPcl(opt_.Rcl, opt_.Pcl);
-  img_time_offset_ = opt_.img_time_offset;
+  img_time_offset_.store(opt_.img_time_offset);
+  visual_decimate_ = std::max(1, opt_.visual_decimate);
+  max_queue_latency_ = opt_.max_queue_latency;
 
   // ---- 前端 ----
   frontend_ = std::make_unique<KltFrontend>(opt_.klt);
@@ -98,6 +100,9 @@ VisualPipeline::VisualPipeline(const VisualPipelineOptions& options) : opt_(opti
 
   median_map_.set_voxel_size(opt_.median_voxel_size);
   save_interval_frames_ = opt_.pcd_save_interval_frames;
+  shard_interval_sec_ = opt_.pcd_shard_interval_sec;
+  shard_mode_ = save_interval_frames_ > 0 || shard_interval_sec_ > 0.0;
+  last_shard_time_ = std::chrono::steady_clock::now();
 
   // ---- 轨迹 / 图像落盘（目录解析与文件打开，参照 FAST-LIVO2 evo/image_save） ----
   if (opt_.pose_output_en) {
@@ -154,6 +159,10 @@ void VisualPipeline::setOdomCallback(OdomCallback cb) {
   std::lock_guard<std::mutex> lk(cb_mutex_);
   odom_cb_ = std::move(cb);
 }
+
+void VisualPipeline::setImageTimeOffset(double offset) { img_time_offset_.store(offset); }
+
+double VisualPipeline::imageTimeOffset() const { return img_time_offset_.load(); }
 
 void VisualPipeline::setLogCallback(LogCallback cb) {
   std::lock_guard<std::mutex> lk(cb_mutex_);
@@ -238,11 +247,12 @@ std::string VisualPipeline::statsString() const {
   std::snprintf(buf, sizeof(buf),
                 "调用=%zu 实际着色帧=%zu 丢弃(无图像)=%zu 丢弃(等位姿超时)=%zu "
                 "丢弃(累积无位姿)=%zu 跳过(重复帧)=%zu 延后等待次数=%zu 未完成=%zu "
-                "地图点数=%zu 输入丢弃=%zu",
+                "地图点数=%zu 输入丢弃=%zu 跳过(视觉抽帧)=%zu 丢弃(排队超时)=%zu",
                 stat_colorizer_calls_, stat_colored_frames_, stat_drop_no_image_,
                 stat_drop_pose_, stat_drop_accum_, stat_skip_duplicate_, stat_deferred_,
                 pending_color_.size(), colored_map_.size(),
-                stat_input_dropped_.load(std::memory_order_relaxed));
+                stat_input_dropped_.load(std::memory_order_relaxed), stat_visual_skipped_,
+                stat_drop_stale_);
   return std::string(buf);
 }
 
@@ -318,6 +328,27 @@ void VisualPipeline::workerLoop() {
       ev = std::move(input_queue_.front());
       input_queue_.pop_front();
     }
+
+    // 延时保护：单线程 worker 一旦跟不上（图像 4 MB × 10 Hz + 单帧上百毫秒），
+    // 队列会越积越长，最终所有配对都因时间差过大而失败（实测端到端 30 s 级）。
+    // 这里只对"重算法触发类"事件做过期丢弃：超时的图像/点云已经没有实时价值，
+    // 丢掉它们可以立刻把队列拉回实时，而不是让延迟无限增长。
+    if (max_queue_latency_ > 0.0 &&
+        (ev.kind == InputEvent::Kind::kImage || ev.kind == InputEvent::Kind::kBodyCloud)) {
+      const double age =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - ev.enqueued).count();
+      if (age > max_queue_latency_) {
+        ++stat_drop_stale_;
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+                      "延时保护: 丢弃排队 %.2fs 的%s事件（阈值 %.2fs，累计 %zu 次）", age,
+                      ev.kind == InputEvent::Kind::kImage ? "图像" : "点云",
+                      max_queue_latency_, stat_drop_stale_);
+        logThrottled("stale_event", 2000, LogLevel::kWarn, buf);
+        continue;
+      }
+    }
+
     // 全部算法状态只在这条线程上访问，因此 handleXxx 内部无需任何锁。
     switch (ev.kind) {
       case InputEvent::Kind::kImage:
@@ -430,7 +461,7 @@ void VisualPipeline::writeColoredSnapshot(std::deque<ColorSegment> segments) {
 
   // ---- 分片模式（参照 Super-LIO scans_*.pcd）：一段写一个文件，纯增量 ----
   // 每片只含本时间窗新增点，落盘线程异步写；分片按时间有序，可直接做时序滤波。
-  if (save_interval_frames_ > 0) {
+  if (shard_mode_) {
     const auto c8 = [](double v) {
       return static_cast<std::uint8_t>(std::clamp(v, 0.0, 255.0));
     };
@@ -524,7 +555,7 @@ void VisualPipeline::shutdownAndSave() {
     drainPendingColorization();
     // 分片模式：把最后不足一个间隔的尾段也交给落盘线程写一片，
     // 保证「分片并集 == 合并图」，时序滤波不会漏掉结尾。
-    if (save_interval_frames_ > 0) {
+    if (shard_mode_) {
       requestColoredMapSave();
     }
     stopSaveThread();
@@ -553,9 +584,7 @@ void VisualPipeline::handleImage(const cv::Mat& bgr, double stamp) {
   }
   // 文件名用 LIO 时间域（header + img_time_offset），与轨迹 T_wl 的时间戳同域，
   // 便于后续按时间与 scene_move.txt / GT 关联。
-  saveImage(rectified, stamp + img_time_offset_);
-  cv::Mat gray;
-  cv::cvtColor(rectified, gray, cv::COLOR_BGR2GRAY);
+  saveImage(rectified, stamp + img_time_offset_.load());
 
   // 图像 header 时刻：与 dense 点云 header 处于同一时钟基准（实测差 < 7 ms），
   // 因此**只**用它做"图像-点云配对"。图像真实采集时刻（header + img_time_offset_）
@@ -571,6 +600,18 @@ void VisualPipeline::handleImage(const cv::Mat& bgr, double stamp) {
                        image_cache_.begin() +
                            (image_cache_.size() - opt_.max_image_cache));
   }
+
+  // 视觉抽帧：图像全部保留在缓存里（彩色点云每帧都要用），但前端/深度/更新
+  // 只按 visual_decimate 抽帧执行。实测开灯后单帧视觉计算 ~120 ms，10 Hz 输入
+  // 根本吃不下；降到 5 Hz 既能保住定位修正，又不会把队列拖成秒级积压。
+  ++img_seen_;
+  if (visual_decimate_ > 1 && (img_seen_ % static_cast<std::size_t>(visual_decimate_)) != 0) {
+    ++stat_visual_skipped_;
+    return;
+  }
+
+  cv::Mat gray;
+  cv::cvtColor(rectified, gray, cv::COLOR_BGR2GRAY);
 
   // 新图像到达后可以尝试补齐"等图像"的帧（与原节点一致：配对/着色统一在
   // runColorizer 内部完成，这里不再额外 drain，避免改变 S0/S1 的时序口径）。
@@ -711,7 +752,7 @@ void VisualPipeline::processVisualFrame(const cv::Mat& gray, double stamp) {
   //    两者相差可达 0.05~0.15 s；按 0.5 m/s 平移 + 中等角速度折算就是几厘米的
   //    系统性锚点偏移，在 z≈5 m 处对应 2~3 px，正好是重投影 RMSE 长期卡在
   //    2.8 px、门控（阈值 3.0）整帧全拒的主要原因。
-  const double t_capture = stamp + img_time_offset_;
+  const double t_capture = stamp + img_time_offset_.load();
   Eigen::Matrix4d T_wl_img = Eigen::Matrix4d::Identity();
   if (opt_.reinject) {
     // 回灌模式：基准位姿直接取修正轨迹在曝光时刻的插值，不叠加 pose_offset_。
@@ -988,7 +1029,7 @@ void VisualPipeline::drainPendingClouds() {
       if (!image.valid || image.image.empty()) {
         continue;
       }
-      const double dt = std::abs(image.arrival_stamp + img_time_offset_ - it->t_cloud);
+      const double dt = std::abs(image.arrival_stamp + img_time_offset_.load() - it->t_cloud);
       if (dt < best_dt) {
         best_dt = dt;
         chosen = &image;
@@ -999,7 +1040,7 @@ void VisualPipeline::drainPendingClouds() {
       frame.points_lidar = it->points_lidar;
       frame.t_cloud = it->t_cloud;
       frame.t_pair = chosen->arrival_stamp;
-      frame.t_img = frame.t_pair + img_time_offset_;
+      frame.t_img = frame.t_pair + img_time_offset_.load();
       frame.image = chosen->image;
       frame.queued_at = now;
       pending_color_.push_back(std::move(frame));
@@ -1076,8 +1117,10 @@ bool VisualPipeline::colorizeFrame(const PendingColorFrame& frame) {
   std::vector<double> point_stamps(frame.points_lidar.size(), t_cloud);
 
   const colorizer::ColorizerPipeline pipeline(options);
+  const auto t_proj0 = std::chrono::steady_clock::now();
   const std::vector<colorizer::ColoredPoint> colored =
       pipeline.process(frame.points_lidar, point_stamps, images_for_frame, pose_cache_);
+  const auto t_proj1 = std::chrono::steady_clock::now();
   if (colored.empty()) {
     char buf[160];
     std::snprintf(buf, sizeof(buf), "彩色点云为空（t_cloud=%.4f t_img=%.4f）", t_cloud,
@@ -1098,7 +1141,7 @@ bool VisualPipeline::colorizeFrame(const PendingColorFrame& frame) {
     std::snprintf(buf, sizeof(buf),
                   "彩色: t_cloud=%.4f t_pair=%.4f t_img=%.4f(offset=%+.3f) "
                   "dt_pair_cloud=%+.4f dt_img_cloud=%+.4f %zu/%zu 点上色 帧#%zu 待处理=%zu",
-                  t_cloud, frame.t_pair, t_img, img_time_offset_, frame.t_pair - t_cloud,
+                  t_cloud, frame.t_pair, t_img, img_time_offset_.load(), frame.t_pair - t_cloud,
                   t_img - t_cloud, colored_count, colored.size(), stat_colored_frames_,
                   pending_color_.size());
     logThrottled("color_frame", 1000, LogLevel::kInfo, buf);
@@ -1106,7 +1149,20 @@ bool VisualPipeline::colorizeFrame(const PendingColorFrame& frame) {
 
   // 累积到世界系彩色地图（定时器/析构时统一写 PCD）。
   accumulateColoredMap(colored, t_cloud);
+  const auto t_acc1 = std::chrono::steady_clock::now();
   publishColoredCloud(colored, t_cloud);
+  const auto t_pub1 = std::chrono::steady_clock::now();
+  if (opt_.timing_en) {
+    const auto ms = [](std::chrono::steady_clock::time_point a,
+                       std::chrono::steady_clock::time_point b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), "[彩色耗时] 投影=%.1f 累积=%.1f 发布=%.1f ms (点数=%zu 缓存位姿=%zu)",
+                  ms(t_proj0, t_proj1), ms(t_proj1, t_acc1), ms(t_acc1, t_pub1),
+                  frame.points_lidar.size(), pose_cache_.size());
+    logThrottled("color_cost", 1000, LogLevel::kInfo, buf);
+  }
   return true;
 }
 
@@ -1281,12 +1337,25 @@ void VisualPipeline::accumulateColoredMap(
     ++added;
   }
 
-  // 分片落盘：每 N 个真正上过色的帧把一个增量段交给落盘线程（参照 Super-LIO
-  // lio.map.save_interval）。段内只含本时间窗新增点，写盘不阻塞工作线程。
-  if (save_interval_frames_ > 0 && added > 0 &&
-      ++frames_since_shard_ >= save_interval_frames_) {
-    frames_since_shard_ = 0;
-    requestColoredMapSave();
+  // 分片落盘：每 N 个真正上过色的帧（或每 N 秒）把一个增量段交给落盘线程
+  // （参照 Super-LIO lio.map.save_interval）。段内只含本时间窗新增点，写盘不阻塞工作线程。
+  if (shard_mode_ && added > 0) {
+    bool due = false;
+    if (save_interval_frames_ > 0 && ++frames_since_shard_ >= save_interval_frames_) {
+      frames_since_shard_ = 0;
+      due = true;
+    }
+    if (shard_interval_sec_ > 0.0) {
+      const auto now = std::chrono::steady_clock::now();
+      if (std::chrono::duration<double>(now - last_shard_time_).count() >=
+          shard_interval_sec_) {
+        last_shard_time_ = now;
+        due = true;
+      }
+    }
+    if (due) {
+      requestColoredMapSave();
+    }
   }
 }
 

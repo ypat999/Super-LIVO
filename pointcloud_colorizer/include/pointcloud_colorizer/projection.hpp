@@ -48,11 +48,21 @@ class Projector {
   /// 相机系 -> 像素，含正深度与视野检查。
   ProjectionResult project(const Eigen::Vector3d& point_camera) const;
 
+  /// 视锥粗筛：只做归一化坐标比较、不做除法，比 project() 便宜。
+  /// 用途：LiDAR 360° 视场里通常只有约 1/5 的点落在相机画面内，先筛出这些点，
+  /// 再对它们做像素投影与遮挡写入，画面外的点不参与任何逐像素运算。
+  bool insideFrustum(const Eigen::Vector3d& point_camera) const;
+
   const CameraIntrinsics& intrinsics() const;
 
  private:
   CameraIntrinsics intrinsics_;
   Options options_;
+  /// x/z、y/z 的允许区间（由内参与边界余量预计算，逐点比较时不需要除法）。
+  double x_min_{0.0};
+  double x_max_{0.0};
+  double y_min_{0.0};
+  double y_max_{0.0};
 };
 
 }  // namespace colorizer

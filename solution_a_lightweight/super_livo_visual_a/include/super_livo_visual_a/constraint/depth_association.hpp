@@ -68,6 +68,15 @@ class LidarDepthAssociation {
   std::vector<Eigen::Vector3d> local_map_;
   std::vector<Eigen::Vector3d> sweep_;
 
+  /// 画面范围的归一化坐标边界（x/z、y/z），构造时按内参预计算。
+  /// 局部地图动辄数万点，其中大多数在相机视场外：投影前先用乘法比较粗筛掉，
+  /// 只有可能落入画面的点才做除法、才进像素栅格。
+  bool frustum_ready_{false};
+  double x_min_{0.0};
+  double x_max_{0.0};
+  double y_min_{0.0};
+  double y_max_{0.0};
+
   /// 最近锚点缓存：feature_id -> (锚点, 帧号)。
   struct CachedAnchor {
     Eigen::Vector3d xyz_world{Eigen::Vector3d::Zero()};

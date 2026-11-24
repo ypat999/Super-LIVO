@@ -313,7 +313,10 @@ class VisualBSuperLIO : public LI2Sup::SuperLIO {
   }
 
   /// DenseThread 产出全量机体系点云后调用：等价于原 lio/cloud_body_dense。
-  void onDenseCloud(const BASIC::CloudPtr& cloud, double stamp) override {
+  /// receive_time（宿主接收墙钟）此处未用，视觉 B 的时钟偏移仍由参数给定。
+  void onDenseCloud(const BASIC::CloudPtr& cloud, double stamp,
+                    double receive_time) override {
+    (void)receive_time;
     auto* pipeline = pipeline_.load(std::memory_order_acquire);
     if (pipeline == nullptr || !cloud) {
       return;

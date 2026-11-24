@@ -93,6 +93,15 @@ struct VisualPipelineOptions {
   /// 状态回灌：视觉 dx 写回 own_pose_cache_ 尾部采样，替代持久偏移模式。
   bool reinject{true};
 
+  // ---- 实时性控制 ----
+  /// 视觉支路抽帧系数：1=每帧图像都跑前端/深度/更新，2=隔一帧（10 Hz -> 5 Hz）。
+  /// 只影响视觉定位支路；图像仍全部进入缓存供彩色点云使用。
+  int visual_decimate{1};
+  /// 输入事件排队时延上限（秒）：超过就丢弃该事件并计数，避免单线程 worker
+  /// 在计算跟不上时把队列越积越长（实测会出现端到端 30 s 级的排队延迟）。
+  /// <=0 表示关闭该保护。
+  double max_queue_latency{0.5};
+
   // ---- 缓存规模 ----
   std::size_t max_image_cache{30};
   std::size_t max_pose_samples{300};
@@ -108,6 +117,9 @@ struct VisualPipelineOptions {
   /// 参照 Super-LIO 的 lio.map.save_interval：每片只含自上一片以来的新增点，
   /// 由落盘线程写出、不阻塞工作线程；分片天然按时间有序，便于离线做时序滤波。
   std::size_t pcd_save_interval_frames{0};
+  /// 按时间分片落盘（秒）：与 pcd_save_interval_frames 二选一/可叠加，任一满足
+  /// 即切一片。参照 Super-LIO 的 lio.map.save_interval（秒级增量落盘）。
+  double pcd_shard_interval_sec{0.0};
 
   // ---- 轨迹 / 图像落盘（参照 FAST-LIVO2 的 evo / image_save 开关） ----
   /// 轨迹输出开关：TUM 格式（timestamp tx ty tz qx qy qz qw），
@@ -157,6 +169,12 @@ class VisualPipeline {
   void setColoredCloudCallback(ColoredCloudCallback cb);
   void setOdomCallback(OdomCallback cb);
   void setLogCallback(LogCallback cb);
+
+  /// 运行时更新图像-雷达时钟偏移（t_lidar = t_img + offset），线程安全。
+  /// 雷达/相机各自使用独立时钟，偏移会随运行漂移（实测约 1.3 ms/s），
+  /// 因此启动后应用实测值覆盖参数初值，避免长跑后配对失败。
+  void setImageTimeOffset(double offset);
+  double imageTimeOffset() const;
 
   // ---- 输入（线程安全，入队后立即返回；BGR 图像内部完成去畸变+灰度） ----
   /// keepalive：允许调用方传入浅拷贝 Mat（如直接引用 ROS 消息内存）时保活
@@ -317,6 +335,9 @@ class VisualPipeline {
   std::shared_ptr<colorizer::VoxelColorMedian> save_median_;
   /// 分片落盘（pcd_save_interval_frames > 0）：每片一个 colored_%05zu.pcd。
   std::size_t save_interval_frames_{0};
+  double shard_interval_sec_{0.0};
+  bool shard_mode_{false};  ///< 帧数或秒数任一开启即进入分片模式
+  std::chrono::steady_clock::time_point last_shard_time_{};
   std::size_t shard_index_{0};
   std::size_t frames_since_shard_{0};
   /// shutdownAndSave() 只执行一次；并发调用者（shutdown 钩子 / 主线程 /
@@ -335,6 +356,9 @@ class VisualPipeline {
 
   // ---- 配置与算法模块（构造后不变） ----
   VisualPipelineOptions opt_;
+  /// 视觉抽帧系数（>=1）与输入排队时延上限（秒，<=0 关闭）。
+  int visual_decimate_{1};
+  double max_queue_latency_{0.5};
   std::unique_ptr<KltFrontend> frontend_;
   std::unique_ptr<LidarDepthAssociation> depth_assoc_;
   std::unique_ptr<ReprojectionConstraint> reproj_;
@@ -347,7 +371,7 @@ class VisualPipeline {
   std::vector<double> distortion_;
   Eigen::Matrix4d T_lc_{Eigen::Matrix4d::Identity()};
   Eigen::Matrix4d T_wl_{Eigen::Matrix4d::Identity()};
-  double img_time_offset_{0.0};
+  std::atomic<double> img_time_offset_{0.0};
   mutable bool rectify_maps_ready_{false};
   mutable cv::Mat rectify_map1_;
   mutable cv::Mat rectify_map2_;
@@ -400,6 +424,12 @@ class VisualPipeline {
   std::size_t stat_deferred_{0};
   std::size_t stat_skip_duplicate_{0};
   std::size_t stat_drop_accum_{0};
+  /// 视觉抽帧跳过的图像数（visual_decimate > 1 时）。
+  std::size_t stat_visual_skipped_{0};
+  /// 延时保护丢弃的输入事件数（排队超过 max_queue_latency）。
+  std::size_t stat_drop_stale_{0};
+  /// 已入队的图像计数（抽帧用）。
+  std::size_t img_seen_{0};
 };
 
 }  // namespace superlivo_a

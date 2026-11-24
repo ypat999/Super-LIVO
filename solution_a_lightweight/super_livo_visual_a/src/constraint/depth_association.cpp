@@ -25,7 +25,16 @@ double medianOf(std::vector<double> values) {
 }
 }  // namespace
 
-LidarDepthAssociation::LidarDepthAssociation(const Options& options) : options_(options) {}
+LidarDepthAssociation::LidarDepthAssociation(const Options& options) : options_(options) {
+  if (options_.fx > 1e-9 && options_.fy > 1e-9 && options_.image_width > 0 &&
+      options_.image_height > 0) {
+    x_min_ = (0.0 - options_.cx) / options_.fx;
+    x_max_ = (static_cast<double>(options_.image_width) - options_.cx) / options_.fx;
+    y_min_ = (0.0 - options_.cy) / options_.fy;
+    y_max_ = (static_cast<double>(options_.image_height) - options_.cy) / options_.fy;
+    frustum_ready_ = true;
+  }
+}
 
 void LidarDepthAssociation::setLocalMap(std::vector<Eigen::Vector3d> points_world) {
   local_map_ = std::move(points_world);
@@ -63,16 +72,27 @@ std::vector<FeatureDepth> LidarDepthAssociation::associate(const std::vector<Fea
     out.reserve(cloud.size());
     for (const auto& p_w : cloud) {
       const Eigen::Vector3d p_c = R_cw * p_w + t_cw;
-      if (p_c.z() < options_.min_depth || p_c.z() > options_.max_depth) {
+      const double z = p_c.z();
+      if (z < options_.min_depth || z > options_.max_depth) {
         continue;
       }
-      const double u = options_.fx * p_c.x() / p_c.z() + options_.cx;
-      const double v = options_.fy * p_c.y() / p_c.z() + options_.cy;
+      // 视野粗筛（无除法）：x/z、y/z 超出画面范围的点直接丢弃。
+      // 局部地图 6 万点里通常只有约 1/5 落在画面上，先筛掉可省掉大部分除法
+      // 与像素栅格插入（栅格是本函数最重的分配/哈希开销）。
+      if (frustum_ready_) {
+        const double x = p_c.x();
+        const double y = p_c.y();
+        if (x < z * x_min_ || x > z * x_max_ || y < z * y_min_ || y > z * y_max_) {
+          continue;
+        }
+      }
+      const double u = options_.fx * p_c.x() / z + options_.cx;
+      const double v = options_.fy * p_c.y() / z + options_.cy;
       if (options_.image_width > 0 && options_.image_height > 0 &&
           (u < 0.0 || v < 0.0 || u >= options_.image_width || v >= options_.image_height)) {
         continue;
       }
-      out.push_back(Projected{u, v, p_c.z(), p_w});
+      out.push_back(Projected{u, v, z, p_w});
     }
   };
 
