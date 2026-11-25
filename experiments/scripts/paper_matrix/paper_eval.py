@@ -11,11 +11,8 @@
   metrics.csv / REPORT.md / figs/*.png
 
 口径：
-  - 两个结果根，按 ROOTS 顺序取第一个有 done 的：
-    1) paper_20261119：B 臂按当前代码重跑（odom 切 10 Hz `/lio/odom` + `odom_robo⁻¹`
-       换回 IMU 系、注入门控 0.4 s）。
-    2) paper_sync：`lio.extrinsic.odom_robo` 回单位阵后的那轮重跑，FL2/SL/A 取这里
-       （B 只是回退兜底，若用到会在报告 §0 里点名）。
+  - 唯一结果根 paper_sync：`paper_20261119` 已并入（B 臂取该轮当前代码的结果，
+    FL2/SL/A 为 `lio.extrinsic.odom_robo` 回单位阵后的重跑）。
   - move 用 move_ros2（图像 header 为主机时钟，A/B 以 -p img_time_offset 覆盖），
     原 move_livoxclk 副本已不在磁盘。
   - rtk 绝对精度走官方 RTK-SLAM 评测协议（tools/rtk_traj_prep.py + eval_ref）。
@@ -37,8 +34,7 @@ import numpy as np
 REPO = Path('/home/ywj/git/Super-LIVO')
 RTK = Path('/home/ywj/slam_data/rtk_slam')
 NTU = Path('/home/ywj/slam_data/ntu_viral')
-ROOTS = [Path('/home/ywj/slam_data/paper_20261119'),
-         Path('/home/ywj/slam_data/paper_sync')]
+ROOTS = [Path('/home/ywj/slam_data/paper_sync')]
 SEQS = ['move', 'retail', 'room', 'ntu03', 'ntu01', 'rtk']
 ARMS = ['fl2', 'sl', 'a', 'b']
 TOPIC = {'fl2': '/aft_mapped_to_init', 'sl': '/lio/odom',
@@ -330,9 +326,6 @@ def make_report(table, outdir):
     def _g(s, a, k):
         return (table.get((s, a)) or {}).get(k)
 
-    _stale_b = ['%s/B←%s' % (s, _g(s, 'b', 'root')) for s in SEQS
-                if _g(s, 'b', 'root') not in (None, 'paper_20261119')]
-
     L = ['# 四臂论文级对比（move / retail / room / ntu03 / ntu01 / rtk）', '']
     L += ['> 生成脚本 `experiments/scripts/paper_matrix/paper_eval.py`；'
           '原始表 `metrics.csv`，图在 `figs/`。', '']
@@ -342,11 +335,12 @@ def make_report(table, outdir):
           '**A** = Super-LIO 主干 + 轻量视觉；**B** = Super-LIO 主干 + 紧耦合视觉。',
           '- 统一 1× 实时播放、同一 FastDDS / ROS_DOMAIN_ID、同一外部探针；'
           '延时为「odom 到达 − 对应雷达帧到达」的 algo 项。',
-          '- 结果根：**B 取 `paper_20261119`**（本轮当前代码：`/lio/odom` 为 10 Hz、'
+          '- 结果根：**统一为 `paper_sync`**（`paper_20261119` 已并入）。其中 **B** 为'
+          '该轮当前代码的结果（`/lio/odom` 为 10 Hz、'
           '经 `odom_robo⁻¹` 换回 IMU 机体系、`poseFromSamples` 插值取相机位姿；'
           '本条跑批用 `visual_b_node`，注入门控 `app.visual_inject_max_dt` 只在 '
           '`visual_b_app` 单进程路径生效），'
-          '**FL2/SL/A 取 `paper_sync`**（`lio.extrinsic.odom_robo` 回单位阵后的重跑）。',
+          '**FL2/SL/A** 为 `lio.extrinsic.odom_robo` 回单位阵后的重跑。',
           '- ⚠ **2026-11-19 起 b 臂已改为单体 `visual_b_app`，且 `app.visual_inject` 默认开'
           '（视觉约束真的写回 ESKF）** ⇒ 本表 B 行仍是双进程（无注入）口径，两者不可混比；'
           '矩阵 B 行需用单体形态重跑后才能与其余三臂并列'
@@ -358,9 +352,6 @@ def make_report(table, outdir):
           '雷达/IMU 数据完全相同，对 LIO/轨迹无影响。',
           '- rtk 用 RTK-SLAM 官方绝对评测（起点+前 30 s 定向，不做全轨迹对齐），'
           '同时给出 SE3 对齐 ATE 与 Gap；ntu 用 ATE（最近邻）与旋转区间 RPE。', '']
-    if _stale_b:
-        L += ['> ⚠ B 行未全部来自 `paper_20261119`，以下为回退到旧根的条目：'
-              + '、'.join(_stale_b) + '。', '']
 
 
     def _rng(vals, nd=2):
