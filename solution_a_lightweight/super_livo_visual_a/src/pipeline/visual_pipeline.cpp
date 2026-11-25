@@ -64,7 +64,9 @@ VisualPipeline::VisualPipeline(const VisualPipelineOptions& options) : opt_(opti
   intrinsics_ = opt_.intrinsics;
   distortion_ = opt_.distortion;
   T_lc_ = makeTlcFromRclPcl(opt_.Rcl, opt_.Pcl);
-  img_time_offset_ = opt_.img_time_offset;
+  img_time_offset_.store(opt_.img_time_offset);
+  visual_decimate_ = std::max(1, opt_.visual_decimate);
+  max_queue_latency_ = opt_.max_queue_latency;
 
   // ---- 前端 ----
   frontend_ = std::make_unique<KltFrontend>(opt_.klt);
@@ -91,13 +93,16 @@ VisualPipeline::VisualPipeline(const VisualPipelineOptions& options) : opt_(opti
   gate_ = std::make_unique<DegeneracyGate>(opt_.gate);
   visual_update_ = std::make_unique<VisualUpdate>(opt_.update);
 
-  // ---- 彩色流水线（每帧在 runColorizer 里按当前相机位姿重建） ----
+  // ---- 彩色流水线（着色线程每帧按当前相机位姿重建，只读配置，线程安全） ----
   colorizer_options_ = opt_.colorizer;
   colorizer_options_.intrinsics = intrinsics_;
   colorizer_options_.T_cl = Eigen::Matrix4d::Identity();
 
   median_map_.set_voxel_size(opt_.median_voxel_size);
   save_interval_frames_ = opt_.pcd_save_interval_frames;
+  shard_interval_sec_ = opt_.pcd_shard_interval_sec;
+  shard_mode_ = save_interval_frames_ > 0 || shard_interval_sec_ > 0.0;
+  last_shard_time_ = std::chrono::steady_clock::now();
 
   // ---- 轨迹 / 图像落盘（目录解析与文件打开，参照 FAST-LIVO2 evo/image_save） ----
   if (opt_.pose_output_en) {
@@ -155,6 +160,10 @@ void VisualPipeline::setOdomCallback(OdomCallback cb) {
   odom_cb_ = std::move(cb);
 }
 
+void VisualPipeline::setImageTimeOffset(double offset) { img_time_offset_.store(offset); }
+
+double VisualPipeline::imageTimeOffset() const { return img_time_offset_.load(); }
+
 void VisualPipeline::setLogCallback(LogCallback cb) {
   std::lock_guard<std::mutex> lk(cb_mutex_);
   log_cb_ = std::move(cb);
@@ -198,11 +207,12 @@ void VisualPipeline::submitWorldCloud(const std::vector<Eigen::Vector3d>& points
 
 void VisualPipeline::submitBodyCloud(const std::vector<Eigen::Vector3f>& points_lidar,
                                      double stamp) {
-  InputEvent ev;
-  ev.kind = InputEvent::Kind::kBodyCloud;
+  // 着色链路已拆到独立线程：点云直接进 color_queue_，不再挤 worker 输入队列。
+  ColorEvent ev;
+  ev.kind = ColorEvent::Kind::kBodyCloud;
   ev.points_body = points_lidar;
   ev.stamp = stamp;
-  pushInputEvent(std::move(ev));
+  pushColorEvent(std::move(ev));
 }
 
 void VisualPipeline::submitDegeneracy(const superlivo_common::DegeneracySignature& sig) {
@@ -213,23 +223,34 @@ void VisualPipeline::submitDegeneracy(const superlivo_common::DegeneracySignatur
 }
 
 void VisualPipeline::requestSaveColoredMap() {
-  InputEvent ev;
-  ev.kind = InputEvent::Kind::kSaveSnapshot;
-  pushInputEvent(std::move(ev));
+  // colored_map_ 归着色线程独占，快照切段必须排在其前的点云之后执行。
+  ColorEvent ev;
+  ev.kind = ColorEvent::Kind::kSaveSnapshot;
+  pushColorEvent(std::move(ev));
 }
 
 void VisualPipeline::flush() {
+  // 先等 worker 排空（VIO 产出的图像/位姿要喂进着色镜像缓存），再等着色线程排空。
   auto promise = std::make_shared<std::promise<void>>();
   auto future = promise->get_future();
   InputEvent ev;
   ev.kind = InputEvent::Kind::kBarrier;
   ev.barrier = promise;
   // 停机后 pushInputEvent 会拒收：此时不再等待（否则会白等 30 s）。
-  if (!pushInputEvent(std::move(ev))) {
-    return;
+  if (pushInputEvent(std::move(ev))) {
+    if (future.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+      log(LogLevel::kWarn, "flush 超时：工作线程可能已停止");
+    }
   }
-  if (future.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
-    log(LogLevel::kWarn, "flush 超时：工作线程可能已停止");
+  auto cpromise = std::make_shared<std::promise<void>>();
+  auto cfuture = cpromise->get_future();
+  ColorEvent cev;
+  cev.kind = ColorEvent::Kind::kBarrier;
+  cev.barrier = cpromise;
+  if (pushColorEvent(std::move(cev))) {
+    if (cfuture.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+      log(LogLevel::kWarn, "flush 超时：着色线程可能已停止");
+    }
   }
 }
 
@@ -238,20 +259,29 @@ std::string VisualPipeline::statsString() const {
   std::snprintf(buf, sizeof(buf),
                 "调用=%zu 实际着色帧=%zu 丢弃(无图像)=%zu 丢弃(等位姿超时)=%zu "
                 "丢弃(累积无位姿)=%zu 跳过(重复帧)=%zu 延后等待次数=%zu 未完成=%zu "
-                "地图点数=%zu 输入丢弃=%zu",
-                stat_colorizer_calls_, stat_colored_frames_, stat_drop_no_image_,
-                stat_drop_pose_, stat_drop_accum_, stat_skip_duplicate_, stat_deferred_,
+                "地图点数=%zu 输入丢弃=%zu 跳过(视觉抽帧)=%zu 丢弃(排队超时)=%zu",
+                stat_colorizer_calls_.load(std::memory_order_relaxed),
+                stat_colored_frames_.load(std::memory_order_relaxed),
+                stat_drop_no_image_.load(std::memory_order_relaxed),
+                stat_drop_pose_.load(std::memory_order_relaxed),
+                stat_drop_accum_.load(std::memory_order_relaxed),
+                stat_skip_duplicate_.load(std::memory_order_relaxed),
+                stat_deferred_.load(std::memory_order_relaxed),
                 pending_color_.size(), colored_map_.size(),
-                stat_input_dropped_.load(std::memory_order_relaxed));
+                stat_input_dropped_.load(std::memory_order_relaxed),
+                stat_visual_skipped_.load(std::memory_order_relaxed),
+                stat_drop_stale_.load(std::memory_order_relaxed));
   return std::string(buf);
 }
 
 // ============================================================================
-// 线程化设施（worker 消费 InputEvent 队列；save 线程只做彩色地图增量写盘）
+// 线程化设施（worker 消费 InputEvent 队列；color 线程消费点云队列做着色；
+// save 线程只做彩色地图增量写盘）
 // ============================================================================
 
 void VisualPipeline::startWorkerThreads() {
   save_thread_ = std::thread(&VisualPipeline::saveLoop, this);
+  color_thread_ = std::thread(&VisualPipeline::colorLoop, this);
   worker_ = std::thread(&VisualPipeline::workerLoop, this);
 }
 
@@ -267,8 +297,24 @@ void VisualPipeline::stopWorkerThreads(bool keep_save_thread) {
   if (worker_.joinable()) {
     worker_.join();  // 先排空输入队列，剩余事件照常处理完（不丢尾段）
   }
+  // worker 排空后才停着色线程：worker 收尾期间喂入的图像/位姿要能让着色线程用上。
+  stopColorThread();
   if (!keep_save_thread) {
     stopSaveThread();
+  }
+}
+
+void VisualPipeline::stopColorThread() {
+  {
+    std::lock_guard<std::mutex> lock(color_mutex_);
+    if (color_stop_) {
+      return;
+    }
+    color_stop_ = true;
+  }
+  color_cv_.notify_one();
+  if (color_thread_.joinable()) {
+    color_thread_.join();  // 排空 color_queue_，尾段点云照常着色（不丢尾段）
   }
 }
 
@@ -303,6 +349,110 @@ bool VisualPipeline::pushInputEvent(InputEvent event) {
   return true;
 }
 
+bool VisualPipeline::pushColorEvent(ColorEvent event) {
+  event.enqueued = std::chrono::steady_clock::now();
+  {
+    std::lock_guard<std::mutex> lock(color_mutex_);
+    if (color_stop_) {
+      return false;  // 停机后不再接收，避免向已退出的着色线程投递
+    }
+    // 上限兜底：一帧 dense 云 2 万点 ×12B ≈ 240 KB，队列不设限会吃光内存。
+    constexpr std::size_t kMaxColorEvents = 512;
+    while (color_queue_.size() >= kMaxColorEvents) {
+      color_queue_.pop_front();
+      stat_input_dropped_.fetch_add(1, std::memory_order_relaxed);
+    }
+    color_queue_.push_back(std::move(event));
+  }
+  color_cv_.notify_one();
+  return true;
+}
+
+// ---- 工作线程 → 着色线程镜像缓存推送（短临界区，绝不包住重计算） ----
+
+void VisualPipeline::pushColorImage(const cv::Mat& rectified, double stamp) {
+  {
+    std::lock_guard<std::mutex> lock(color_cache_mutex_);
+    colorizer::TimedImage timed;
+    timed.image = rectified;  // 引用计数浅拷贝
+    timed.exposure_mid_stamp = stamp;
+    timed.arrival_stamp = stamp;
+    timed.valid = true;
+    color_image_cache_.push_back(std::move(timed));
+    if (color_image_cache_.size() > opt_.max_image_cache) {
+      color_image_cache_.erase(
+          color_image_cache_.begin(),
+          color_image_cache_.begin() +
+              (color_image_cache_.size() - opt_.max_image_cache));
+    }
+  }
+  color_wake_.store(true);
+  color_cv_.notify_one();
+}
+
+void VisualPipeline::pushColorPose(const colorizer::PoseSample& sample) {
+  {
+    std::lock_guard<std::mutex> lock(color_cache_mutex_);
+    color_pose_cache_.push_back(sample);
+    if (color_pose_cache_.size() > opt_.max_pose_samples) {
+      color_pose_cache_.erase(
+          color_pose_cache_.begin(),
+          color_pose_cache_.begin() +
+              (color_pose_cache_.size() - opt_.max_pose_samples));
+    }
+  }
+  color_wake_.store(true);
+  color_cv_.notify_one();
+}
+
+void VisualPipeline::pushColorCamPose(const colorizer::PoseSample& sample) {
+  {
+    std::lock_guard<std::mutex> lock(color_cache_mutex_);
+    color_cam_pose_cache_.push_back(sample);
+    if (color_cam_pose_cache_.size() > opt_.max_pose_samples) {
+      color_cam_pose_cache_.erase(
+          color_cam_pose_cache_.begin(),
+          color_cam_pose_cache_.begin() +
+              (color_cam_pose_cache_.size() - opt_.max_pose_samples));
+    }
+  }
+  color_wake_.store(true);
+  color_cv_.notify_one();
+}
+
+void VisualPipeline::pushColorOwnPose(const colorizer::PoseSample& sample) {
+  {
+    std::lock_guard<std::mutex> lock(color_cache_mutex_);
+    color_own_pose_cache_.push_back(sample);
+    if (color_own_pose_cache_.size() > opt_.max_pose_samples) {
+      color_own_pose_cache_.erase(
+          color_own_pose_cache_.begin(),
+          color_own_pose_cache_.begin() +
+              (color_own_pose_cache_.size() - opt_.max_pose_samples));
+    }
+  }
+  color_wake_.store(true);
+  color_cv_.notify_one();
+}
+
+void VisualPipeline::updateColorOwnPoseBack(const Eigen::Matrix4d& T_wl, double stamp) {
+  std::lock_guard<std::mutex> lock(color_cache_mutex_);
+  if (!color_own_pose_cache_.empty() &&
+      std::abs(color_own_pose_cache_.back().stamp - stamp) <= 0.15) {
+    color_own_pose_cache_.back().T_wl = T_wl;
+  }
+}
+
+VisualPipeline::ColorSnapshot VisualPipeline::takeColorSnapshot() const {
+  ColorSnapshot snap;
+  std::lock_guard<std::mutex> lock(color_cache_mutex_);
+  snap.images = color_image_cache_;
+  snap.poses = color_pose_cache_;
+  snap.cam_poses = color_cam_pose_cache_;
+  snap.own_poses = color_own_pose_cache_;
+  return snap;
+}
+
 void VisualPipeline::workerLoop() {
   for (;;) {
     InputEvent ev;
@@ -318,10 +468,29 @@ void VisualPipeline::workerLoop() {
       ev = std::move(input_queue_.front());
       input_queue_.pop_front();
     }
-    // 全部算法状态只在这条线程上访问，因此 handleXxx 内部无需任何锁。
+
+    // 延时保护：worker 一旦跟不上，队列会越积越长，最终所有配对都因时间差过大
+    // 而失败（实测端到端 30 s 级）。超时的图像已经没有实时价值，丢掉可以立刻把
+    // 队列拉回实时，而不是让延迟无限增长。（点云事件已拆到着色队列，各自保护。）
+    if (max_queue_latency_ > 0.0 && ev.kind == InputEvent::Kind::kImage) {
+      const double age =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - ev.enqueued).count();
+      if (age > max_queue_latency_) {
+        const std::size_t n = stat_drop_stale_.fetch_add(1, std::memory_order_relaxed) + 1;
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+                      "延时保护: 丢弃排队 %.2fs 的图像事件（阈值 %.2fs，累计 %zu 次）", age,
+                      max_queue_latency_, n);
+        logThrottled("stale_event", 2000, LogLevel::kWarn, buf);
+        continue;
+      }
+    }
+
+    // VIO 算法状态只在这条线程上访问，因此 handleXxx 内部无需任何锁；
+    // 与着色线程的交接只经由 pushColorXxx（短临界区）。
     switch (ev.kind) {
       case InputEvent::Kind::kImage:
-        img_enqueue_wall_ = ev.enqueued;  // 延时计时锚点：图像入队墙钟时刻
+        img_enqueue_wall_.store(ev.enqueued);  // 延时计时锚点：图像入队墙钟时刻
         handleImage(ev.image, ev.stamp);
         break;
       case InputEvent::Kind::kOdom:
@@ -333,14 +502,8 @@ void VisualPipeline::workerLoop() {
       case InputEvent::Kind::kCloud:
         handleWorldCloud(ev.points_world);
         break;
-      case InputEvent::Kind::kBodyCloud:
-        handleBodyCloud(ev.points_body, ev.stamp);
-        break;
       case InputEvent::Kind::kDegeneracy:
         handleDegeneracy(ev.degen);
-        break;
-      case InputEvent::Kind::kSaveSnapshot:
-        requestColoredMapSave();
         break;
       case InputEvent::Kind::kBarrier:
         if (ev.barrier) {
@@ -351,6 +514,70 @@ void VisualPipeline::workerLoop() {
         return;
     }
     maybePrintLatencyWindow();
+  }
+}
+
+void VisualPipeline::colorLoop() {
+  for (;;) {
+    ColorEvent ev;
+    bool have_event = false;
+    {
+      std::unique_lock<std::mutex> lock(color_mutex_);
+      // 50 ms 兜底唤醒：待配对/待位姿的帧即使没有新事件也能按时重试与超时清理。
+      color_cv_.wait_for(lock, std::chrono::milliseconds(50), [this] {
+        return color_stop_ || !color_queue_.empty() || color_wake_.load();
+      });
+      color_wake_.store(false);
+      if (!color_queue_.empty()) {
+        ev = std::move(color_queue_.front());
+        color_queue_.pop_front();
+        have_event = true;
+      } else if (color_stop_) {
+        break;  // 停机时先排空队列再退出（不丢尾段）
+      }
+    }
+
+    // 延时保护（与 worker 同口径）：排队超时的点云没有实时价值，丢弃并计数。
+    if (have_event && ev.kind == ColorEvent::Kind::kBodyCloud && max_queue_latency_ > 0.0) {
+      const double age =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - ev.enqueued).count();
+      if (age > max_queue_latency_) {
+        const std::size_t n = stat_drop_stale_.fetch_add(1, std::memory_order_relaxed) + 1;
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+                      "延时保护: 丢弃排队 %.2fs 的点云事件（阈值 %.2fs，累计 %zu 次）", age,
+                      max_queue_latency_, n);
+        logThrottled("stale_event", 2000, LogLevel::kWarn, buf);
+        have_event = false;
+      }
+    }
+
+    const bool has_pending = !pending_clouds_.empty() || !pending_color_.empty();
+    if (!have_event && !has_pending) {
+      continue;  // 空转（兜底唤醒）：无需取快照
+    }
+
+    // 彩色状态只在这条线程上访问：先对镜像缓存取快照，随后整轮无锁使用。
+    const ColorSnapshot snap = takeColorSnapshot();
+    if (have_event) {
+      switch (ev.kind) {
+        case ColorEvent::Kind::kBodyCloud:
+          handleBodyCloudColor(ev.points_body, ev.stamp);
+          break;
+        case ColorEvent::Kind::kSaveSnapshot:
+          requestColoredMapSave();
+          break;
+        case ColorEvent::Kind::kBarrier:
+          if (ev.barrier) {
+            ev.barrier->set_value();
+          }
+          break;
+        case ColorEvent::Kind::kQuit:
+          return;
+      }
+    }
+    drainPendingClouds(snap);
+    drainPendingColorization(snap);
   }
 }
 
@@ -405,7 +632,27 @@ void VisualPipeline::requestColoredMapSave() {
   seg.points.height = 1;
   seg.points.is_dense = false;
   if (median_map_.enabled()) {
-    seg.median = std::make_shared<colorizer::VoxelColorMedian>(median_map_);
+    if (shard_mode_) {
+      // 分片模式：移交时刻直接用实时 median_map_ 回填本段颜色。原实现每移交一次
+      // 就整图拷贝一份 VoxelColorMedian 快照（实测 150 s 运行 median 达百万体素、
+      // 单次拷贝 ~1.3 s，把着色线程吞吐压到 ~6 Hz），而分片落盘只需要本段点的
+      // 中位色——同一时点对同一批点做 colorAt，两种做法逐点等价。
+      const auto c8 = [](double v) {
+        return static_cast<std::uint8_t>(std::clamp(v, 0.0, 255.0));
+      };
+      for (auto& p : seg.points) {
+        Eigen::Vector3d rgb;
+        if (median_map_.colorAt(Eigen::Vector3f(p.x, p.y, p.z), rgb)) {
+          p.r = c8(rgb.x());
+          p.g = c8(rgb.y());
+          p.b = c8(rgb.z());
+        }
+      }
+      seg.color_resolved = true;
+    } else {
+      // 合并模式保持原行为：落盘线程按移交快照回填整个常驻缓冲（含更早段的新中位色）。
+      seg.median = std::make_shared<colorizer::VoxelColorMedian>(median_map_);
+    }
   }
   save_handed_points_ = n;
   {
@@ -430,7 +677,7 @@ void VisualPipeline::writeColoredSnapshot(std::deque<ColorSegment> segments) {
 
   // ---- 分片模式（参照 Super-LIO scans_*.pcd）：一段写一个文件，纯增量 ----
   // 每片只含本时间窗新增点，落盘线程异步写；分片按时间有序，可直接做时序滤波。
-  if (save_interval_frames_ > 0) {
+  if (shard_mode_) {
     const auto c8 = [](double v) {
       return static_cast<std::uint8_t>(std::clamp(v, 0.0, 255.0));
     };
@@ -442,7 +689,8 @@ void VisualPipeline::writeColoredSnapshot(std::deque<ColorSegment> segments) {
         save_median_ = seg.median;
       }
       pcl::PointCloud<pcl::PointXYZRGB> cloud = std::move(seg.points);
-      if (save_median_ && save_median_->enabled()) {
+      // color_resolved 的分片已在移交时刻回填过中位色，不再二次覆盖。
+      if (!seg.color_resolved && save_median_ && save_median_->enabled()) {
         for (auto& p : cloud.points) {
           Eigen::Vector3d rgb;
           if (save_median_->colorAt(Eigen::Vector3f(p.x, p.y, p.z), rgb)) {
@@ -516,15 +764,18 @@ void VisualPipeline::shutdownAndSave() {
   // executor.spin() 返回后也会调一次，两者可能并发；后到者阻塞到那次执行
   // 结束，从而保证进程退出前文件已经落盘。
   std::call_once(shutdown_once_, [this]() {
-    // 先停 worker（保留落盘线程）：worker 排空输入队列后退出。
+    // 先停 worker（保留落盘线程）：worker 排空输入队列后退出，随后着色线程排空
+    // color_queue_ 退出（stopWorkerThreads 内部保证先 worker 后 color 的顺序）。
     stopWorkerThreads(/*keep_save_thread=*/true);
-    // 收尾：bag 结束时队列里可能还有等图像/等位姿的帧，尽量补完再落盘
+    // 收尾：bag 结束时可能还有等图像/等位姿的帧，尽量补完再落盘
     // （配不到图/位的按超时丢弃并计数，与运行期口径一致）。
-    drainPendingClouds();
-    drainPendingColorization();
+    // 此时 worker/color 均已 join，彩色状态只有本线程访问。
+    const ColorSnapshot snap = takeColorSnapshot();
+    drainPendingClouds(snap);
+    drainPendingColorization(snap);
     // 分片模式：把最后不足一个间隔的尾段也交给落盘线程写一片，
     // 保证「分片并集 == 合并图」，时序滤波不会漏掉结尾。
-    if (save_interval_frames_ > 0) {
+    if (shard_mode_) {
       requestColoredMapSave();
     }
     stopSaveThread();
@@ -553,27 +804,27 @@ void VisualPipeline::handleImage(const cv::Mat& bgr, double stamp) {
   }
   // 文件名用 LIO 时间域（header + img_time_offset），与轨迹 T_wl 的时间戳同域，
   // 便于后续按时间与 scene_move.txt / GT 关联。
-  saveImage(rectified, stamp + img_time_offset_);
-  cv::Mat gray;
-  cv::cvtColor(rectified, gray, cv::COLOR_BGR2GRAY);
+  saveImage(rectified, stamp + img_time_offset_.load());
 
   // 图像 header 时刻：与 dense 点云 header 处于同一时钟基准（实测差 < 7 ms），
   // 因此**只**用它做"图像-点云配对"。图像真实采集时刻（header + img_time_offset_）
-  // 由 runColorizer 单独计算，仅用于取相机位姿，绝不能把两者混成一个时间戳。
-  colorizer::TimedImage timed;
-  timed.image = rectified;
-  timed.exposure_mid_stamp = stamp;
-  timed.arrival_stamp = stamp;
-  timed.valid = true;
-  image_cache_.push_back(timed);
-  if (image_cache_.size() > opt_.max_image_cache) {
-    image_cache_.erase(image_cache_.begin(),
-                       image_cache_.begin() +
-                           (image_cache_.size() - opt_.max_image_cache));
+  // 由着色链路单独计算，仅用于取相机位姿，绝不能把两者混成一个时间戳。
+  // 去畸变图像（引用计数浅拷贝）镜像进着色线程缓存，由其与点云配对着色。
+  pushColorImage(rectified, stamp);
+
+  // 视觉抽帧：图像全部镜像给着色线程（彩色点云每帧都要用），但前端/深度/更新
+  // 只按 visual_decimate 抽帧执行。实测开灯后单帧视觉计算 ~120 ms，10 Hz 输入
+  // 根本吃不下；降到 5 Hz 既能保住定位修正，又不会把队列拖成秒级积压。
+  const std::size_t seen = img_seen_.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (visual_decimate_ > 1 &&
+      (seen % static_cast<std::size_t>(visual_decimate_)) != 0) {
+    stat_visual_skipped_.fetch_add(1, std::memory_order_relaxed);
+    return;
   }
 
-  // 新图像到达后可以尝试补齐"等图像"的帧（与原节点一致：配对/着色统一在
-  // runColorizer 内部完成，这里不再额外 drain，避免改变 S0/S1 的时序口径）。
+  cv::Mat gray;
+  cv::cvtColor(rectified, gray, cv::COLOR_BGR2GRAY);
+
   processVisualFrame(gray, stamp);
 }
 
@@ -582,7 +833,7 @@ void VisualPipeline::handleOdom(const Eigen::Matrix4d& T_wl, double stamp) {
   last_odom_stamp_ = stamp;
   savePose(T_wl, stamp);
 
-  // 累积位姿采样供彩色点云运动补偿。
+  // 累积位姿采样供彩色点云运动补偿（worker 私有 + 镜像给着色线程）。
   colorizer::PoseSample sample;
   sample.stamp = stamp;
   sample.T_wl = T_wl;
@@ -591,6 +842,7 @@ void VisualPipeline::handleOdom(const Eigen::Matrix4d& T_wl, double stamp) {
     pose_cache_.erase(pose_cache_.begin(),
                       pose_cache_.begin() + (pose_cache_.size() - opt_.max_pose_samples));
   }
+  pushColorPose(sample);
 
   // 状态回灌：把本条 LIO 的增量挂接到修正轨迹尾部。
   // dw = T_lio(k) · T_lio(k-1)⁻¹（世界系左乘增量），own(k) = dw · own(k-1)。
@@ -612,15 +864,11 @@ void VisualPipeline::handleOdom(const Eigen::Matrix4d& T_wl, double stamp) {
                             own_pose_cache_.begin() +
                                 (own_pose_cache_.size() - opt_.max_pose_samples));
     }
+    pushColorOwnPose(own);
   }
   // 注意：这里只更新位姿缓存，发布统一放在 processVisualFrame（图像帧），
   // 避免 path 里出现重复位姿、也保证发布的是视觉修正后的结果。
-
-  // 新采样到齐后重试待着色帧：图像采集时刻 t_img = t_cloud + img_time_offset，
-  // 通常要等到这一帧 odom 发布后才能插值出位姿。
-  if (!pending_color_.empty()) {
-    drainPendingColorization();
-  }
+  // 待着色帧的重试由着色线程自行完成（pushColorPose 已唤醒它）。
 }
 
 void VisualPipeline::handleCamOdom(const Eigen::Matrix4d& T_wl, double stamp) {
@@ -633,9 +881,7 @@ void VisualPipeline::handleCamOdom(const Eigen::Matrix4d& T_wl, double stamp) {
                           cam_pose_cache_.begin() +
                               (cam_pose_cache_.size() - opt_.max_pose_samples));
   }
-  if (!pending_color_.empty()) {
-    drainPendingColorization();
-  }
+  pushColorCamPose(sample);
 }
 
 void VisualPipeline::handleWorldCloud(const std::vector<Eigen::Vector3d>& points_world) {
@@ -657,23 +903,50 @@ void VisualPipeline::handleWorldCloud(const std::vector<Eigen::Vector3d>& points
     local_map_.erase(local_map_.begin(),
                      local_map_.begin() + (local_map_.size() - opt_.max_map_points));
   }
-  world_cloud_valid_ = true;
 }
 
-void VisualPipeline::handleBodyCloud(const std::vector<Eigen::Vector3f>& points_lidar,
-                                     double stamp) {
-  body_points_.clear();
-  body_points_.reserve(points_lidar.size());
+// ---- 着色线程：一帧机体系点云入待配对队列 ----
+
+void VisualPipeline::handleBodyCloudColor(const std::vector<Eigen::Vector3f>& points_lidar,
+                                          double stamp) {
+  stat_colorizer_calls_.fetch_add(1, std::memory_order_relaxed);
+
+  std::vector<Eigen::Vector3f> pts;
+  pts.reserve(points_lidar.size());
   for (const auto& p : points_lidar) {
     if (!std::isfinite(p.x()) || !std::isfinite(p.y()) || !std::isfinite(p.z())) {
       continue;
     }
-    body_points_.push_back(p);
+    pts.push_back(p);
   }
-  body_stamp_ = stamp;
+  if (pts.empty()) {
+    return;
+  }
 
-  // 新扫描到达即入队等图像/位姿（bag2 的图像回调比云慢约 1 帧，不能等图像回调才入队）。
-  runColorizer();
+  // 新扫描到达即入队等图像/位姿（图像回调比云慢约 1 帧，不能等图像回调才入队）。
+  const double t_cloud = stamp;
+  const bool already_queued =
+      std::abs(t_cloud - last_colored_cloud_stamp_) < 1e-6 ||
+      std::any_of(pending_clouds_.begin(), pending_clouds_.end(),
+                  [t_cloud](const PendingCloud& c) {
+                    return std::abs(c.t_cloud - t_cloud) < 1e-6;
+                  }) ||
+      std::any_of(pending_color_.begin(), pending_color_.end(),
+                  [t_cloud](const PendingColorFrame& f) {
+                    return std::abs(f.t_cloud - t_cloud) < 1e-6;
+                  });
+  if (!already_queued) {
+    PendingCloud pc;
+    pc.points_lidar = std::move(pts);
+    pc.t_cloud = t_cloud;
+    pc.queued_at = std::chrono::steady_clock::now();
+    pending_clouds_.push_back(std::move(pc));
+    while (pending_clouds_.size() > kMaxPendingClouds) {
+      pending_clouds_.pop_front();
+      stat_drop_no_image_.fetch_add(1, std::memory_order_relaxed);
+      log(LogLevel::kWarn, "彩色[丢弃] 等图像队列溢出，丢弃最早一帧");
+    }
+  }
 }
 
 void VisualPipeline::handleDegeneracy(const superlivo_common::DegeneracySignature& sig) {
@@ -711,7 +984,7 @@ void VisualPipeline::processVisualFrame(const cv::Mat& gray, double stamp) {
   //    两者相差可达 0.05~0.15 s；按 0.5 m/s 平移 + 中等角速度折算就是几厘米的
   //    系统性锚点偏移，在 z≈5 m 处对应 2~3 px，正好是重投影 RMSE 长期卡在
   //    2.8 px、门控（阈值 3.0）整帧全拒的主要原因。
-  const double t_capture = stamp + img_time_offset_;
+  const double t_capture = stamp + img_time_offset_.load();
   Eigen::Matrix4d T_wl_img = Eigen::Matrix4d::Identity();
   if (opt_.reinject) {
     // 回灌模式：基准位姿直接取修正轨迹在曝光时刻的插值，不叠加 pose_offset_。
@@ -852,6 +1125,7 @@ void VisualPipeline::processVisualFrame(const cv::Mat& gray, double stamp) {
       if (!own_pose_cache_.empty() &&
           std::abs(own_pose_cache_.back().stamp - pose_stamp) <= 0.15) {
         own_pose_cache_.back().T_wl = T_wl_out;
+        updateColorOwnPoseBack(T_wl_out, pose_stamp);
       }
     } else {
       const Eigen::Matrix4d T_lio_inv = T_wl_img.inverse();
@@ -886,12 +1160,10 @@ void VisualPipeline::processVisualFrame(const cv::Mat& gray, double stamp) {
                             own_pose_cache_.begin() +
                                 (own_pose_cache_.size() - opt_.max_pose_samples));
     }
+    pushColorOwnPose(own);
   }
 
-  // 9) 若缓存了机体系点云，触发彩色点云（与视觉定位解耦，独立工作）
-  if (!body_points_.empty() && world_cloud_valid_) {
-    runColorizer();
-  }
+  // 9) 彩色点云已拆到独立着色线程：点云事件自行驱动配对/着色，worker 不再触发。
   const auto t_end = std::chrono::steady_clock::now();
   auto ms = [](const std::chrono::steady_clock::time_point& a,
                const std::chrono::steady_clock::time_point& b) {
@@ -944,51 +1216,17 @@ void VisualPipeline::processVisualFrame(const cv::Mat& gray, double stamp) {
 // 彩色点云
 // ============================================================================
 
-void VisualPipeline::runColorizer() {
-  ++stat_colorizer_calls_;
-  if (body_points_.empty()) {
-    return;
-  }
-
-  const double t_cloud = body_stamp_;
-  const bool already_queued =
-      std::abs(t_cloud - last_colored_cloud_stamp_) < 1e-6 ||
-      std::any_of(pending_clouds_.begin(), pending_clouds_.end(),
-                  [t_cloud](const PendingCloud& c) {
-                    return std::abs(c.t_cloud - t_cloud) < 1e-6;
-                  }) ||
-      std::any_of(pending_color_.begin(), pending_color_.end(),
-                  [t_cloud](const PendingColorFrame& f) {
-                    return std::abs(f.t_cloud - t_cloud) < 1e-6;
-                  });
-  if (!already_queued) {
-    PendingCloud pc;
-    pc.points_lidar = body_points_;
-    pc.t_cloud = t_cloud;
-    pc.queued_at = std::chrono::steady_clock::now();
-    pending_clouds_.push_back(std::move(pc));
-    while (pending_clouds_.size() > kMaxPendingClouds) {
-      pending_clouds_.pop_front();
-      ++stat_drop_no_image_;
-      log(LogLevel::kWarn, "彩色[丢弃] 等图像队列溢出，丢弃最早一帧");
-    }
-  }
-
-  drainPendingClouds();
-  drainPendingColorization();
-}
-
-void VisualPipeline::drainPendingClouds() {
+void VisualPipeline::drainPendingClouds(const ColorSnapshot& snap) {
   const auto now = std::chrono::steady_clock::now();
   for (auto it = pending_clouds_.begin(); it != pending_clouds_.end();) {
     // 官方口径配对：比较 |header + img_time_offset - t_cloud|。
     const colorizer::TimedImage* chosen = nullptr;
     double best_dt = std::numeric_limits<double>::max();
-    for (const auto& image : image_cache_) {
+    for (const auto& image : snap.images) {
       if (!image.valid || image.image.empty()) {
         continue;
       }
-      const double dt = std::abs(image.arrival_stamp + img_time_offset_ - it->t_cloud);
+      const double dt = std::abs(image.arrival_stamp + img_time_offset_.load() - it->t_cloud);
       if (dt < best_dt) {
         best_dt = dt;
         chosen = &image;
@@ -999,13 +1237,13 @@ void VisualPipeline::drainPendingClouds() {
       frame.points_lidar = it->points_lidar;
       frame.t_cloud = it->t_cloud;
       frame.t_pair = chosen->arrival_stamp;
-      frame.t_img = frame.t_pair + img_time_offset_;
+      frame.t_img = frame.t_pair + img_time_offset_.load();
       frame.image = chosen->image;
       frame.queued_at = now;
       pending_color_.push_back(std::move(frame));
       while (pending_color_.size() > kMaxPendingColorFrames) {
         pending_color_.pop_front();
-        ++stat_drop_pose_;
+        stat_drop_pose_.fetch_add(1, std::memory_order_relaxed);
         log(LogLevel::kWarn, "彩色[丢弃] 待处理队列溢出，丢弃最早一帧");
       }
       it = pending_clouds_.erase(it);
@@ -1014,7 +1252,7 @@ void VisualPipeline::drainPendingClouds() {
     // 图像还没到：等下一帧图像/云/里程计再试；等太久（例如相机断流）才真丢弃。
     const double waited = std::chrono::duration<double>(now - it->queued_at).count();
     if (waited > kPendingCloudTimeoutSec) {
-      ++stat_drop_no_image_;
+      stat_drop_no_image_.fetch_add(1, std::memory_order_relaxed);
       char buf[256];
       std::snprintf(buf, sizeof(buf),
                     "彩色[丢弃] 等待图像超时: t_cloud=%.4f 最近差=%.4f 阈值=%.4f 已等 %.2fs",
@@ -1027,17 +1265,18 @@ void VisualPipeline::drainPendingClouds() {
   }
 }
 
-void VisualPipeline::drainPendingColorization() {
+void VisualPipeline::drainPendingColorization(const ColorSnapshot& snap) {
   const auto now = std::chrono::steady_clock::now();
   for (auto it = pending_color_.begin(); it != pending_color_.end();) {
-    if (colorizeFrame(*it)) {
+    if (colorizeFrame(*it, snap)) {
       it = pending_color_.erase(it);
       continue;
     }
-    // 位姿仍未到齐：等一会儿再来（由 odom 触发）。超过上限说明确实等不到。
+    // 位姿仍未到齐：等一会儿再来（新位姿镜像到后由唤醒/兜底超时重试）。
+    // 超过上限说明确实等不到。
     const double waited = std::chrono::duration<double>(now - it->queued_at).count();
     if (waited > kPendingColorTimeoutSec) {
-      ++stat_drop_pose_;
+      stat_drop_pose_.fetch_add(1, std::memory_order_relaxed);
       char buf[256];
       std::snprintf(buf, sizeof(buf),
                     "彩色[丢弃] 等待位姿超时: t_cloud=%.4f t_img=%.4f 已等 %.2fs",
@@ -1046,19 +1285,20 @@ void VisualPipeline::drainPendingColorization() {
       it = pending_color_.erase(it);
       continue;
     }
-    ++stat_deferred_;
+    stat_deferred_.fetch_add(1, std::memory_order_relaxed);
     ++it;
   }
 }
 
-bool VisualPipeline::colorizeFrame(const PendingColorFrame& frame) {
+bool VisualPipeline::colorizeFrame(const PendingColorFrame& frame, const ColorSnapshot& snap) {
   const double t_cloud = frame.t_cloud;
   const double t_img = frame.t_img;
 
   // 两个时刻的位姿都必须由缓存插值得到，任一失败就稍后重试。
   Eigen::Matrix4d T_wl_cloud = Eigen::Matrix4d::Identity();
   Eigen::Matrix4d T_wl_img = Eigen::Matrix4d::Identity();
-  if (!poseAtStamp(t_cloud, T_wl_cloud) || !camPoseAtStamp(t_img, T_wl_img)) {
+  if (!poseAtStampColor(snap, t_cloud, T_wl_cloud) ||
+      !camPoseAtStampColor(snap, t_img, T_wl_img)) {
     return false;
   }
 
@@ -1076,8 +1316,10 @@ bool VisualPipeline::colorizeFrame(const PendingColorFrame& frame) {
   std::vector<double> point_stamps(frame.points_lidar.size(), t_cloud);
 
   const colorizer::ColorizerPipeline pipeline(options);
+  const auto t_proj0 = std::chrono::steady_clock::now();
   const std::vector<colorizer::ColoredPoint> colored =
-      pipeline.process(frame.points_lidar, point_stamps, images_for_frame, pose_cache_);
+      pipeline.process(frame.points_lidar, point_stamps, images_for_frame, snap.poses);
+  const auto t_proj1 = std::chrono::steady_clock::now();
   if (colored.empty()) {
     char buf[160];
     std::snprintf(buf, sizeof(buf), "彩色点云为空（t_cloud=%.4f t_img=%.4f）", t_cloud,
@@ -1091,22 +1333,36 @@ bool VisualPipeline::colorizeFrame(const PendingColorFrame& frame) {
       ++colored_count;
     }
   }
-  ++stat_colored_frames_;
+  const std::size_t frame_no =
+      stat_colored_frames_.fetch_add(1, std::memory_order_relaxed) + 1;
   last_colored_cloud_stamp_ = t_cloud;
   {
     char buf[320];
     std::snprintf(buf, sizeof(buf),
                   "彩色: t_cloud=%.4f t_pair=%.4f t_img=%.4f(offset=%+.3f) "
                   "dt_pair_cloud=%+.4f dt_img_cloud=%+.4f %zu/%zu 点上色 帧#%zu 待处理=%zu",
-                  t_cloud, frame.t_pair, t_img, img_time_offset_, frame.t_pair - t_cloud,
-                  t_img - t_cloud, colored_count, colored.size(), stat_colored_frames_,
+                  t_cloud, frame.t_pair, t_img, img_time_offset_.load(), frame.t_pair - t_cloud,
+                  t_img - t_cloud, colored_count, colored.size(), frame_no,
                   pending_color_.size());
     logThrottled("color_frame", 1000, LogLevel::kInfo, buf);
   }
 
   // 累积到世界系彩色地图（定时器/析构时统一写 PCD）。
-  accumulateColoredMap(colored, t_cloud);
+  accumulateColoredMap(colored, t_cloud, snap);
+  const auto t_acc1 = std::chrono::steady_clock::now();
   publishColoredCloud(colored, t_cloud);
+  const auto t_pub1 = std::chrono::steady_clock::now();
+  if (opt_.timing_en) {
+    const auto ms = [](std::chrono::steady_clock::time_point a,
+                       std::chrono::steady_clock::time_point b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), "[彩色耗时] 投影=%.1f 累积=%.1f 发布=%.1f ms (点数=%zu 缓存位姿=%zu)",
+                  ms(t_proj0, t_proj1), ms(t_proj1, t_acc1), ms(t_acc1, t_pub1),
+                  frame.points_lidar.size(), snap.poses.size());
+    logThrottled("color_cost", 1000, LogLevel::kInfo, buf);
+  }
   return true;
 }
 
@@ -1114,10 +1370,9 @@ bool VisualPipeline::colorizeFrame(const PendingColorFrame& frame) {
 // 位姿查询
 // ============================================================================
 
-bool VisualPipeline::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl,
-                                 bool clamp_future) const {
-  const std::vector<colorizer::PoseSample>& cache =
-      opt_.color_use_own_odom ? own_pose_cache_ : pose_cache_;
+bool VisualPipeline::poseAtFromCache(const std::vector<colorizer::PoseSample>& cache,
+                                     double stamp, Eigen::Matrix4d& T_wl,
+                                     bool clamp_future) const {
   if (cache.empty()) {
     return false;
   }
@@ -1144,6 +1399,12 @@ bool VisualPipeline::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl,
   return interpolator.poseAt(stamp, T_wl);
 }
 
+bool VisualPipeline::poseAtStamp(double stamp, Eigen::Matrix4d& T_wl,
+                                 bool clamp_future) const {
+  return poseAtFromCache(opt_.color_use_own_odom ? own_pose_cache_ : pose_cache_, stamp,
+                         T_wl, clamp_future);
+}
+
 bool VisualPipeline::camPoseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
   if (cam_pose_cache_.empty()) {
     return poseAtStamp(stamp, T_wl);  // 未配置独立相机位姿源：沿用旧行为
@@ -1165,25 +1426,32 @@ bool VisualPipeline::camPoseAtStamp(double stamp, Eigen::Matrix4d& T_wl) const {
 
 bool VisualPipeline::poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl,
                                           bool clamp_future) const {
-  if (own_pose_cache_.empty()) {
-    return false;
+  return poseAtFromCache(own_pose_cache_, stamp, T_wl, clamp_future);
+}
+
+// ---- 着色线程版本：查镜像缓存快照，插值/clamp 语义与 worker 版完全一致 ----
+
+bool VisualPipeline::poseAtStampColor(const ColorSnapshot& snap, double stamp,
+                                      Eigen::Matrix4d& T_wl, bool clamp_future) const {
+  return poseAtFromCache(opt_.color_use_own_odom ? snap.own_poses : snap.poses, stamp,
+                         T_wl, clamp_future);
+}
+
+bool VisualPipeline::camPoseAtStampColor(const ColorSnapshot& snap, double stamp,
+                                         Eigen::Matrix4d& T_wl) const {
+  if (snap.cam_poses.empty()) {
+    return poseAtStampColor(snap, stamp, T_wl);  // 未配置独立相机位姿源：沿用旧行为
   }
-  const colorizer::PoseSample* newest = &own_pose_cache_.front();
-  for (const auto& sample : own_pose_cache_) {
-    if (sample.stamp > newest->stamp) {
-      newest = &sample;
-    }
+  double newest = -std::numeric_limits<double>::max();
+  for (const auto& sample : snap.cam_poses) {
+    newest = std::max(newest, sample.stamp);
   }
-  if (stamp > newest->stamp) {
-    if (!clamp_future) {
-      return false;
-    }
-    T_wl = newest->T_wl;
-    return true;
+  if (stamp > newest) {
+    return false;  // 未来时刻：由调用方延后重试
   }
   colorizer::LidarPoseInterpolator interpolator(
       colorizer::LidarPoseInterpolator::Options{kPoseHistoryMaxGapSec});
-  for (const auto& sample : own_pose_cache_) {
+  for (const auto& sample : snap.cam_poses) {
     interpolator.addSample(sample);
   }
   return interpolator.poseAt(stamp, T_wl);
@@ -1195,11 +1463,12 @@ bool VisualPipeline::poseAtStampCorrected(double stamp, Eigen::Matrix4d& T_wl,
 
 void VisualPipeline::publishColoredCloud(
     const std::vector<colorizer::ColoredPoint>& points, double stamp) {
-  if (opt_.timing_en && img_enqueue_wall_.time_since_epoch().count() != 0) {
+  if (opt_.timing_en &&
+      img_enqueue_wall_.load().time_since_epoch().count() != 0) {
     latency_timer_.Record(
         "[Img->VisCloud]",
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                  img_enqueue_wall_)
+                                                  img_enqueue_wall_.load())
             .count());
   }
   ColoredCloudCallback cb;
@@ -1213,7 +1482,8 @@ void VisualPipeline::publishColoredCloud(
 }
 
 void VisualPipeline::accumulateColoredMap(
-    const std::vector<colorizer::ColoredPoint>& points, double stamp) {
+    const std::vector<colorizer::ColoredPoint>& points, double stamp,
+    const ColorSnapshot& snap) {
   if (points.empty()) {
     return;
   }
@@ -1230,16 +1500,16 @@ void VisualPipeline::accumulateColoredMap(
   // 与彩色流水线保持一致：点已去畸变到扫描帧头，这里只需在 stamp 时刻取一次 T_wl。
   colorizer::LidarPoseInterpolator interp(
       colorizer::LidarPoseInterpolator::Options{kPoseHistoryMaxGapSec});
-  for (const auto& sample : pose_cache_) {
+  for (const auto& sample : snap.poses) {
     interp.addSample(sample);
   }
   Eigen::Matrix4d T_wl = Eigen::Matrix4d::Identity();
   if (!interp.poseAt(stamp, T_wl)) {
     // 禁止回退到最新位姿：那会把点云搬到错误时刻的世界系，产生跨帧错位的"重影"。
-    ++stat_drop_accum_;
+    stat_drop_accum_.fetch_add(1, std::memory_order_relaxed);
     char buf[160];
     std::snprintf(buf, sizeof(buf), "彩色[丢弃] 累积位姿插值失败: stamp=%.4f 缓存=%zu",
-                  stamp, pose_cache_.size());
+                  stamp, snap.poses.size());
     logThrottled("drop_accum", 5000, LogLevel::kWarn, buf);
     return;
   }
@@ -1281,12 +1551,25 @@ void VisualPipeline::accumulateColoredMap(
     ++added;
   }
 
-  // 分片落盘：每 N 个真正上过色的帧把一个增量段交给落盘线程（参照 Super-LIO
-  // lio.map.save_interval）。段内只含本时间窗新增点，写盘不阻塞工作线程。
-  if (save_interval_frames_ > 0 && added > 0 &&
-      ++frames_since_shard_ >= save_interval_frames_) {
-    frames_since_shard_ = 0;
-    requestColoredMapSave();
+  // 分片落盘：每 N 个真正上过色的帧（或每 N 秒）把一个增量段交给落盘线程
+  // （参照 Super-LIO lio.map.save_interval）。段内只含本时间窗新增点，写盘不阻塞工作线程。
+  if (shard_mode_ && added > 0) {
+    bool due = false;
+    if (save_interval_frames_ > 0 && ++frames_since_shard_ >= save_interval_frames_) {
+      frames_since_shard_ = 0;
+      due = true;
+    }
+    if (shard_interval_sec_ > 0.0) {
+      const auto now = std::chrono::steady_clock::now();
+      if (std::chrono::duration<double>(now - last_shard_time_).count() >=
+          shard_interval_sec_) {
+        last_shard_time_ = now;
+        due = true;
+      }
+    }
+    if (due) {
+      requestColoredMapSave();
+    }
   }
 }
 
@@ -1366,11 +1649,11 @@ void VisualPipeline::saveImage(const cv::Mat& bgr, double stamp) {
 }
 
 void VisualPipeline::publishOdomAndPath(const Eigen::Matrix4d& T_wl, double stamp) {
-  if (opt_.timing_en && img_enqueue_wall_.time_since_epoch().count() != 0) {
+  if (opt_.timing_en && img_enqueue_wall_.load().time_since_epoch().count() != 0) {
     latency_timer_.Record(
         "[Img->VisOdom]",
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                  img_enqueue_wall_)
+                                                  img_enqueue_wall_.load())
             .count());
   }
   OdomCallback cb;

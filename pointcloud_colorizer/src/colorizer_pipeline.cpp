@@ -2,15 +2,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace colorizer {
 
 namespace {
-/// 单个点在流水线中间阶段的计算结果。
-struct PointProjection {
-  Eigen::Vector3d point_world{Eigen::Vector3d::Zero()};
-  ProjectionResult projection;
-  bool pose_ok{false};
+/// 一个通过视野粗筛的点（只保留投影所需的三个量，避免逐点保存 4x4/3D 中间量）。
+struct FrustumHit {
+  std::size_t index{0};          ///< 在输入点云中的下标
+  Eigen::Vector2d pixel{0.0, 0.0};
+  double depth{0.0};
 };
 }  // namespace
 
@@ -43,14 +44,33 @@ std::vector<ColoredPoint> ColorizerPipeline::process(
 
   const Projector projector(options_.intrinsics, Projector::Options{});
   OcclusionChecker occlusion(options_.occlusion);
-
-  // ---- 第 2 步：逐点运动补偿 + 投影，并把深度写入 z-buffer -----------------
-  std::vector<PointProjection> projected(points_lidar.size());
   occlusion.beginFrame(options_.intrinsics.width, options_.intrinsics.height);
 
+  // 输出先按"全部点、无色"铺好：落在画面外的点后面不会再被碰，
+  // 只对画面内的点回填颜色（雷达点稀疏，画面外占大多数）。
+  output.resize(points_lidar.size());
   for (std::size_t i = 0; i < points_lidar.size(); ++i) {
-    Eigen::Matrix4d T_wl = Eigen::Matrix4d::Identity();
-    if (!interpolator.poseAt(point_stamps[i], T_wl)) {
+    output[i].xyz = points_lidar[i];
+    output[i].rgb.setZero();
+    output[i].quality = 0.0F;
+  }
+
+  // ---- 第 2 步：视野粗筛 + 运动补偿，只对画面内的点算像素与深度 -----------
+  std::vector<FrustumHit> hits;
+  hits.reserve(points_lidar.size() / 4 + 16);
+
+  // 同一帧点云通常共用同一时刻（单线程调用方传入的就是 point_stamps 全等），
+  // 逐点位姿插值（含 slerp）曾经是这一阶段的主要开销，这里按时间戳缓存复用。
+  double cached_stamp = std::numeric_limits<double>::quiet_NaN();
+  bool cached_ok = false;
+  Eigen::Matrix4d T_wl = Eigen::Matrix4d::Identity();
+
+  for (std::size_t i = 0; i < points_lidar.size(); ++i) {
+    if (point_stamps[i] != cached_stamp) {
+      cached_stamp = point_stamps[i];
+      cached_ok = interpolator.poseAt(cached_stamp, T_wl);
+    }
+    if (!cached_ok) {
       continue;  // 该时刻没有可靠位姿，跳过（quality 保持 0）
     }
 
@@ -61,48 +81,49 @@ std::vector<ColoredPoint> ColorizerPipeline::process(
     // P_C = T_CL * P_W
     const Eigen::Vector3d p_c = projector.toCamera(options_.T_cl, p_w);
 
-    PointProjection item;
-    item.point_world = p_w;
-    item.projection = projector.project(p_c);
-    item.pose_ok = true;
-    projected[i] = item;
-
-    if (item.projection.in_fov) {
-      occlusion.insertDepth(item.projection.pixel, item.projection.depth);
+    // 先用归一化坐标粗筛（无除法）：画面外的点直接跳过，不做除法/栅格写入。
+    if (!projector.insideFrustum(p_c)) {
+      continue;
     }
+    const ProjectionResult projection = projector.project(p_c);
+    if (!projection.in_fov) {
+      continue;
+    }
+    hits.push_back(FrustumHit{i, projection.pixel, projection.depth});
   }
 
-  // ---- 第 3 步：遮挡/边缘判定 + RGB 采样 ----------------------------------
+  // ---- 第 3 步：把画面内点的深度写入 z-buffer ------------------------------
+  for (const FrustumHit& hit : hits) {
+    occlusion.insertDepth(hit.pixel, hit.depth);
+  }
+
+  // ---- 第 4 步：遮挡/边缘判定 + RGB 采样（只遍历画面内的点） --------------
   const RgbAssigner assigner(options_.rgb);
-  output.reserve(points_lidar.size());
+  for (const FrustumHit& hit : hits) {
+    ProjectionResult projection;
+    projection.in_fov = true;
+    projection.pixel = hit.pixel;
+    projection.depth = hit.depth;
 
-  for (std::size_t i = 0; i < points_lidar.size(); ++i) {
-    ColoredPoint point;
-    point.xyz = points_lidar[i];
-
-    const PointProjection& item = projected[i];
-    bool colored = false;
-
-    if (item.pose_ok && item.projection.in_fov &&
-        occlusion.isVisible(item.projection, item.projection.depth) &&
-        !occlusion.isDepthEdge(item.projection)) {
-      // 质量评估：越靠近图像边界、越远越不可靠。
-      const double u = item.projection.pixel.x();
-      const double v = item.projection.pixel.y();
-      const double margin =
-          std::min(std::min(u, options_.intrinsics.width - u),
-                   std::min(v, options_.intrinsics.height - v));
-      const double border_factor = std::min(1.0, std::max(0.0, margin / 20.0));
-      const double depth_factor = std::min(1.0, 1.0 / (1.0 + item.projection.depth / 50.0));
-      const float quality = static_cast<float>(std::max(0.0, border_factor * depth_factor));
-      colored = assigner.assign(image.image, item.projection.pixel, quality, point);
+    if (!occlusion.isVisible(projection, hit.depth) || occlusion.isDepthEdge(projection)) {
+      continue;
     }
 
-    if (!colored) {
-      point.rgb = Eigen::Vector3f::Zero();
+    // 质量评估：越靠近图像边界、越远越不可靠。
+    const double u = hit.pixel.x();
+    const double v = hit.pixel.y();
+    const double margin =
+        std::min(std::min(u, options_.intrinsics.width - u),
+                 std::min(v, options_.intrinsics.height - v));
+    const double border_factor = std::min(1.0, std::max(0.0, margin / 20.0));
+    const double depth_factor = std::min(1.0, 1.0 / (1.0 + hit.depth / 50.0));
+    const float quality = static_cast<float>(std::max(0.0, border_factor * depth_factor));
+
+    ColoredPoint& point = output[hit.index];
+    if (!assigner.assign(image.image, hit.pixel, quality, point)) {
+      point.rgb.setZero();
       point.quality = 0.0F;  // 未能着色：保留几何，颜色标记为无效
     }
-    output.push_back(point);
   }
 
   return output;

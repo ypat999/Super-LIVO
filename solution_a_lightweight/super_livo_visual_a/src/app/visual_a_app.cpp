@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <Eigen/Geometry>
@@ -164,6 +165,12 @@ superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
   opt.offset_decay_rate = getOrDeclare<double>(node, vp("update.offset_decay_rate"), 1.0);
   opt.reinject = getOrDeclare<bool>(node, vp("update.reinject"), true);
 
+  // ---- 实时性控制 ----
+  // 视觉抽帧：1=每帧都算，2=隔帧（10 Hz -> 5 Hz）。图像仍全部用于彩色点云。
+  opt.visual_decimate = getOrDeclare<int>(node, vp("visual.decimate"), 1);
+  // 输入排队时延上限（秒）：超过则丢弃图像/点云事件，防止队列无限积压。
+  opt.max_queue_latency = getOrDeclare<double>(node, vp("visual.max_queue_latency"), 0.5);
+
   // ---- 彩色点云 ----
   opt.color_use_own_odom = getOrDeclare<bool>(node, vp("color.use_own_odom"), false);
   opt.use_exposure_pose = getOrDeclare<bool>(node, vp("visual.use_exposure_pose"), true);
@@ -194,6 +201,10 @@ superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
   // 分片落盘：每 N 个彩色帧异步写一个增量 PCD（0 = 只在退出时写整图）。
   opt.pcd_save_interval_frames = static_cast<std::size_t>(
       getOrDeclare<int>(node, vp("pcd.save_interval_frames"), 0));
+  // 按时间分片（秒）：与帧数分片等价，只是触发条件是墙钟，便于照搬 Super-LIO
+  // lio.map.save_interval 的 5 s 习惯。0 = 关闭。
+  opt.pcd_shard_interval_sec =
+      getOrDeclare<double>(node, vp("pcd.shard_interval_sec"), 0.0);
 
   // ---- 轨迹 / 图像落盘（与 FAST-LIVO2 的 evo / image_save 同口径） ----
   // 轨迹：<evo.save_dir>/<evo.seq_name>.txt，TUM 格式，每行
@@ -272,6 +283,8 @@ struct MonolithVisualIo {
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr colored_pub;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub;
+  // 图像订阅挂在专属节点上，由独立 executor 线程接收（见 setupMonolithIo）。
+  std::shared_ptr<rclcpp::Node> image_node;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr cam_odom_sub;
   rclcpp::TimerBase::SharedPtr save_timer;
@@ -285,6 +298,10 @@ class VisualASuperLIO : public LI2Sup::SuperLIO {
   void setPipeline(superlivo_a::VisualPipeline* pipeline) {
     pipeline_.store(pipeline);
   }
+
+  /// 图像-雷达时钟偏移（t_lidar = t_cam + offset），仅用于把 dense 云时间戳
+  /// 换算到图像所在的墙钟基准，进而量化"事件到达时已经晚了多久"。
+  void setImageTimeOffset(double offset) { image_time_offset_ = offset; }
 
  protected:
   void onLioOutput(const OutputData& data) override {
@@ -326,10 +343,47 @@ class VisualASuperLIO : public LI2Sup::SuperLIO {
     }
   }
 
-  void onDenseCloud(const BASIC::CloudPtr& cloud, double stamp) override {
+  void onDenseCloud(const BASIC::CloudPtr& cloud, double stamp,
+                    double receive_time) override {
     auto* pipeline = pipeline_.load();
     if (pipeline == nullptr || !cloud) {
       return;
+    }
+    // ---- 图像-雷达时钟在线标定 ----
+    // 雷达帧时间戳在雷达时钟域，相机 header.stamp 在宿主墙钟域，两者相差一个
+    // 固定量且会缓慢相对漂移（实测约 1.3 ms/s，几分钟就能漂出 0.1 s 同步窗）。
+    // 这里用"时间戳 - 宿主接收时刻"在线估计：前 20 帧取中位数收敛（抗 UDP 抖动），
+    // 之后用慢速 EMA 跟踪漂移，直接覆盖参数初值，免去每次运行前手工重标。
+    if (receive_time > 0.0) {
+      const double est = stamp - receive_time;
+      if (calib_count_ < kCalibSamples) {
+        calib_buf_[calib_count_++] = est;
+        if (calib_count_ == kCalibSamples) {
+          std::nth_element(calib_buf_, calib_buf_ + kCalibSamples / 2,
+                           calib_buf_ + kCalibSamples);
+          image_time_offset_ = calib_buf_[kCalibSamples / 2];
+          pipeline->setImageTimeOffset(image_time_offset_);
+          RCLCPP_INFO(rclcpp::get_logger("dense_lag"),
+                      "[ClockCalib] 图像-雷达时钟偏移=%.3f s（%d 帧中位数），已生效",
+                      image_time_offset_, kCalibSamples);
+        }
+      } else {
+        image_time_offset_ += kCalibEmaAlpha * (est - image_time_offset_);
+        pipeline->setImageTimeOffset(image_time_offset_);
+      }
+    }
+    // 诊断：dense 云到达时的端到端延迟（含 LIO 处理），每 20 帧打一次。
+    static std::atomic<std::uint64_t> lag_count{0};
+    const auto lag_n = lag_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (lag_n % 20 == 1) {
+      const double wall_now = std::chrono::duration<double>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+      RCLCPP_INFO(rclcpp::get_logger("dense_lag"),
+                  "[DenseLag] n=%lu stamp=%.3f 标定后残差=%.3fs LIO延迟=%.3fs size=%zu",
+                  static_cast<unsigned long>(lag_n), stamp,
+                  wall_now - (stamp - image_time_offset_),
+                  receive_time > 0.0 ? wall_now - receive_time : -1.0, cloud->size());
     }
     std::vector<Eigen::Vector3f> points;
     points.reserve(cloud->size());
@@ -340,7 +394,13 @@ class VisualASuperLIO : public LI2Sup::SuperLIO {
   }
 
  private:
+  static constexpr int kCalibSamples = 20;      ///< 初始标定样本数（中位数）
+  static constexpr double kCalibEmaAlpha = 0.02;  ///< 漂移跟踪速度（~5 s 时间常数）
+
   std::atomic<superlivo_a::VisualPipeline*> pipeline_{nullptr};
+  double image_time_offset_{0.0};
+  double calib_buf_[kCalibSamples]{};
+  int calib_count_{0};
 };
 
 /// 建立订阅/发布器并接上流水线回调。
@@ -426,36 +486,70 @@ std::shared_ptr<MonolithVisualIo> setupMonolithIo(
         }
       });
 
-  // ---- 图像订阅（外部输入，仍走 ROS） ----
+  // ---- 图像订阅（专属节点 + 独立 executor 线程） ----
+  // 图像回调本身只做一次浅拷贝入队（微秒级），但实测在 6 线程 MultiThreadedExecutor
+  // 上图像仍只取到约 4~6 Hz，而同机独立进程探针能收到 9.6 Hz：LIO 的 lidar/imu
+  // 回调与 2 ms 处理定时器长期占住共享 executor 线程，图像样本来不及被取走，
+  // 在 DDS 侧按 RELIABLE depth 被覆盖/迟到，进而导致大量点云"无图像可配"。
+  // 这里把图像订阅放到专属节点上，用单独线程常驻 spin，样本一到就入队。
   const std::string image_topic =
       getOrDeclare<std::string>(node, vp("image_topic"), "/left_camera/image");
+  // 默认 RELIABLE：实测本机 3.9 MB 大图在 CPU 饱和时，BEST_EFFORT 订阅端
+  // 只能收到约 2 Hz（分片丢失）。深度是吞吐的直接杠杆：同机最小探针在
+  // depth=2/4/10 下分别只能收到 6.9/7.5/8.6 Hz，depth 深一点才能避免写端
+  // 流控与覆盖。加深后迟到的帧由下面的「采集时刻过期丢弃」拦在入队前，
+  // 不会进入流水线浪费 CPU。
   const bool image_qos_reliable = getOrDeclare<bool>(node, vp("image.qos_reliable"), true);
+  const int image_qos_depth = std::max(1, getOrDeclare<int>(node, vp("image.qos_depth"), 10));
+  // 相机 header.stamp 是采集时刻的宿主墙钟（SDK host timestamp），因此可以
+  // 直接算端到端"采集龄"。超过阈值说明是 DDS/队列积压出来的旧帧，直接丢弃：
+  // 它既配不上当前点云，也会把后面的点云挤到超时。
+  const double image_max_age = getOrDeclare<double>(node, vp("image.max_age_sec"), 0.30);
+  const auto image_clock = node.get_clock();
+  io->image_node = std::make_shared<rclcpp::Node>("super_livo_image_ingest");
   rclcpp::SubscriptionOptions sub_options;
   sub_options.callback_group =
-      node.create_callback_group(rclcpp::CallbackGroupType::Reentrant);
-  auto image_qos = image_qos_reliable
-                       ? rclcpp::QoS(rclcpp::KeepLast(10)).reliable()
-                       : rclcpp::QoS(rclcpp::SensorDataQoS());
+      io->image_node->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+  auto image_qos = rclcpp::QoS(rclcpp::KeepLast(static_cast<std::size_t>(image_qos_depth)));
+  if (image_qos_reliable) {
+    image_qos.reliable();
+  } else {
+    image_qos.best_effort();
+  }
   const auto image_logger = node.get_logger();
-  io->image_sub = node.create_subscription<sensor_msgs::msg::Image>(
+  io->image_sub = io->image_node->create_subscription<sensor_msgs::msg::Image>(
       image_topic, image_qos,
-      [pipeline, image_logger](const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
+      [pipeline, image_logger, image_clock, image_max_age](
+          const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
         try {
+          const double stamp = rclcpp::Time(msg->header.stamp).seconds();
+          // 采集龄保护：stamp 量级异常（仿真/bag 用 0 时刻）时不做判断。
+          if (image_max_age > 0.0 && stamp > 1e8) {
+            const double age = image_clock->now().seconds() - stamp;
+            if (age > image_max_age) {
+              static std::atomic<std::uint64_t> dropped{0};
+              const auto n = dropped.fetch_add(1) + 1;
+              RCLCPP_WARN_THROTTLE(image_logger, *image_clock, 5000,
+                                   "丢弃过期图像：age=%.2fs 阈值=%.2fs 累计=%lu",
+                                   age, image_max_age,
+                                   static_cast<unsigned long>(n));
+              return;
+            }
+          }
           // 轻量传递：bgr8 消息零拷贝，直接构造引用消息内存的浅拷贝 Mat，
           // 把消息 ConstSharedPtr 作为 keepalive 交给 pipeline（随事件消费完释放）；
           // 其他编码退化为一次 toCvCopy（Mat 自有缓冲，无需 keepalive）。
           if (msg->encoding == sensor_msgs::image_encodings::BGR8) {
             cv::Mat view(static_cast<int>(msg->height), static_cast<int>(msg->width),
                          CV_8UC3, const_cast<uint8_t*>(msg->data.data()), msg->step);
-            pipeline->submitImage(view, rclcpp::Time(msg->header.stamp).seconds(), msg);
+            pipeline->submitImage(view, stamp, msg);
           } else {
             const cv_bridge::CvImagePtr cv_ptr =
                 cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
             if (!cv_ptr || cv_ptr->image.empty()) {
               return;
             }
-            pipeline->submitImage(cv_ptr->image,
-                                  rclcpp::Time(msg->header.stamp).seconds());
+            pipeline->submitImage(cv_ptr->image, stamp);
           }
         } catch (const cv_bridge::Exception& e) {
           static rclcpp::Clock throttle_clock;
@@ -507,6 +601,8 @@ int main(int argc, char** argv) {
   lio->setROSWrapper(wrapper);
   wrapper->setSuperLIO(lio);
   lio->init();
+  // 诊断用：dense 云时间戳换算到图像墙钟基准所需的偏移。
+  lio->setImageTimeOffset(getOrDeclare<double>(*wrapper, vp("img_time_offset"), 0.1));
 
   // ---- 视觉支路开关 ------------------------------------------------------
   // 进程内钩子直推（唯一模式，无 DDS 回环；旧 topic 对照路径已删除）
@@ -527,6 +623,14 @@ int main(int argc, char** argv) {
       std::chrono::milliseconds(2),
       [lio]() { lio->process(); },
       wrapper->getProcessCallbackGroup());
+
+  // 图像专属 executor：单线程常驻 spin，保证 10 Hz 大图样本一到达就被取走入队。
+  rclcpp::executors::SingleThreadedExecutor image_executor;
+  std::thread image_thread;
+  if (io && io->image_node) {
+    image_executor.add_node(io->image_node);
+    image_thread = std::thread([&image_executor]() { image_executor.spin(); });
+  }
 
   auto report_timer = wrapper->create_wall_timer(
       std::chrono::seconds(1),
@@ -551,6 +655,12 @@ int main(int argc, char** argv) {
 
   // 断开钩子，避免 lio 线程在 pipeline 析构后仍访问它。
   lio->setPipeline(nullptr);
+
+  // 先停图像线程再落盘：否则 shutdownAndSave() 期间仍可能有图像事件入队。
+  if (image_thread.joinable()) {
+    image_executor.cancel();
+    image_thread.join();
+  }
 
   // 兜底：shutdown 钩子挂在全局 context 上，与主线程的退出时序不保证有序
   // （实测两者可能并发）。这里再同步保存一次；shutdownAndSave() 幂等且
