@@ -34,6 +34,10 @@ class RgbAssigner {
     int patch_radius{0};
     /// 邻域均值时，与中心色任一通道差超过该值的像素不参与（跨颜色边缘剔除）。
     float patch_color_tol{20.0F};
+
+    /// 过曝过滤：R/G/B 三通道全部 > 该值的像素视为饱和，不参与采样
+    /// （双线性邻点剔除+权重归一、patch 均值跳过、结果兜底）。0=关闭。
+    int overexposed_min{250};
   };
 
   explicit RgbAssigner(const Options& options);

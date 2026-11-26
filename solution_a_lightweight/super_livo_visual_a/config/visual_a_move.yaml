@@ -65,6 +65,10 @@
         # 360°雷达∩84°相机的视场内近似全染色上限）；颜色类参数（min_quality/
         # patch_radius/depth_tolerance）均无显著效果。2026-11-26 定 0.2。
         color.sync_max_offset: 0.2
+        # 过曝过滤：RGB 三通道全 >250 的饱和像素不染色（双线性邻点剔除+权重归一、
+        # patch 均值跳过、结果兜底），避免大面积过曝把点云染成一片死白。
+        # 被拒的点自动转入未染色地图（灰色）。0=关闭。
+        color.overexposed_min: 250
 
         update:
           enable: true               # 退化门控视觉更新（健康段自动回退纯 LIO）
