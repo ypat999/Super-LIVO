@@ -140,6 +140,9 @@ VisualPipeline::VisualPipeline(const VisualPipelineOptions& options) : opt_(opti
   }
 
   colored_map_.reserve(1024);
+  save_uncolored_ = opt_.save_uncolored;
+  save_frame_ = opt_.save_frame_jpg;
+  last_uncolored_shard_time_ = std::chrono::steady_clock::now();
   startWorkerThreads();
   log(LogLevel::kInfo, "VisualPipeline 初始化完成（进程内流水线，无 DDS）");
 }
@@ -559,6 +562,10 @@ void VisualPipeline::colorLoop() {
 
     // 彩色状态只在这条线程上访问：先对镜像缓存取快照，随后整轮无锁使用。
     const ColorSnapshot snap = takeColorSnapshot();
+    // 记录最新去畸变帧（cache 按时间序 push_back，back 即最新），分片移交时带上。
+    if (save_frame_ && !snap.images.empty() && snap.images.back().valid) {
+      latest_color_frame_ = snap.images.back().image;
+    }
     if (have_event) {
       switch (ev.kind) {
         case ColorEvent::Kind::kBodyCloud:
@@ -566,6 +573,7 @@ void VisualPipeline::colorLoop() {
           break;
         case ColorEvent::Kind::kSaveSnapshot:
           requestColoredMapSave();
+          requestUncoloredMapSave();
           break;
         case ColorEvent::Kind::kBarrier:
           if (ev.barrier) {
@@ -578,6 +586,18 @@ void VisualPipeline::colorLoop() {
     }
     drainPendingClouds(snap);
     drainPendingColorization(snap);
+
+    // 未染色点独立按时间切分片：长时间无着色（纯黑/相机断流）时，
+    // 彩色侧不触发 due，未染色段也要按 shard_interval_sec 定期落盘。
+    if (shard_mode_ && save_uncolored_ && uncolored_map_.size() > uncolored_handed_points_ &&
+        shard_interval_sec_ > 0.0) {
+      const auto now2 = std::chrono::steady_clock::now();
+      if (std::chrono::duration<double>(now2 - last_uncolored_shard_time_).count() >=
+          shard_interval_sec_) {
+        last_uncolored_shard_time_ = now2;
+        requestUncoloredMapSave();
+      }
+    }
   }
 }
 
@@ -631,6 +651,9 @@ void VisualPipeline::requestColoredMapSave() {
   seg.points.width = static_cast<std::uint32_t>(seg.points.size());
   seg.points.height = 1;
   seg.points.is_dense = false;
+  if (save_frame_) {
+    seg.frame = latest_color_frame_;  // 引用计数浅拷贝，落盘线程写 jpg
+  }
   if (median_map_.enabled()) {
     if (shard_mode_) {
       // 分片模式：移交时刻直接用实时 median_map_ 回填本段颜色。原实现每移交一次
@@ -685,6 +708,25 @@ void VisualPipeline::writeColoredSnapshot(std::deque<ColorSegment> segments) {
       if (seg.points.empty()) {
         continue;
       }
+      if (seg.is_uncolored) {
+        // 未染色分片：灰色几何点，不做中位数回填，独立编号与彩色分片同节奏。
+        pcl::PointCloud<pcl::PointXYZRGB> cloud = std::move(seg.points);
+        cloud.width = static_cast<std::uint32_t>(cloud.size());
+        cloud.height = 1;
+        cloud.is_dense = false;
+        char name[64];
+        std::snprintf(name, sizeof(name), "uncolored_%05zu.pcd", uncolored_shard_index_++);
+        const std::string shard_path =
+            (std::filesystem::path(opt_.pcd_save_dir) / name).string();
+        if (pcl::io::savePCDFileBinary(shard_path, cloud) == 0) {
+          log(LogLevel::kInfo, "未染色分片已保存: " + shard_path + "（" +
+                                   std::to_string(cloud.size()) + " 点）");
+        } else {
+          logThrottled("pcd_save", 5000, LogLevel::kWarn,
+                       "保存 PCD 分片失败: " + shard_path);
+        }
+        continue;
+      }
       if (seg.median) {
         save_median_ = seg.median;
       }
@@ -704,7 +746,7 @@ void VisualPipeline::writeColoredSnapshot(std::deque<ColorSegment> segments) {
       cloud.height = 1;
       cloud.is_dense = false;
       char name[64];
-      std::snprintf(name, sizeof(name), "colored_%05zu.pcd", shard_index_++);
+      std::snprintf(name, sizeof(name), "colored_%05zu.pcd", shard_index_);
       const std::string shard_path =
           (std::filesystem::path(opt_.pcd_save_dir) / name).string();
       if (pcl::io::savePCDFileBinary(shard_path, cloud) == 0) {
@@ -714,12 +756,25 @@ void VisualPipeline::writeColoredSnapshot(std::deque<ColorSegment> segments) {
         logThrottled("pcd_save", 5000, LogLevel::kWarn,
                      "保存 PCD 分片失败: " + shard_path);
       }
+      // 同编号相机帧：核对色温/曝光/视场覆盖用
+      if (save_frame_ && !seg.frame.empty()) {
+        char jname[64];
+        std::snprintf(jname, sizeof(jname), "frame_%05zu.jpg", shard_index_);
+        const std::string jpg_path =
+            (std::filesystem::path(opt_.pcd_save_dir) / jname).string();
+        static const std::vector<int> jpg_params{cv::IMWRITE_JPEG_QUALITY, 90};
+        cv::imwrite(jpg_path, seg.frame, jpg_params);
+      }
+      ++shard_index_;
     }
     return;
   }
 
   // 合并增量段到常驻缓冲。正常一个保存周期只有一段；落盘慢于移交时会有多段。
   for (auto& seg : segments) {
+    if (seg.is_uncolored) {
+      continue;  // 未染色整图在 shutdownAndSave 末尾同步写，不进彩色缓冲
+    }
     save_buffer_.points.insert(save_buffer_.points.end(), seg.points.points.begin(),
                                seg.points.points.end());
     if (seg.median) {
@@ -777,11 +832,13 @@ void VisualPipeline::shutdownAndSave() {
     // 保证「分片并集 == 合并图」，时序滤波不会漏掉结尾。
     if (shard_mode_) {
       requestColoredMapSave();
+      requestUncoloredMapSave();
     }
     stopSaveThread();
     // 同步写出整张彩色地图。长序列（几百万点 + 中位数回填）要几秒，
     // 这一步必须在本进程内完成，不能交给 save 线程（进程退出时线程被杀）。
     saveColoredMap();
+    saveUncoloredMap();
     if (pose_file_.is_open()) {
       pose_file_.flush();
       pose_file_.close();
@@ -1258,6 +1315,7 @@ void VisualPipeline::drainPendingClouds(const ColorSnapshot& snap) {
                     "彩色[丢弃] 等待图像超时: t_cloud=%.4f 最近差=%.4f 阈值=%.4f 已等 %.2fs",
                     it->t_cloud, best_dt, colorizer_options_.sync.max_offset, waited);
       logThrottled("drop_no_image", 5000, LogLevel::kWarn, buf);
+      appendUncolored(it->points_lidar, it->t_cloud, snap);
       it = pending_clouds_.erase(it);
       continue;
     }
@@ -1282,6 +1340,7 @@ void VisualPipeline::drainPendingColorization(const ColorSnapshot& snap) {
                     "彩色[丢弃] 等待位姿超时: t_cloud=%.4f t_img=%.4f 已等 %.2fs",
                     it->t_cloud, it->t_img, waited);
       logThrottled("drop_pose", 5000, LogLevel::kWarn, buf);
+      appendUncolored(it->points_lidar, it->t_cloud, snap);
       it = pending_color_.erase(it);
       continue;
     }
@@ -1349,6 +1408,17 @@ bool VisualPipeline::colorizeFrame(const PendingColorFrame& frame, const ColorSn
 
   // 累积到世界系彩色地图（定时器/析构时统一写 PCD）。
   accumulateColoredMap(colored, t_cloud, snap);
+  // 本帧没拿到颜色的点（视场外/遮挡/采样失败）进未染色地图。
+  if (save_uncolored_) {
+    std::vector<Eigen::Vector3f> rest;
+    rest.reserve(colored.size() - std::min(colored_count, colored.size()));
+    for (const auto& p : colored) {
+      if (p.quality <= 0.0F) {
+        rest.push_back(p.xyz);
+      }
+    }
+    appendUncolored(rest, t_cloud, snap);
+  }
   const auto t_acc1 = std::chrono::steady_clock::now();
   publishColoredCloud(colored, t_cloud);
   const auto t_pub1 = std::chrono::steady_clock::now();
@@ -1487,7 +1557,10 @@ void VisualPipeline::accumulateColoredMap(
   if (points.empty()) {
     return;
   }
-  if (colored_map_.size() >= opt_.max_colored_map_points) {
+  // max_colored_map_points=0 表示无限（输出点云不截断；voxmap 上限是 Super-LIO
+  // 自己的参数，与此无关）。
+  if (opt_.max_colored_map_points > 0 &&
+      colored_map_.size() >= opt_.max_colored_map_points) {
     if (!pcd_capacity_warned_) {
       pcd_capacity_warned_ = true;
       log(LogLevel::kWarn, "彩色地图点数达到上限 " +
@@ -1526,7 +1599,9 @@ void VisualPipeline::accumulateColoredMap(
     }
   }
 
-  const std::size_t room = opt_.max_colored_map_points - colored_map_.size();
+  const std::size_t room = opt_.max_colored_map_points > 0
+                               ? opt_.max_colored_map_points - colored_map_.size()
+                               : std::numeric_limits<std::size_t>::max();
   const auto clamp_u8 = [](float v) {
     return static_cast<std::uint8_t>(std::clamp(v, 0.0F, 255.0F));
   };
@@ -1569,7 +1644,105 @@ void VisualPipeline::accumulateColoredMap(
     }
     if (due) {
       requestColoredMapSave();
+      requestUncoloredMapSave();
     }
+  }
+}
+
+void VisualPipeline::appendUncolored(const std::vector<Eigen::Vector3f>& points_lidar,
+                                     double stamp, const ColorSnapshot& snap) {
+  if (!save_uncolored_ || points_lidar.empty()) {
+    return;
+  }
+  const std::size_t cap = opt_.max_colored_map_points;
+  if (cap > 0 && uncolored_map_.size() >= cap) {
+    if (!uncolored_capacity_warned_) {
+      uncolored_capacity_warned_ = true;
+      log(LogLevel::kWarn, "未染色地图点数达到上限 " + std::to_string(cap) +
+                               "，后续不再累积");
+    }
+    return;
+  }
+  // 与彩色地图同一位姿口径：stamp 时刻取一次 T_wl，取不到就整帧跳过
+  // （不回退最新位姿，避免跨帧错位）。
+  colorizer::LidarPoseInterpolator interp(
+      colorizer::LidarPoseInterpolator::Options{kPoseHistoryMaxGapSec});
+  for (const auto& sample : snap.poses) {
+    interp.addSample(sample);
+  }
+  Eigen::Matrix4d T_wl = Eigen::Matrix4d::Identity();
+  if (!interp.poseAt(stamp, T_wl)) {
+    return;
+  }
+  const Eigen::Matrix3d R = T_wl.block<3, 3>(0, 0);
+  const Eigen::Vector3d t = T_wl.block<3, 1>(0, 3);
+  const std::size_t room =
+      cap > 0 ? cap - uncolored_map_.size() : std::numeric_limits<std::size_t>::max();
+  std::size_t added = 0;
+  for (const auto& pl : points_lidar) {
+    if (added >= room) {
+      break;
+    }
+    if (!std::isfinite(pl.x()) || !std::isfinite(pl.y()) || !std::isfinite(pl.z())) {
+      continue;
+    }
+    pcl::PointXYZRGB q;
+    const Eigen::Vector3f pw = (R * pl.cast<double>() + t).cast<float>();
+    q.x = pw.x();
+    q.y = pw.y();
+    q.z = pw.z();
+    q.r = q.g = q.b = 128;  // 灰色占位，CC 里与彩色点区分且黑底可见
+    q.a = 255;
+    uncolored_map_.push_back(q);
+    ++added;
+  }
+}
+
+void VisualPipeline::requestUncoloredMapSave() {
+  if (!save_uncolored_) {
+    return;
+  }
+  const std::size_t n = uncolored_map_.size();
+  if (n <= uncolored_handed_points_) {
+    return;
+  }
+  ColorSegment seg;
+  seg.points.assign(uncolored_map_.points.begin() +
+                        static_cast<std::ptrdiff_t>(uncolored_handed_points_),
+                    uncolored_map_.points.end());
+  seg.points.width = static_cast<std::uint32_t>(seg.points.size());
+  seg.points.height = 1;
+  seg.points.is_dense = false;
+  seg.is_uncolored = true;
+  uncolored_handed_points_ = n;
+  {
+    std::lock_guard<std::mutex> lock(save_mutex_);
+    save_segments_.push_back(std::move(seg));
+    save_pending_ = true;
+  }
+  save_cv_.notify_one();
+}
+
+void VisualPipeline::saveUncoloredMap() {
+  if (!save_uncolored_ || uncolored_map_.empty()) {
+    return;
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(opt_.pcd_save_dir, ec);
+  if (ec) {
+    return;
+  }
+  const std::string path =
+      (std::filesystem::path(opt_.pcd_save_dir) / "super_livo_visual_a_uncolored.pcd")
+          .string();
+  uncolored_map_.width = static_cast<std::uint32_t>(uncolored_map_.size());
+  uncolored_map_.height = 1;
+  uncolored_map_.is_dense = false;
+  if (pcl::io::savePCDFileBinary(path, uncolored_map_) == 0) {
+    log(LogLevel::kInfo, "未染色地图已保存: " + path + "（" +
+                             std::to_string(uncolored_map_.size()) + " 点，世界系）");
+  } else {
+    logThrottled("pcd_save_uncolored", 5000, LogLevel::kWarn, "保存 PCD 失败: " + path);
   }
 }
 

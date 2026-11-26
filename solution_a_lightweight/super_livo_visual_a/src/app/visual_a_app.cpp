@@ -190,12 +190,16 @@ superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
   opt.colorizer.rgb.patch_radius = getOrDeclare<int>(node, vp("color.patch_radius"), 0);
   opt.colorizer.rgb.patch_color_tol =
       getOrDeclare<float>(node, vp("color.patch_color_tol"), 20.0F);
+  // 过曝过滤：RGB 三通道全 > 该值的像素不染色（0=关）。过曝点转投未染色地图。
+  opt.colorizer.rgb.overexposed_min =
+      getOrDeclare<int>(node, vp("color.overexposed_min"), 250);
 
   // ---- 落盘 ----
   opt.pcd_save_dir =
       getOrDeclare<std::string>(node, vp("pcd.save_dir"), "/home/ywj/slam_data/pcd");
+  // 输出点云上限：0=无限（默认）。voxmap 上限由 Super-LIO 的 lio 参数控制。
   opt.max_colored_map_points = static_cast<std::size_t>(
-      getOrDeclare<int>(node, vp("pcd.max_points"), 20000000));
+      getOrDeclare<int>(node, vp("pcd.max_points"), 0));
   opt.median_voxel_size =
       static_cast<float>(getOrDeclare<double>(node, vp("pcd.median_voxel_size"), 0.01));
   // 分片落盘：每 N 个彩色帧异步写一个增量 PCD（0 = 只在退出时写整图）。
@@ -205,6 +209,10 @@ superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
   // lio.map.save_interval 的 5 s 习惯。0 = 关闭。
   opt.pcd_shard_interval_sec =
       getOrDeclare<double>(node, vp("pcd.shard_interval_sec"), 0.0);
+  // 未染色点云同节奏落盘（uncolored_%05zu.pcd + 退出时整图），默认开。
+  opt.save_uncolored = getOrDeclare<bool>(node, vp("pcd.save_uncolored"), true);
+  // 每个彩色分片附带同编号的去畸变相机帧 frame_%05zu.jpg，默认开。
+  opt.save_frame_jpg = getOrDeclare<bool>(node, vp("pcd.save_frame"), true);
 
   // ---- 轨迹 / 图像落盘（与 FAST-LIVO2 的 evo / image_save 同口径） ----
   // 轨迹：<evo.save_dir>/<evo.seq_name>.txt，TUM 格式，每行
@@ -354,7 +362,9 @@ class VisualASuperLIO : public LI2Sup::SuperLIO {
     // 固定量且会缓慢相对漂移（实测约 1.3 ms/s，几分钟就能漂出 0.1 s 同步窗）。
     // 这里用"时间戳 - 宿主接收时刻"在线估计：前 20 帧取中位数收敛（抗 UDP 抖动），
     // 之后用慢速 EMA 跟踪漂移，直接覆盖参数初值，免去每次运行前手工重标。
-    if (receive_time > 0.0) {
+    // 回放 bag 时必须关闭（receive_time 是宿主墙钟、stamp 是录制时的传感器钟，
+    // 差值无意义），改用参数 img_time_offset 手填实测值。
+    if (clock_calib_en_ && receive_time > 0.0) {
       const double est = stamp - receive_time;
       if (calib_count_ < kCalibSamples) {
         calib_buf_[calib_count_++] = est;
@@ -401,6 +411,10 @@ class VisualASuperLIO : public LI2Sup::SuperLIO {
   double image_time_offset_{0.0};
   double calib_buf_[kCalibSamples]{};
   int calib_count_{0};
+  bool clock_calib_en_{true};
+
+ public:
+  void setClockCalibEnabled(bool en) { clock_calib_en_ = en; }
 };
 
 /// 建立订阅/发布器并接上流水线回调。
@@ -603,6 +617,8 @@ int main(int argc, char** argv) {
   lio->init();
   // 诊断用：dense 云时间戳换算到图像墙钟基准所需的偏移。
   lio->setImageTimeOffset(getOrDeclare<double>(*wrapper, vp("img_time_offset"), 0.1));
+  // 在线时钟标定开关：实时跑默认开；回放 bag 必须关（手填 img_time_offset）。
+  lio->setClockCalibEnabled(getOrDeclare<bool>(*wrapper, vp("clock_calib_en"), true));
 
   // ---- 视觉支路开关 ------------------------------------------------------
   // 进程内钩子直推（唯一模式，无 DDS 回环；旧 topic 对照路径已删除）

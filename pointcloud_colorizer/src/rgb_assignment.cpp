@@ -29,6 +29,11 @@ bool RgbAssigner::assign(const cv::Mat& bgr,
     const cv::Vec3b& px = bgr.at<cv::Vec3b>(y, x);
     return static_cast<float>(px[is_bgr ? c : 0]);
   };
+  const int over_thr = options_.overexposed_min;
+  auto overexposed = [&](float pb, float pg, float pr) {
+    return pb > static_cast<float>(over_thr) && pg > static_cast<float>(over_thr) &&
+           pr > static_cast<float>(over_thr);
+  };
 
   float b = 0.0F;
   float g = 0.0F;
@@ -39,13 +44,37 @@ bool RgbAssigner::assign(const cv::Mat& bgr,
     const int y0 = static_cast<int>(std::floor(v));
     const double ax = u - x0;
     const double ay = v - y0;
+    const int xs[4] = {x0, x0 + 1, x0, x0 + 1};
+    const int ys[4] = {y0, y0, y0 + 1, y0 + 1};
+    double w[4] = {(1.0 - ax) * (1.0 - ay), ax * (1.0 - ay),
+                   (1.0 - ax) * ay,         ax * ay};
+    bool dead[4] = {false, false, false, false};
+    if (over_thr > 0) {
+      // 过曝是"整像素"属性：饱和邻点直接剔除，剩余权重归一化；四点全饱和弃色。
+      double wsum = 0.0;
+      for (int i = 0; i < 4; ++i) {
+        if (overexposed(sample(xs[i], ys[i], 0), sample(xs[i], ys[i], 1),
+                        sample(xs[i], ys[i], 2))) {
+          dead[i] = true;
+          w[i] = 0.0;
+        } else {
+          wsum += w[i];
+        }
+      }
+      if (wsum <= 1e-9) {
+        return false;
+      }
+      for (int i = 0; i < 4; ++i) {
+        w[i] /= wsum;
+      }
+    }
     for (int c = 0; c < 3; ++c) {
-      const float v00 = sample(x0, y0, c);
-      const float v10 = sample(x0 + 1, y0, c);
-      const float v01 = sample(x0, y0 + 1, c);
-      const float v11 = sample(x0 + 1, y0 + 1, c);
-      const float value = static_cast<float>((1.0 - ay) * ((1.0 - ax) * v00 + ax * v10) +
-                                             ay * ((1.0 - ax) * v01 + ax * v11));
+      float value = 0.0F;
+      for (int i = 0; i < 4; ++i) {
+        if (!dead[i]) {
+          value += static_cast<float>(w[i] * sample(xs[i], ys[i], c));
+        }
+      }
       if (c == 0) {
         b = value;
       } else if (c == 1) {
@@ -60,6 +89,9 @@ bool RgbAssigner::assign(const cv::Mat& bgr,
     b = sample(x, y, 0);
     g = sample(x, y, 1);
     r = sample(x, y, 2);
+    if (over_thr > 0 && overexposed(b, g, r)) {
+      return false;
+    }
   }
 
   // 邻域均值（可选）：以中心色为基准，剔除跨颜色边缘的像素后再平均，
@@ -81,6 +113,7 @@ bool RgbAssigner::assign(const cv::Mat& bgr,
         const float pb = sample(x, y, 0);
         const float pg = sample(x, y, 1);
         const float pr = sample(x, y, 2);
+        if (over_thr > 0 && overexposed(pb, pg, pr)) continue;  // 过曝像素不参与均值
         const float dev = std::max({std::fabs(pb - b), std::fabs(pg - g), std::fabs(pr - r)});
         if (dev > options_.patch_color_tol) continue;
         sb += pb;
@@ -97,6 +130,9 @@ bool RgbAssigner::assign(const cv::Mat& bgr,
   }
 
   // OpenCV 的图像通道顺序是 BGR，这里转成 RGB 写入点云。
+  if (over_thr > 0 && overexposed(b, g, r)) {
+    return false;  // 兜底：插值/均值后仍整体饱和（如大面积过曝区中心）
+  }
   point.rgb = Eigen::Vector3f(std::min(r, 255.0F), std::min(g, 255.0F), std::min(b, 255.0F));
   point.quality = quality;
   return true;

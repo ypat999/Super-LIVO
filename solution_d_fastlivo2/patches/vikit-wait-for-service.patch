@@ -1,0 +1,16 @@
+diff --git a/vikit_ros/include/vikit/params_helper.h b/vikit_ros/include/vikit/params_helper.h
+index 9e12931..7029b49 100644
+--- a/vikit_ros/include/vikit/params_helper.h
++++ b/vikit_ros/include/vikit/params_helper.h
+@@ -113,8 +113,9 @@ T getRemoteParam(const rclcpp::Node::SharedPtr &nh, const std::string& remote_no
+     // Use SyncParametersClient for high performance cross-node access
+     try {
+         auto parameters_client = std::make_shared<rclcpp::SyncParametersClient>(nh, remote_node_name);
+-        // Wait briefly for the service to be available
+-        if (parameters_client->wait_for_service(std::chrono::milliseconds(100))) {
++        // 100ms 对本机（RK3588 + FastDDS）太短：进程刚起来时 service discovery
++        // 实测需要 ~2.5s，抢跑会直接返回默认值并导致 "Camera model not correctly specified"。
++        if (parameters_client->wait_for_service(std::chrono::seconds(10))) {
+             auto values = parameters_client->get_parameters({param_name});
+             if (!values.empty() && values[0].get_type() != rclcpp::ParameterType::PARAMETER_NOT_SET) {
+                 return values[0].get_value<T>();

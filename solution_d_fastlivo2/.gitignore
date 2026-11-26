@@ -1,0 +1,5 @@
+# 本地依赖与构建产物
+.deps/
+ws/build/
+ws/install/
+ws/log/

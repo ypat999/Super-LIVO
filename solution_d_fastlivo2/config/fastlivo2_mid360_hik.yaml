@@ -1,0 +1,123 @@
+/**:
+  ros__parameters:
+    common:
+      # 本机（海康 MV-CB013 raw bgr8 + Livox MID360 内置 IMU）
+      img_topic: "/left_camera/image"
+      lid_topic: "/livox/lidar"
+      imu_topic: "/livox/imu"
+      img_en: 1
+      lidar_en: 1
+      ros_driver_bug_fix: false
+      livox_msg_type: "livox_ros_driver2"
+
+    extrin_calib:
+      # IMU -> LiDAR（MID360 内置 IMU 出厂外参，与 mid360_only.yaml 一致）
+      extrinsic_T: [0.011, 0.02329, -0.04412]
+      extrinsic_R: [1., 0., 0.,
+                    0., 1., 0.,
+                    0., 0., 1.]
+      # LiDAR -> Camera（p_cam = Rcl * P_lidar + Pcl）
+      # 取自方案 A 的 FAST-Calib + 4 孔心重解结果（RMSE 3.2 mm）
+      Rcl: [-0.017100, -0.999833, -0.006427,
+             0.482159, -0.002615, -0.876080,
+             0.875917, -0.018080,  0.482123]
+      Pcl: [0.027840, -0.172288, -0.047550]
+
+    time_offset:
+      imu_time_offset: 0.0
+      # 雷达钟 - 相机钟。相机 header.stamp 是宿主墙钟（~1.7955e9），
+      # 雷达 header.stamp 是设备钟（~1.5902e9），差值约 -2.0538e8 s。
+      # 实时启动脚本会用 scripts/calib_time_offset.py 现场标定并覆盖此值；
+      # 回放 bag 时请手填实测值（t_lidar = t_img + offset）。
+      img_time_offset: 0.0
+      exposure_time_init: 0.0
+
+    rolling_shutter:
+      # 海康 MV-CB013 无实测读出时间，先关闭 RS 模型；
+      # td 在线细化只依赖光度残差，与 RS 开关无关，用于跟踪慢速时钟漂移。
+      enable: false
+      tr_readout: 0.0
+      anchor_factor: 0.5
+      debug_print: false
+      td_estimate_enable: true
+      td_step_alpha: 0.1
+      td_step_cap: 0.0005
+      td_lambda: 100.0
+      td_min_jac_sq: 1.0
+
+    camera:
+      # 先按与 FAST-Calib 一致的 K/D 去畸变，再用纯针孔模型投影
+      undistort_en: true
+      dist_coeffs: [5.4466418090825280e-02, -4.5147373415016401e-02,
+                    8.5461102120314711e-06, 1.0486594840736336e-03]
+
+    preprocess:
+      point_filter_num: 1
+      filter_size_surf: 0.1
+      lidar_type: 8 # 8 : Livox Mid-360 LiDAR
+      scan_line: 4
+      blind: 0.1
+
+    vio:
+      max_iterations: 5
+      outlier_threshold: 1000
+      img_point_cov: 100
+      patch_size: 8
+      patch_pyrimid_level: 4
+      normal_en: true
+      raycast_en: false
+      inverse_composition_en: false
+      exposure_estimate_en: true
+      inv_expo_cov: 0.1
+
+    imu:
+      imu_en: true
+      imu_int_frame: 50
+      acc_cov: 0.1
+      gyr_cov: 0.1
+      b_acc_cov: 0.001
+      b_gyr_cov: 0.001
+
+    lio:
+      max_iterations: 5
+      dept_err: 0.02
+      beam_err: 0.15
+      min_eigen_value: 0.005
+      voxel_size: 0.5
+      max_layer: 2
+      max_points_num: 50
+      layer_init_num: [5, 5, 5, 5, 5]
+
+    local_map:
+      map_sliding_en: false
+      half_map_size: 100
+      sliding_thresh: 8.0
+
+    uav:
+      imu_rate_odom: false
+      gravity_align_en: true
+
+    publish:
+      dense_map_en: true
+      pub_effect_point_en: false
+      pub_plane_en: false
+      pub_scan_num: 1
+      blind_rgb_points: 0.0
+
+    evo:
+      seq_name: "scene_d"
+      # 退出时写 Log/result/scene_d.txt（t x y z qx qy qz qw），用于与 A 轨迹对比
+      pose_output_en: true
+
+    pcd_save:
+      # 退出时写 Log/pcd/all_raw_points.pcd（彩色）与 all_downsampled_points.pcd
+      # Log/ 由启动脚本软链到本次运行输出目录
+      pcd_save_en: true
+      type: 0
+      colmap_output_en: false
+      filter_size_pcd: 0.02
+      interval: -1
+
+    image_save:
+      img_save_en: false
+      interval: 1
