@@ -1,0 +1,18 @@
+/**:
+  ros__parameters:
+    # vikit camera_loader 从 parameter_blackboard 节点读取这些参数
+    cam_model: Pinhole
+    cam_width: 1280
+    cam_height: 1024
+    scale: 1.0
+    cam_fx: 7.0863125924497740e+02
+    cam_fy: 7.0871513587278127e+02
+    cam_cx: 6.4449372682521789e+02
+    cam_cy: 4.9588359175254533e+02
+    # 注意：U-AMC 的 PinholeCamera 只做针孔投影，cam_d0..d3 会被读入但不参与投影。
+    # 真正的去畸变在 LIVMapper::img_cbk 里由主参数 camera.dist_coeffs 完成，
+    # 这里保留同一组 (k1,k2,p1,p2) 仅作记录/一致性检查。
+    cam_d0: 5.4466418090825280e-02
+    cam_d1: -4.5147373415016401e-02
+    cam_d2: 8.5461102120314711e-06
+    cam_d3: 1.0486594840736336e-03
