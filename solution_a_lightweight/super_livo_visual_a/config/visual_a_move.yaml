@@ -85,6 +85,10 @@
           # 退出时仍写一份完整合并图。两者任一 >0 即进入分片模式。
           save_interval_frames: 0
           shard_interval_sec: 5.0
+          # 未染色点云（视场外/遮挡/等图超时帧）按同一节奏写 uncolored_%05zu.pcd
+          # （灰色），退出时写 super_livo_visual_a_uncolored.pcd；
+          # 与彩色分片并集≈全部进入管线的点云，便于离线拼接查看完整几何。
+          save_uncolored: true
 
         # 轨迹 / 图像落盘（参照 FAST-LIVO2 的 evo / image_save）
         #   轨迹：<save_dir>/<seq_name>.txt，TUM 格式

@@ -125,6 +125,11 @@ struct VisualPipelineOptions {
   /// 按时间分片落盘（秒）：与 pcd_save_interval_frames 二选一/可叠加，任一满足
   /// 即切一片。参照 Super-LIO 的 lio.map.save_interval（秒级增量落盘）。
   double pcd_shard_interval_sec{0.0};
+  /// 未染色点云落盘：把进入着色链路但没拿到颜色的点（视场外、遮挡、等图/等位
+  /// 姿超时帧）按同一分片节奏写 uncolored_%05zu.pcd（灰色），退出时写
+  /// super_livo_visual_a_uncolored.pcd。与彩色分片并集≈全部进入管线的点云，
+  /// 便于离线拼接查看完整几何。
+  bool save_uncolored{true};
 
   // ---- 轨迹 / 图像落盘（参照 FAST-LIVO2 的 evo / image_save 开关） ----
   /// 轨迹输出开关：TUM 格式（timestamp tx ty tz qx qy qz qw），
@@ -281,7 +286,12 @@ class VisualPipeline {
   /// 累积彩色地图（着色线程；位姿取快照的镜像 pose 缓存）。
   void accumulateColoredMap(const std::vector<colorizer::ColoredPoint>& points, double stamp,
                             const ColorSnapshot& snap);
+  /// 累积未染色点（着色线程）：机体系点用 stamp 时刻位姿变换到世界系后追加，
+  /// 灰色 (128,128,128)。位姿插值失败或达到点数上限则跳过。
+  void appendUncolored(const std::vector<Eigen::Vector3f>& points_lidar, double stamp,
+                       const ColorSnapshot& snap);
   void saveColoredMap();
+  void saveUncoloredMap();
   void savePose(const Eigen::Matrix4d& T_wl, double stamp);
   void saveImage(const cv::Mat& bgr, double stamp);
   void publishColoredCloud(const std::vector<colorizer::ColoredPoint>& points, double stamp);
@@ -356,9 +366,12 @@ class VisualPipeline {
     /// 分片模式下颜色已在移交时刻用实时 median_map_ 回填完毕（与"拷贝快照后
     /// 回填"同一时点、同一 colorAt，结果逐点一致），落盘线程不再二次回填。
     bool color_resolved{false};
+    /// 未染色段：写 uncolored_%05zu.pcd，不做中位数回填。
+    bool is_uncolored{false};
   };
 
   void requestColoredMapSave();
+  void requestUncoloredMapSave();
   void writeColoredSnapshot(std::deque<ColorSegment> segments);
 
   std::deque<InputEvent> input_queue_;
@@ -406,6 +419,13 @@ class VisualPipeline {
   std::chrono::steady_clock::time_point last_shard_time_{};
   std::size_t shard_index_{0};
   std::size_t frames_since_shard_{0};
+  // ---- 未染色点云（着色线程独占，与 colored_map_ 同生命周期）----
+  bool save_uncolored_{true};
+  pcl::PointCloud<pcl::PointXYZRGB> uncolored_map_;
+  std::size_t uncolored_handed_points_{0};
+  std::size_t uncolored_shard_index_{0};
+  std::chrono::steady_clock::time_point last_uncolored_shard_time_{};
+  bool uncolored_capacity_warned_{false};
   /// shutdownAndSave() 只执行一次；并发调用者（shutdown 钩子 / 主线程 /
   /// 析构）会阻塞到那次执行完成，保证进程退出前文件已落盘。
   std::once_flag shutdown_once_;

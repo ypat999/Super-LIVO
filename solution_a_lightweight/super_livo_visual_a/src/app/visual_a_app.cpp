@@ -205,6 +205,8 @@ superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
   // lio.map.save_interval 的 5 s 习惯。0 = 关闭。
   opt.pcd_shard_interval_sec =
       getOrDeclare<double>(node, vp("pcd.shard_interval_sec"), 0.0);
+  // 未染色点云同节奏落盘（uncolored_%05zu.pcd + 退出时整图），默认开。
+  opt.save_uncolored = getOrDeclare<bool>(node, vp("pcd.save_uncolored"), true);
 
   // ---- 轨迹 / 图像落盘（与 FAST-LIVO2 的 evo / image_save 同口径） ----
   // 轨迹：<evo.save_dir>/<evo.seq_name>.txt，TUM 格式，每行
