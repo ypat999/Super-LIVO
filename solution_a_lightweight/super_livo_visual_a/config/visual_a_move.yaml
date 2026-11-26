@@ -82,7 +82,9 @@
           # 周期整图落盘（秒）：同步写整图 + 中位数回填，会阻塞工作线程
           # （实测 0.5~0.7 s 断档），实时跑用下面的分片替代，这里保持 0。
           save_interval_sec: 0.0
-          max_points: 20000000
+          # 输出点云上限：0=无限（默认）。注意这不是 voxmap 上限——
+          # voxmap（Super-LIO 内部地图）由 lio 参数控制，与此无关。
+          max_points: 0
           # 分片落盘（参照 Super-LIO lio.map.save_interval）：每 N 个着色帧或
           # N 秒异步写一个增量 colored_%05d.pcd，只含本时间窗新增点、按时间有序，
           # 退出时仍写一份完整合并图。两者任一 >0 即进入分片模式。
@@ -92,6 +94,9 @@
           # （灰色），退出时写 super_livo_visual_a_uncolored.pcd；
           # 与彩色分片并集≈全部进入管线的点云，便于离线拼接查看完整几何。
           save_uncolored: true
+          # 每个彩色分片附带同编号去畸变相机帧 frame_%05zu.jpg（与 colored_%05zu.pcd
+          # 一一对应），用于核对色温/曝光/视场覆盖。
+          save_frame: true
 
         # 轨迹 / 图像落盘（参照 FAST-LIVO2 的 evo / image_save）
         #   轨迹：<save_dir>/<seq_name>.txt，TUM 格式

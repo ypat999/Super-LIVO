@@ -112,7 +112,8 @@ struct VisualPipelineOptions {
   std::size_t max_pose_samples{300};
   std::size_t max_map_points{60000};
   int map_append_stride{3};
-  std::size_t max_colored_map_points{20000000};
+  /// 输出点云上限：0=无限（默认）。voxmap 上限是 Super-LIO 自己的参数，与此无关。
+  std::size_t max_colored_map_points{0};
 
   // ---- 彩色地图落盘 ----
   std::string pcd_save_dir{"/home/ywj/slam_data/pcd"};
@@ -130,6 +131,9 @@ struct VisualPipelineOptions {
   /// super_livo_visual_a_uncolored.pcd。与彩色分片并集≈全部进入管线的点云，
   /// 便于离线拼接查看完整几何。
   bool save_uncolored{true};
+  /// 每个彩色分片同时落盘移交时刻的最新去畸变帧：frame_%05zu.jpg（与
+  /// colored_%05zu.pcd 同编号），便于核对色温/曝光/视场覆盖。
+  bool save_frame_jpg{true};
 
   // ---- 轨迹 / 图像落盘（参照 FAST-LIVO2 的 evo / image_save 开关） ----
   /// 轨迹输出开关：TUM 格式（timestamp tx ty tz qx qy qz qw），
@@ -368,6 +372,8 @@ class VisualPipeline {
     bool color_resolved{false};
     /// 未染色段：写 uncolored_%05zu.pcd，不做中位数回填。
     bool is_uncolored{false};
+    /// 移交时刻的最新去畸变帧（引用计数浅拷贝，仅彩色段携带）。
+    cv::Mat frame;
   };
 
   void requestColoredMapSave();
@@ -421,6 +427,8 @@ class VisualPipeline {
   std::size_t frames_since_shard_{0};
   // ---- 未染色点云（着色线程独占，与 colored_map_ 同生命周期）----
   bool save_uncolored_{true};
+  bool save_frame_{true};
+  cv::Mat latest_color_frame_;  ///< 着色线程独占：每轮快照更新，移交时挂到段上
   pcl::PointCloud<pcl::PointXYZRGB> uncolored_map_;
   std::size_t uncolored_handed_points_{0};
   std::size_t uncolored_shard_index_{0};

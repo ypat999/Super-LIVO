@@ -141,6 +141,7 @@ VisualPipeline::VisualPipeline(const VisualPipelineOptions& options) : opt_(opti
 
   colored_map_.reserve(1024);
   save_uncolored_ = opt_.save_uncolored;
+  save_frame_ = opt_.save_frame_jpg;
   last_uncolored_shard_time_ = std::chrono::steady_clock::now();
   startWorkerThreads();
   log(LogLevel::kInfo, "VisualPipeline 初始化完成（进程内流水线，无 DDS）");
@@ -561,6 +562,10 @@ void VisualPipeline::colorLoop() {
 
     // 彩色状态只在这条线程上访问：先对镜像缓存取快照，随后整轮无锁使用。
     const ColorSnapshot snap = takeColorSnapshot();
+    // 记录最新去畸变帧（cache 按时间序 push_back，back 即最新），分片移交时带上。
+    if (save_frame_ && !snap.images.empty() && snap.images.back().valid) {
+      latest_color_frame_ = snap.images.back().image;
+    }
     if (have_event) {
       switch (ev.kind) {
         case ColorEvent::Kind::kBodyCloud:
@@ -646,6 +651,9 @@ void VisualPipeline::requestColoredMapSave() {
   seg.points.width = static_cast<std::uint32_t>(seg.points.size());
   seg.points.height = 1;
   seg.points.is_dense = false;
+  if (save_frame_) {
+    seg.frame = latest_color_frame_;  // 引用计数浅拷贝，落盘线程写 jpg
+  }
   if (median_map_.enabled()) {
     if (shard_mode_) {
       // 分片模式：移交时刻直接用实时 median_map_ 回填本段颜色。原实现每移交一次
@@ -738,7 +746,7 @@ void VisualPipeline::writeColoredSnapshot(std::deque<ColorSegment> segments) {
       cloud.height = 1;
       cloud.is_dense = false;
       char name[64];
-      std::snprintf(name, sizeof(name), "colored_%05zu.pcd", shard_index_++);
+      std::snprintf(name, sizeof(name), "colored_%05zu.pcd", shard_index_);
       const std::string shard_path =
           (std::filesystem::path(opt_.pcd_save_dir) / name).string();
       if (pcl::io::savePCDFileBinary(shard_path, cloud) == 0) {
@@ -748,6 +756,16 @@ void VisualPipeline::writeColoredSnapshot(std::deque<ColorSegment> segments) {
         logThrottled("pcd_save", 5000, LogLevel::kWarn,
                      "保存 PCD 分片失败: " + shard_path);
       }
+      // 同编号相机帧：核对色温/曝光/视场覆盖用
+      if (save_frame_ && !seg.frame.empty()) {
+        char jname[64];
+        std::snprintf(jname, sizeof(jname), "frame_%05zu.jpg", shard_index_);
+        const std::string jpg_path =
+            (std::filesystem::path(opt_.pcd_save_dir) / jname).string();
+        static const std::vector<int> jpg_params{cv::IMWRITE_JPEG_QUALITY, 90};
+        cv::imwrite(jpg_path, seg.frame, jpg_params);
+      }
+      ++shard_index_;
     }
     return;
   }
@@ -1539,7 +1557,10 @@ void VisualPipeline::accumulateColoredMap(
   if (points.empty()) {
     return;
   }
-  if (colored_map_.size() >= opt_.max_colored_map_points) {
+  // max_colored_map_points=0 表示无限（输出点云不截断；voxmap 上限是 Super-LIO
+  // 自己的参数，与此无关）。
+  if (opt_.max_colored_map_points > 0 &&
+      colored_map_.size() >= opt_.max_colored_map_points) {
     if (!pcd_capacity_warned_) {
       pcd_capacity_warned_ = true;
       log(LogLevel::kWarn, "彩色地图点数达到上限 " +
@@ -1578,7 +1599,9 @@ void VisualPipeline::accumulateColoredMap(
     }
   }
 
-  const std::size_t room = opt_.max_colored_map_points - colored_map_.size();
+  const std::size_t room = opt_.max_colored_map_points > 0
+                               ? opt_.max_colored_map_points - colored_map_.size()
+                               : std::numeric_limits<std::size_t>::max();
   const auto clamp_u8 = [](float v) {
     return static_cast<std::uint8_t>(std::clamp(v, 0.0F, 255.0F));
   };
@@ -1632,7 +1655,7 @@ void VisualPipeline::appendUncolored(const std::vector<Eigen::Vector3f>& points_
     return;
   }
   const std::size_t cap = opt_.max_colored_map_points;
-  if (uncolored_map_.size() >= cap) {
+  if (cap > 0 && uncolored_map_.size() >= cap) {
     if (!uncolored_capacity_warned_) {
       uncolored_capacity_warned_ = true;
       log(LogLevel::kWarn, "未染色地图点数达到上限 " + std::to_string(cap) +
@@ -1653,7 +1676,8 @@ void VisualPipeline::appendUncolored(const std::vector<Eigen::Vector3f>& points_
   }
   const Eigen::Matrix3d R = T_wl.block<3, 3>(0, 0);
   const Eigen::Vector3d t = T_wl.block<3, 1>(0, 3);
-  const std::size_t room = cap - uncolored_map_.size();
+  const std::size_t room =
+      cap > 0 ? cap - uncolored_map_.size() : std::numeric_limits<std::size_t>::max();
   std::size_t added = 0;
   for (const auto& pl : points_lidar) {
     if (added >= room) {
