@@ -42,7 +42,7 @@
           fast_calib_result: "/home/ywj/git/Super-LIVO/third_party/FAST-Calib-ROS2/output/calib_result.txt"
         img_time_offset: 0.0
         # 相机与雷达扫描存在相位差（最近邻 dt 中位 16.7ms、最大 74ms），放宽同步窗。
-        color.sync_max_offset: 0.1
+        color.sync_max_offset: 0.2
 
         # 彩色点云落盘：<save_dir>/super_livo_visual_b_colored.pcd
         pcd:
