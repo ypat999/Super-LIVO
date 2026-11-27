@@ -71,7 +71,7 @@
         depth.pixel_radius: 3
         depth.search_radius: 0.3
         depth.min_depth: 0.5
-        depth.max_depth: 80.0
+        depth.max_depth: 100.0
         depth.max_neighbors: 5
         depth.anchor_window: 5
 

@@ -69,6 +69,10 @@
         # patch 均值跳过、结果兜底），避免大面积过曝把点云染成一片死白。
         # 被拒的点自动转入未染色地图（灰色）。0=关闭。
         color.overexposed_min: 250
+        # 视觉深度关联距离（米）：与 lio.sensor.maxrange=100 对齐，
+        # 远景点（如经窗户可见的 80~90 m 楼板）也参与深度关联与染色。
+        depth:
+          max_depth: 100.0
 
         update:
           enable: true               # 退化门控视觉更新（健康段自动回退纯 LIO）
