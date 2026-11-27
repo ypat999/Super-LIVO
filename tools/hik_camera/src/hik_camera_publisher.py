@@ -35,8 +35,11 @@ class HikCameraPublisher(Node):
         self.declare_parameter("exposure_min_us", 100.0)
         self.declare_parameter("exposure_max_us", 3000.0)
         # Gamma > 1 提亮中间调、压缩高光（硬件节点只读，用软件 LUT 实现）
-        # 默认 1.0=关；实测白天室内 raw mean≈120 曝光正确，开 1.5 反而过亮
-        self.declare_parameter("gamma", 1.0)
+        self.declare_parameter("gamma", 1.5)
+        # 曝光目标系数：固件无 ExposureAutoAdjustTarget/ExposureCompensation 节点
+        # （实测 0x80000109），软件预乘等效降 AE 目标（0.7≈-0.5EV）。
+        # 与 Gamma 合成一条曲线：高光压回、暗部提起、中间调基本不变。
+        self.declare_parameter("exposure_target_scale", 0.7)
         # 自动白平衡：修正工业相机默认 WB Off 在 LED/阴天下偏青黄
         self.declare_parameter("auto_white_balance", True)
         # USB2 带宽有限：BayerGB8 约 15 fps，BGR8Packed 仅约 6 fps
@@ -53,12 +56,15 @@ class HikCameraPublisher(Node):
         self.exposure_min_us = self.get_parameter("exposure_min_us").value
         self.exposure_max_us = self.get_parameter("exposure_max_us").value
         self.gamma = self.get_parameter("gamma").value
+        self.exposure_target_scale = self.get_parameter("exposure_target_scale").value
         self.auto_white_balance = self.get_parameter("auto_white_balance").value
-        # 软件 Gamma LUT（硬件 Gamma 节点只读，0x80000106）
-        if self.gamma > 0 and self.gamma != 1.0:
-            inv = 1.0 / self.gamma
+        # 软件色调曲线：out = 255 × (in/255 × k)^(1/γ)，k=目标系数、γ=Gamma
+        k = self.exposure_target_scale
+        if (self.gamma > 0 and self.gamma != 1.0) or (0 < k < 1.0):
+            inv = 1.0 / self.gamma if self.gamma > 0 else 1.0
             self._gamma_lut = np.array(
-                [int(np.clip(255 * np.power(i / 255.0, inv), 0, 255))
+                [int(np.clip(255 * np.power(np.clip(i / 255.0 * k, 0.0, 1.0), inv),
+                             0, 255))
                  for i in range(256)], dtype=np.uint8)
         else:
             self._gamma_lut = None
@@ -95,13 +101,14 @@ class HikCameraPublisher(Node):
         self.buffer, self.payload_size = hik.start_grabbing(self.cam)
 
         self.get_logger().info(
-            "相机已启动，发布到 {}（模式：{}，采集格式：{}，发布编码：bgr8，曝光：{}，Gamma={}，AWB={}）".format(
+            "相机已启动，发布到 {}（模式：{}，采集格式：{}，发布编码：bgr8，曝光：{}，Gamma={}，target_scale={}，AWB={}）".format(
                 self.topic,
                 "Line2 硬件触发" if self.trigger else "free-run",
                 self.pixel_format,
                 "AE 100-3000us" if self.auto_exposure
                 else "固定 {:.0f}us".format(self.exposure_us),
                 self.gamma,
+                self.exposure_target_scale,
                 "Continuous" if self.auto_white_balance else "Off",
             )
         )
