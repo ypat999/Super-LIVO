@@ -138,7 +138,7 @@ def configure_camera(
     auto_exposure=False,
     exposure_min_us=100.0,
     exposure_max_us=3000.0,
-    gamma=1.5,
+    gamma=1.0,
     auto_white_balance=True,
 ):
     """配置采集模式（free-run 或外部硬件触发）
@@ -149,7 +149,8 @@ def configure_camera(
 
     gamma>1.0: 提亮中间调并压缩高光，缓解"大面积暗部 + 光源过曝"共存的高动态场景。
     海康 Gamma 节点默认 1.0（线性，比手机 sRGB 曲线暗），建议 1.5~2.0。
-    标定场景（auto_exposure=False）保持 1.0 以保证光度一致性。
+    实测白天室内 AE+AGC 收敛后 raw mean≈120 曝光正确，默认保持 1.0（关闭）。
+    标定场景（auto_exposure=False）同样保持 1.0 以保证光度一致性。
 
     auto_white_balance=True: BalanceWhiteAuto=Continuous，修正工业相机默认
     WB Off + 比率 1:1:1 在 LED/阴天下偏青黄的问题。标定场景保持 Off。

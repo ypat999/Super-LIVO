@@ -34,8 +34,9 @@ class HikCameraPublisher(Node):
         self.declare_parameter("auto_exposure", True)
         self.declare_parameter("exposure_min_us", 100.0)
         self.declare_parameter("exposure_max_us", 3000.0)
-        # Gamma > 1 提亮中间调、压缩高光，缓解"又暗又过曝"的高动态场景
-        self.declare_parameter("gamma", 1.5)
+        # Gamma > 1 提亮中间调、压缩高光（硬件节点只读，用软件 LUT 实现）
+        # 默认 1.0=关；实测白天室内 raw mean≈120 曝光正确，开 1.5 反而过亮
+        self.declare_parameter("gamma", 1.0)
         # 自动白平衡：修正工业相机默认 WB Off 在 LED/阴天下偏青黄
         self.declare_parameter("auto_white_balance", True)
         # USB2 带宽有限：BayerGB8 约 15 fps，BGR8Packed 仅约 6 fps
