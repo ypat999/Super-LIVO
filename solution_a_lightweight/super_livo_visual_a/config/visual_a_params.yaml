@@ -163,7 +163,7 @@
         # 距离 <= max_dist（默认 10cm）借其色写入结果、超界的点不写入，另存
         # super_livo_visual_a_nn_colored.pcd（不影响彩色/未染色整图）。
         pcd.nn_color_transfer: true
-        pcd.nn_color_transfer_max_dist: 0.10
+        pcd.nn_color_transfer_max_dist: 0.02
 
         # ========================================================================
         # 轨迹 / 图像落盘（参照 FAST-LIVO2 的 evo / image_save 开关）

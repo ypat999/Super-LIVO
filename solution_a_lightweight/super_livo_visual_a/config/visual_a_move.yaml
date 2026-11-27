@@ -105,7 +105,7 @@
           # 距离 <= max_dist（默认 10cm）借其色写入结果、超界的点不写入，另存
           # super_livo_visual_a_nn_colored.pcd（不影响上面两个整图）。
           nn_color_transfer: true
-          nn_color_transfer_max_dist: 0.10
+          nn_color_transfer_max_dist: 0.02
 
         # 轨迹 / 图像落盘（参照 FAST-LIVO2 的 evo / image_save）
         #   轨迹：<save_dir>/<seq_name>.txt，TUM 格式
