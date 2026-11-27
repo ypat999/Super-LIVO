@@ -23,7 +23,7 @@ LIVOX=/home/ztl/PointPanoramaTex/livox_driver2
 HIK=/home/ztl/PointPanoramaTex/hik_camera
 
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-93}
-DECIMATE=${DECIMATE:-4}          # VIO 抽帧：4 ≈ 2.5 Hz（着色吞吐最好）
+DECIMATE=${DECIMATE:-10}         # VIO 抽帧：10 ≈ 1 Hz（前端 130ms/帧太重，降载防雷达积压丢帧）
 FILTER_RATE=${FILTER_RATE:-5}    # LIO 配准抽点，3→5 可把 LIO 提到约 9.6 Hz
 SHARD_SEC=${SHARD_SEC:-5.0}
 OUT=${1:-/home/ztl/slam_data/output/live_$(date +%m%d_%H%M%S)}
