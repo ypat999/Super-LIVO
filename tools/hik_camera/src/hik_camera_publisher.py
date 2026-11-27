@@ -45,6 +45,12 @@ class HikCameraPublisher(Node):
         self.declare_parameter("ae_gain_max_db", 16.0)
         # Gamma > 1 提亮中间调、压缩高光（硬件节点只读，用软件 LUT 实现）
         self.declare_parameter("gamma", 1.5)
+        # 静态白平衡微调（B,G,R 通道增益）：抵消 AWB 在大面积绿叶等
+        # 非灰场景下的偏暖漂移。相机端无 BalanceRatio 节点，只能主机侧做。
+        self.declare_parameter("wb_trim", "1.04,1.0,0.96")
+        # 饱和度增益：new = s*img + (1-s)*gray（保亮度提彩度）。
+        # 相机端 Saturation/Hue/Contrast 节点均不存在，只能主机侧做。
+        self.declare_parameter("saturation_gain", 1.3)
         # 自动白平衡：修正工业相机默认 WB Off 在 LED/阴天下偏青黄
         self.declare_parameter("auto_white_balance", True)
         # USB2 带宽有限：BayerGB8 约 15 fps，BGR8Packed 仅约 6 fps
@@ -70,14 +76,19 @@ class HikCameraPublisher(Node):
         self._shutter_us = 5000.0
         self._gain_db = 0.0
         self._ae_window = []
-        # 软件 Gamma LUT（硬件 Gamma 节点只读，0x80000106）
-        if self.gamma > 0 and self.gamma != 1.0:
-            inv = 1.0 / self.gamma
-            self._gamma_lut = np.array(
-                [int(np.clip(255 * np.power(i / 255.0, inv), 0, 255))
-                 for i in range(256)], dtype=np.uint8)
-        else:
-            self._gamma_lut = None
+        self.wb_trim = [float(x) for x in
+                        str(self.get_parameter("wb_trim").value).split(",")]
+        self.saturation_gain = float(self.get_parameter("saturation_gain").value)
+        # 合成 LUT：每通道 = 静态白平衡微调 ∘ Gamma（均为逐通道映射，零额外开销）
+        inv = 1.0 / self.gamma if self.gamma > 0 else 1.0
+        ramp = np.arange(256, dtype=np.float64) / 255.0
+        lut = np.empty((256, 1, 3), dtype=np.uint8)
+        for c in range(3):
+            g = self.wb_trim[c] if len(self.wb_trim) == 3 else 1.0
+            v = 255.0 * g * np.power(ramp, inv)
+            lut[:, 0, c] = np.clip(v, 0, 255).astype(np.uint8)
+        self._gamma_lut = lut if (inv != 1.0 or any(
+            abs(x - 1.0) > 1e-3 for x in self.wb_trim)) else None
         self.pixel_format = self.get_parameter("pixel_format").value
         self.timeout_ms = self.get_parameter("timeout_ms").value
         self.log_every = self.get_parameter("log_every").value
@@ -134,6 +145,9 @@ class HikCameraPublisher(Node):
                 self.gamma,
                 "Continuous" if self.auto_white_balance else "Off",
             )
+            + "，WB微调={} 饱和度={:.2f}".format(
+                self.wb_trim, self.saturation_gain,
+            )
         )
 
     def _tune_exposure(self, mean):
@@ -184,9 +198,15 @@ class HikCameraPublisher(Node):
                     self._tune_exposure(
                         sum(self._ae_window) / len(self._ae_window))
                     self._ae_window = []
-            # 软件 Gamma 校正（硬件节点只读，用 LUT 实现）
+            # 软件 Gamma 校正（硬件节点只读，用 LUT 实现；WB 微调已并入 LUT）
             if self._gamma_lut is not None:
                 image = cv2.LUT(image, self._gamma_lut)
+            # 饱和度提升：new = s*img + (1-s)*gray，保亮度只提彩度
+            s = self.saturation_gain
+            if s > 1.01:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                gray = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+                image = cv2.addWeighted(image, s, gray, 1.0 - s, 0)
             # 取帧阻塞期间可能已收到 Ctrl-C，避免关闭后再发布
             if not rclpy.ok():
                 break
