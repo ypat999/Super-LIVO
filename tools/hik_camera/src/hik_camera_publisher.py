@@ -52,7 +52,7 @@ class HikCameraPublisher(Node):
         self.declare_parameter("wb_trim", "1.075,1.0,0.942")
         # 饱和度增益：new = s*img + (1-s)*gray（保亮度提彩度）。
         # 相机端 Saturation/Hue/Contrast 节点均不存在，只能主机侧做。
-        self.declare_parameter("saturation_gain", 1.4)
+        self.declare_parameter("saturation_gain", 1.6)
         # 自动白平衡：修正工业相机默认 WB Off 在 LED/阴天下偏青黄
         self.declare_parameter("auto_white_balance", True)
         # USB2 带宽有限：BayerGB8 约 15 fps，BGR8Packed 仅约 6 fps
