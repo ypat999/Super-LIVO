@@ -24,6 +24,10 @@ find_package(super_livo_common REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io kdtree)
 # 公共代码库 Super-LIO：本包只"引用"其资源（库级链接，不做话题级回灌）
 find_package(super_lio REQUIRED)
+# super_lio::lio 的 INTERFACE 带 OpenMP::OpenMP_CXX（pclomp 并行 GICP），
+# 下游作用域必须自行 find_package 才能拿到该 imported target，
+# 否则 CMake 退化成 -lOpenMP::OpenMP_CXX 字面量导致链接失败。
+find_package(OpenMP REQUIRED)
 
 # ---- 方案 A 算法库 ---------------------------------------------------------
 add_library(${PROJECT_NAME} SHARED

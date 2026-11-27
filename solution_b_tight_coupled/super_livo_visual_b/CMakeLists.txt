@@ -23,6 +23,8 @@ find_package(super_livo_common REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io)
 # 公共代码库 Super-LIO：本包只"引用"其资源（库级链接，不做话题级回灌）
 find_package(super_lio REQUIRED)
+# 同方案 A：lio 的 INTERFACE 依赖 OpenMP::OpenMP_CXX，需在本作用域建立 target
+find_package(OpenMP REQUIRED)
 
 # ---- 方案 B 算法库 ---------------------------------------------------------
 add_library(${PROJECT_NAME} SHARED
