@@ -58,7 +58,7 @@
 
     # 迭代 ESKF（必须显式写：ROSWrapper 声明默认值是 0 / false，
     # max_iterations=0 会让观测更新循环一次都不执行 ⇒ 雷达零约束、纯 IMU 漂移）
-    lio.kf.kf_max_iterations: 4
+    lio.kf.kf_max_iterations: 8
     lio.kf.kf_align_gravity: true
 
     # ---- 视觉支路开关（本文件只带这几个，其余视觉参数在 visual_{a,b}_move.yaml）----
