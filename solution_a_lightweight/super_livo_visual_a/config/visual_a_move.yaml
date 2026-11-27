@@ -99,6 +99,10 @@
           # 退出时仍写一份完整合并图。两者任一 >0 即进入分片模式。
           save_interval_frames: 0
           shard_interval_sec: 5.0
+          # 体素中位色回填（0=关闭，生产默认）。开启时同体素内所有点被写成同一
+          # 颜色，1 cm 格内色标准差被压到 0，肉眼表现为纹理发糊/字迹不清；
+          # 与 params.yaml、visual_b 一致关闭，保留逐点原色。
+          median_voxel_size: 0.0
           # 未染色点云（视场外/遮挡/等图超时帧）按同一节奏写 uncolored_%05zu.pcd
           # （灰色），退出时写 super_livo_visual_a_uncolored.pcd；
           # 与彩色分片并集≈全部进入管线的点云，便于离线拼接查看完整几何。
