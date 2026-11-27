@@ -30,9 +30,12 @@ bool RgbAssigner::assign(const cv::Mat& bgr,
     return static_cast<float>(px[is_bgr ? c : 0]);
   };
   const int over_thr = options_.overexposed_min;
+  // 亮背景（过曝天空）判定：取"最小通道"而不是三通道同时超限。
+  // 海康 ACE 经 WB trim（R×0.971）+ Gamma 后 R 通道封顶在 245~249，
+  // "三通道同时 >250" 实测整帧只有 0.01% 像素成立，等于过滤器失效；
+  // 改看最小通道后，天空（min 235~254）可稳定识别，白墙/玻璃/地面几乎零误伤。
   auto overexposed = [&](float pb, float pg, float pr) {
-    return pb > static_cast<float>(over_thr) && pg > static_cast<float>(over_thr) &&
-           pr > static_cast<float>(over_thr);
+    return std::min({pb, pg, pr}) > static_cast<float>(over_thr);
   };
 
   float b = 0.0F;

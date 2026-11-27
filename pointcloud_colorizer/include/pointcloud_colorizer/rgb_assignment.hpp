@@ -35,9 +35,11 @@ class RgbAssigner {
     /// 邻域均值时，与中心色任一通道差超过该值的像素不参与（跨颜色边缘剔除）。
     float patch_color_tol{20.0F};
 
-    /// 过曝过滤：R/G/B 三通道全部 > 该值的像素视为饱和，不参与采样
+    /// 亮背景（过曝天空）过滤：min(R,G,B) > 该值的像素视为无效，不参与采样
     /// （双线性邻点剔除+权重归一、patch 均值跳过、结果兜底）。0=关闭。
-    int overexposed_min{250};
+    /// 用最小通道而非三通道同时超限：本相机 R 通道封顶 ~249，三通道判定永不触发。
+    /// 225 实测可滤掉 ~82% 天空像素，白色立面误伤约 3%。
+    int overexposed_min{225};
   };
 
   explicit RgbAssigner(const Options& options);

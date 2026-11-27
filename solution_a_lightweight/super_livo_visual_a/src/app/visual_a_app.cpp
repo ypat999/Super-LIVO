@@ -190,9 +190,9 @@ superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
   opt.colorizer.rgb.patch_radius = getOrDeclare<int>(node, vp("color.patch_radius"), 0);
   opt.colorizer.rgb.patch_color_tol =
       getOrDeclare<float>(node, vp("color.patch_color_tol"), 20.0F);
-  // 过曝过滤：RGB 三通道全 > 该值的像素不染色（0=关）。过曝点转投未染色地图。
+  // 亮背景过滤：min(R,G,B) > 该值的像素不染色（0=关）。天空点转投未染色地图。
   opt.colorizer.rgb.overexposed_min =
-      getOrDeclare<int>(node, vp("color.overexposed_min"), 250);
+      getOrDeclare<int>(node, vp("color.overexposed_min"), 225);
 
   // ---- 落盘 ----
   opt.pcd_save_dir =
