@@ -47,9 +47,9 @@ class HikCameraPublisher(Node):
         self.declare_parameter("gamma", 1.5)
         # 静态白平衡微调（B,G,R 通道增益）：抵消 AWB 在大面积绿叶等
         # 非灰场景下的偏暖漂移。相机端无 BalanceRatio 节点，只能主机侧做。
-        # 默认值由户外屋顶帧实测反推（水泥墙灰参考 R180/G170/B158 →
-        # R×0.942 B×1.075 归中；树林绿主导像素 5.2%→36.4%）。
-        self.declare_parameter("wb_trim", "1.075,1.0,0.942")
+        # 默认值由户外屋顶帧实测反推（水泥墙灰参考 R180/G170/B158），
+        # 全量校正（R×0.942 B×1.075）偏蓝，按用户反馈减半。
+        self.declare_parameter("wb_trim", "1.038,1.0,0.971")
         # 饱和度增益：new = s*img + (1-s)*gray（保亮度提彩度）。
         # 相机端 Saturation/Hue/Contrast 节点均不存在，只能主机侧做。
         self.declare_parameter("saturation_gain", 1.6)
