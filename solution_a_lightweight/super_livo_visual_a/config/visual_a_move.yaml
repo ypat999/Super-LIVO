@@ -101,6 +101,11 @@
           # 每个彩色分片附带同编号去畸变相机帧 frame_%05zu.jpg（与 colored_%05zu.pcd
           # 一一对应），用于核对色温/曝光/视场覆盖。
           save_frame: true
+          # 未染色点云最近邻染色：退出时每个未染色点在彩色地图中找最近彩色点，
+          # 距离 <= max_dist（默认 10cm）借其色写入结果、超界的点不写入，另存
+          # super_livo_visual_a_nn_colored.pcd（不影响上面两个整图）。
+          nn_color_transfer: true
+          nn_color_transfer_max_dist: 0.10
 
         # 轨迹 / 图像落盘（参照 FAST-LIVO2 的 evo / image_save）
         #   轨迹：<save_dir>/<seq_name>.txt，TUM 格式

@@ -11,6 +11,8 @@
 
 #include <Eigen/Eigenvalues>
 #include <Eigen/Geometry>
+
+#include "super_livo_visual_a/color/nn_color_transfer.hpp"
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -839,6 +841,8 @@ void VisualPipeline::shutdownAndSave() {
     // 这一步必须在本进程内完成，不能交给 save 线程（进程退出时线程被杀）。
     saveColoredMap();
     saveUncoloredMap();
+    // 未染色地图最近邻染色（半径内借彩色地图的色）后另存一份。
+    saveNNColoredMap();
     if (pose_file_.is_open()) {
       pose_file_.flush();
       pose_file_.close();
@@ -1743,6 +1747,41 @@ void VisualPipeline::saveUncoloredMap() {
                              std::to_string(uncolored_map_.size()) + " 点，世界系）");
   } else {
     logThrottled("pcd_save_uncolored", 5000, LogLevel::kWarn, "保存 PCD 失败: " + path);
+  }
+}
+
+void VisualPipeline::saveNNColoredMap() {
+  if (!opt_.nn_color_transfer || uncolored_map_.empty()) {
+    return;
+  }
+  if (colored_map_.empty()) {
+    logThrottled("nn_color", 5000, LogLevel::kWarn,
+                 "NN 染色跳过：彩色地图为空，无处借色");
+    return;
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(opt_.pcd_save_dir, ec);
+  if (ec) {
+    return;
+  }
+  pcl::PointCloud<pcl::PointXYZRGB> dyed;
+  const auto stats = transferNNColor(colored_map_, uncolored_map_,
+                                     opt_.nn_color_transfer_max_dist, dyed);
+  const std::string path =
+      (std::filesystem::path(opt_.pcd_save_dir) / "super_livo_visual_a_nn_colored.pcd")
+          .string();
+  dyed.width = static_cast<std::uint32_t>(dyed.size());
+  dyed.height = 1;
+  dyed.is_dense = false;
+  if (pcl::io::savePCDFileBinary(path, dyed) == 0) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "NN 染色点云已保存: %s（借色 %zu/%zu 点写入，其余超 %.3f m 未写入）",
+                  path.c_str(), stats.colored, stats.total,
+                  opt_.nn_color_transfer_max_dist);
+    log(LogLevel::kInfo, buf);
+  } else {
+    logThrottled("pcd_save_nn", 5000, LogLevel::kWarn, "保存 PCD 失败: " + path);
   }
 }
 
