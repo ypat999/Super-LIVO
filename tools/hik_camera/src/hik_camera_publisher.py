@@ -34,12 +34,17 @@ class HikCameraPublisher(Node):
         self.declare_parameter("auto_exposure", True)
         self.declare_parameter("exposure_min_us", 100.0)
         self.declare_parameter("exposure_max_us", 3000.0)
+        # AE 模式：camera=相机内置（测光目标固件写死 ~128，无补偿节点）；
+        # software=自研闭环（raw mean 反馈调快门/增益，目标可调）。
+        # 固件实测无 ExposureAutoAdjustTarget/ExposureCompensation/AOI-AE，
+        # 想"硬件降曝光+Gamma 提回"必须走 software。
+        self.declare_parameter("ae_mode", "software")
+        self.declare_parameter("ae_target_mean", 88.0)      # 闭环目标（≈-0.5EV）
+        self.declare_parameter("ae_shutter_min_us", 100.0)
+        self.declare_parameter("ae_shutter_max_us", 9900.0)  # 10Hz 触发周期内
+        self.declare_parameter("ae_gain_max_db", 16.0)
         # Gamma > 1 提亮中间调、压缩高光（硬件节点只读，用软件 LUT 实现）
         self.declare_parameter("gamma", 1.5)
-        # 曝光目标系数：固件无 ExposureAutoAdjustTarget/ExposureCompensation 节点
-        # （实测 0x80000109），软件预乘等效降 AE 目标（0.7≈-0.5EV）。
-        # 与 Gamma 合成一条曲线：高光压回、暗部提起、中间调基本不变。
-        self.declare_parameter("exposure_target_scale", 0.7)
         # 自动白平衡：修正工业相机默认 WB Off 在 LED/阴天下偏青黄
         self.declare_parameter("auto_white_balance", True)
         # USB2 带宽有限：BayerGB8 约 15 fps，BGR8Packed 仅约 6 fps
@@ -56,15 +61,20 @@ class HikCameraPublisher(Node):
         self.exposure_min_us = self.get_parameter("exposure_min_us").value
         self.exposure_max_us = self.get_parameter("exposure_max_us").value
         self.gamma = self.get_parameter("gamma").value
-        self.exposure_target_scale = self.get_parameter("exposure_target_scale").value
         self.auto_white_balance = self.get_parameter("auto_white_balance").value
-        # 软件色调曲线：out = 255 × (in/255 × k)^(1/γ)，k=目标系数、γ=Gamma
-        k = self.exposure_target_scale
-        if (self.gamma > 0 and self.gamma != 1.0) or (0 < k < 1.0):
-            inv = 1.0 / self.gamma if self.gamma > 0 else 1.0
+        self.ae_mode = self.get_parameter("ae_mode").value
+        self.ae_target = float(self.get_parameter("ae_target_mean").value)
+        self.ae_shutter_min = float(self.get_parameter("ae_shutter_min_us").value)
+        self.ae_shutter_max = float(self.get_parameter("ae_shutter_max_us").value)
+        self.ae_gain_max = float(self.get_parameter("ae_gain_max_db").value)
+        self._shutter_us = 5000.0
+        self._gain_db = 0.0
+        self._ae_window = []
+        # 软件 Gamma LUT（硬件 Gamma 节点只读，0x80000106）
+        if self.gamma > 0 and self.gamma != 1.0:
+            inv = 1.0 / self.gamma
             self._gamma_lut = np.array(
-                [int(np.clip(255 * np.power(np.clip(i / 255.0 * k, 0.0, 1.0), inv),
-                             0, 255))
+                [int(np.clip(255 * np.power(i / 255.0, inv), 0, 255))
                  for i in range(256)], dtype=np.uint8)
         else:
             self._gamma_lut = None
@@ -87,31 +97,65 @@ class HikCameraPublisher(Node):
 
     def start(self):
         self.cam = hik.open_camera(self.camera_index)
+        # software 闭环自己管快门/增益：相机内置 AE 必须关，否则两边抢执行器
+        use_cam_ae = self.auto_exposure and self.ae_mode != "software"
         hik.configure_camera(
             self.cam,
             trigger=self.trigger,
             exposure_us=self.exposure_us,
             pixel_format=self.pixel_format,
-            auto_exposure=self.auto_exposure,
+            auto_exposure=use_cam_ae,
             exposure_min_us=self.exposure_min_us,
             exposure_max_us=self.exposure_max_us,
             gamma=self.gamma,
             auto_white_balance=self.auto_white_balance,
         )
+        if self.ae_mode == "software":
+            # 以当前固定曝光值起步；增益从 0 起
+            from MvImport.MvCameraControl_class import MVCC_FLOATVALUE
+            import ctypes
+            v = MVCC_FLOATVALUE()
+            ctypes.memset(ctypes.byref(v), 0, ctypes.sizeof(v))
+            if self.cam.MV_CC_GetFloatValue("ExposureTime", v) == 0 and v.fCurValue > 0:
+                self._shutter_us = float(v.fCurValue)
+            self._gain_db = 0.0
+            self.cam.MV_CC_SetFloatValue("Gain", self._gain_db)
         self.buffer, self.payload_size = hik.start_grabbing(self.cam)
 
         self.get_logger().info(
-            "相机已启动，发布到 {}（模式：{}，采集格式：{}，发布编码：bgr8，曝光：{}，Gamma={}，target_scale={}，AWB={}）".format(
+            "相机已启动，发布到 {}（模式：{}，采集格式：{}，发布编码：bgr8，曝光：{}，Gamma={}，AWB={}）".format(
                 self.topic,
                 "Line2 硬件触发" if self.trigger else "free-run",
                 self.pixel_format,
-                "AE 100-3000us" if self.auto_exposure
-                else "固定 {:.0f}us".format(self.exposure_us),
+                "软件闭环 目标{:.0f}".format(self.ae_target)
+                if self.ae_mode == "software"
+                else ("相机AE" if self.auto_exposure
+                      else "固定 {:.0f}us".format(self.exposure_us)),
                 self.gamma,
-                self.exposure_target_scale,
                 "Continuous" if self.auto_white_balance else "Off",
             )
         )
+
+    def _tune_exposure(self, mean):
+        """软件闭环：raw mean 反馈，先调快门、快门到限再调增益。"""
+        if mean <= 1.0:
+            return
+        err = max(0.4, min(2.5, self.ae_target / mean))  # >1 偏暗需加曝光
+        s = self._shutter_us * (err ** 0.7)
+        s = max(self.ae_shutter_min, min(self.ae_shutter_max, s))
+        if abs(s - self._shutter_us) > self._shutter_us * 0.05:
+            self.cam.MV_CC_SetFloatValue("ExposureTime", s)
+            self._shutter_us = s
+            return
+        # 快门已贴限：用增益继续逼近
+        g = self._gain_db
+        if self._shutter_us >= self.ae_shutter_max * 0.95 and err > 1.15:
+            g = min(self.ae_gain_max, self._gain_db + 2.0)
+        elif self._shutter_us <= self.ae_shutter_min * 1.05 and err < 0.87:
+            g = max(0.0, self._gain_db - 2.0)
+        if abs(g - self._gain_db) > 0.1:
+            self.cam.MV_CC_SetFloatValue("Gain", g)
+            self._gain_db = g
 
     def spin(self):
         count = 0
@@ -132,6 +176,14 @@ class HikCameraPublisher(Node):
             if image is None:
                 self.get_logger().warn("获取到空图像")
                 continue
+            # 软件闭环 AE：用 LUT 前的 raw 灰度均值反馈，每 10 帧调一次（≈1 s）
+            if self.ae_mode == "software":
+                self._ae_window.append(float(cv2.cvtColor(
+                    image, cv2.COLOR_BGR2GRAY).mean()))
+                if len(self._ae_window) >= 10:
+                    self._tune_exposure(
+                        sum(self._ae_window) / len(self._ae_window))
+                    self._ae_window = []
             # 软件 Gamma 校正（硬件节点只读，用 LUT 实现）
             if self._gamma_lut is not None:
                 image = cv2.LUT(image, self._gamma_lut)
@@ -201,8 +253,11 @@ class HikCameraPublisher(Node):
                     host_ts_str = f", host_ts={host_ts_ns} ({readable})"
 
                 self.get_logger().info(
-                    "已发布 {} 帧 ({}x{}, {:.1f} fps{}{})".format(
-                        count, width, height, fps, dev_interval_str, host_ts_str
+                    "已发布 {} 帧 ({}x{}, {:.1f} fps{}{}{})".format(
+                        count, width, height, fps, dev_interval_str, host_ts_str,
+                        ", 快门={:.0f}us 增益={:.1f}dB".format(
+                            self._shutter_us, self._gain_db)
+                        if self.ae_mode == "software" else ""
                     )
                 )
 
