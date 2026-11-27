@@ -47,10 +47,12 @@ class HikCameraPublisher(Node):
         self.declare_parameter("gamma", 1.5)
         # 静态白平衡微调（B,G,R 通道增益）：抵消 AWB 在大面积绿叶等
         # 非灰场景下的偏暖漂移。相机端无 BalanceRatio 节点，只能主机侧做。
-        self.declare_parameter("wb_trim", "1.04,1.0,0.96")
+        # 默认值由户外屋顶帧实测反推（水泥墙灰参考 R180/G170/B158 →
+        # R×0.942 B×1.075 归中；树林绿主导像素 5.2%→36.4%）。
+        self.declare_parameter("wb_trim", "1.075,1.0,0.942")
         # 饱和度增益：new = s*img + (1-s)*gray（保亮度提彩度）。
         # 相机端 Saturation/Hue/Contrast 节点均不存在，只能主机侧做。
-        self.declare_parameter("saturation_gain", 1.3)
+        self.declare_parameter("saturation_gain", 1.4)
         # 自动白平衡：修正工业相机默认 WB Off 在 LED/阴天下偏青黄
         self.declare_parameter("auto_white_balance", True)
         # USB2 带宽有限：BayerGB8 约 15 fps，BGR8Packed 仅约 6 fps
