@@ -21,7 +21,7 @@ KillSignal=SIGINT
 # 默认 control-group 会让 systemd 给 cgroup 内所有进程同时发 SIGINT，顺序失效。
 KillMode=process
 # 退出收尾：合并整图 + 中位数回填 + NN 染色（千万点级实测 x86 约 3 min），给足余量
-TimeoutStopSec=600
+TimeoutStopSec=0
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
