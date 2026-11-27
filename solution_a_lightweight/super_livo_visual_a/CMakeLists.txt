@@ -19,10 +19,15 @@ find_package(pcl_conversions REQUIRED)
 find_package(pointcloud_colorizer REQUIRED)
 # A/B 共用算法：退化签名映射、各向异性先验、重投影方差模型（头文件库）
 find_package(super_livo_common REQUIRED)
-# 落盘彩色地图 PCD 需要 PCL io 组件（libpcl_io）
-find_package(PCL REQUIRED COMPONENTS common io)
+# 落盘彩色地图 PCD 需要 PCL io 组件（libpcl_io）；
+# NN 染色最近邻搜索需要 kdtree 组件（libpcl_kdtree）
+find_package(PCL REQUIRED COMPONENTS common io kdtree)
 # 公共代码库 Super-LIO：本包只"引用"其资源（库级链接，不做话题级回灌）
 find_package(super_lio REQUIRED)
+# super_lio::lio 的 INTERFACE 带 OpenMP::OpenMP_CXX（pclomp 并行 GICP），
+# 下游作用域必须自行 find_package 才能拿到该 imported target，
+# 否则 CMake 退化成 -lOpenMP::OpenMP_CXX 字面量导致链接失败。
+find_package(OpenMP REQUIRED)
 
 # ---- 方案 A 算法库 ---------------------------------------------------------
 add_library(${PROJECT_NAME} SHARED
@@ -50,6 +55,7 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
 # （旧多 node 时代的 visual_a_node / visual_a_node_main 已删除。）
 add_library(${PROJECT_NAME}_pipeline SHARED
   src/pipeline/visual_pipeline.cpp
+  src/color/nn_color_transfer.cpp
 )
 target_include_directories(${PROJECT_NAME}_pipeline PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -74,11 +80,21 @@ target_include_directories(visual_a_app PRIVATE
 target_link_libraries(visual_a_app ${PROJECT_NAME} ${PROJECT_NAME}_pipeline ${PCL_LIBRARIES} super_lio::lio)
 ament_target_dependencies(visual_a_app rclcpp sensor_msgs nav_msgs geometry_msgs cv_bridge pcl_conversions pointcloud_colorizer)
 
+# ---- 独立最近邻染色工具（纯 PCL，不依赖 ROS） --------------------------------
+# 对历史落盘的 super_livo_visual_a_colored.pcd / _uncolored.pcd 离线补做
+# NN 染色；与退出时管线内走的 transferNNColor 同一实现。
+add_executable(nn_color_transfer_app src/tools/nn_color_transfer_app.cpp)
+target_include_directories(nn_color_transfer_app PRIVATE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  ${PCL_INCLUDE_DIRS}
+)
+target_link_libraries(nn_color_transfer_app ${PROJECT_NAME}_pipeline ${PCL_LIBRARIES})
+
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME}
 )
-install(TARGETS ${PROJECT_NAME} ${PROJECT_NAME}_pipeline visual_a_app
+install(TARGETS ${PROJECT_NAME} ${PROJECT_NAME}_pipeline visual_a_app nn_color_transfer_app
   EXPORT ${PROJECT_NAME}Targets
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib

@@ -17,8 +17,11 @@ WorkingDirectory=/home/ztl
 ExecStart=/bin/bash /home/ztl/visual_a_live.sh
 # SIGINT 才会走 shutdownAndSave()（写最终合并彩色图），SIGTERM 由 rclcpp 一并处理
 KillSignal=SIGINT
-# 退出时合并几百万点 + 中位数回填需要数秒
-TimeoutStopSec=90
+# 只信号主脚本：停止顺序（先雷达/相机、后 visual_a_app 收尾落盘）由脚本 trap 编排；
+# 默认 control-group 会让 systemd 给 cgroup 内所有进程同时发 SIGINT，顺序失效。
+KillMode=process
+# 退出收尾：合并整图 + 中位数回填 + NN 染色（千万点级实测 x86 约 3 min），给足余量
+TimeoutStopSec=0
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535

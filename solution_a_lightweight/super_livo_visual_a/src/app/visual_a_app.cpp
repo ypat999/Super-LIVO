@@ -190,9 +190,9 @@ superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
   opt.colorizer.rgb.patch_radius = getOrDeclare<int>(node, vp("color.patch_radius"), 0);
   opt.colorizer.rgb.patch_color_tol =
       getOrDeclare<float>(node, vp("color.patch_color_tol"), 20.0F);
-  // 过曝过滤：RGB 三通道全 > 该值的像素不染色（0=关）。过曝点转投未染色地图。
+  // 亮背景过滤：min(R,G,B) > 该值的像素不染色（0=关）。天空点转投未染色地图。
   opt.colorizer.rgb.overexposed_min =
-      getOrDeclare<int>(node, vp("color.overexposed_min"), 250);
+      getOrDeclare<int>(node, vp("color.overexposed_min"), 225);
 
   // ---- 落盘 ----
   opt.pcd_save_dir =
@@ -213,6 +213,11 @@ superlivo_a::VisualPipelineOptions loadPipelineOptions(rclcpp::Node& node) {
   opt.save_uncolored = getOrDeclare<bool>(node, vp("pcd.save_uncolored"), true);
   // 每个彩色分片附带同编号的去畸变相机帧 frame_%05zu.jpg，默认开。
   opt.save_frame_jpg = getOrDeclare<bool>(node, vp("pcd.save_frame"), true);
+  // 未染色点云最近邻染色：退出时每个未染色点在彩色地图中找最近彩色点，
+  // 半径内借其色、超界保留灰色，另存 super_livo_visual_a_nn_colored.pcd。
+  opt.nn_color_transfer = getOrDeclare<bool>(node, vp("pcd.nn_color_transfer"), true);
+  opt.nn_color_transfer_max_dist =
+      getOrDeclare<double>(node, vp("pcd.nn_color_transfer_max_dist"), 0.10);
 
   // ---- 轨迹 / 图像落盘（与 FAST-LIVO2 的 evo / image_save 同口径） ----
   // 轨迹：<evo.save_dir>/<evo.seq_name>.txt，TUM 格式，每行

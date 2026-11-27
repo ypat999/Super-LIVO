@@ -8,9 +8,12 @@
 #   DECIMATE=2 ./visual_a_live.sh         # VIO 抽帧（1/2/4，默认 4）
 #   SHARD_SEC=5 ./visual_a_live.sh        # 彩色分片间隔（秒，默认 5）
 #
-# 停止：Ctrl-C（SIGINT 才会触发最终整图合并落盘），不要 kill -9。
+# 停止：Ctrl-C / systemctl stop（SIGINT 才会触发最终整图合并落盘），不要 kill -9。
+#   停止顺序：先停雷达+相机腾出 CPU，再 SIGINT visual_a_app 跑合并整图 + NN 染色。
 # 产物：<out>/colored_00000.pcd ...（每 SHARD_SEC 秒一片增量）
 #       <out>/super_livo_visual_a_colored.pcd（退出时合并全图）
+#       <out>/super_livo_visual_a_uncolored.pcd（未染色全图）
+#       <out>/super_livo_visual_a_nn_colored.pcd（未染色点最近邻借色，半径内无则留灰）
 #       <out>/app.log
 # ============================================================================
 # 注意：不要开 `set -u`，ROS 的 setup.bash 里有未定义变量引用，会直接退出。
@@ -20,7 +23,7 @@ LIVOX=/home/ztl/PointPanoramaTex/livox_driver2
 HIK=/home/ztl/PointPanoramaTex/hik_camera
 
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-93}
-DECIMATE=${DECIMATE:-4}          # VIO 抽帧：4 ≈ 2.5 Hz（着色吞吐最好）
+DECIMATE=${DECIMATE:-10}         # VIO 抽帧：10 ≈ 1 Hz（前端 130ms/帧太重，降载防雷达积压丢帧）
 FILTER_RATE=${FILTER_RATE:-5}    # LIO 配准抽点，3→5 可把 LIO 提到约 9.6 Hz
 SHARD_SEC=${SHARD_SEC:-5.0}
 OUT=${1:-/home/ztl/slam_data/output/live_$(date +%m%d_%H%M%S)}
@@ -112,7 +115,22 @@ tail -n +1 -F "$LOG" 2>/dev/null &
 TAIL_PID=$!
 
 APP_PID=
-trap '[ -n "$APP_PID" ] && kill -INT "$APP_PID" 2>/dev/null' INT TERM
+
+# 停止顺序编排（配合 service 的 KillMode=process，systemd 只信号本脚本）：
+# 先停雷达+相机腾出 CPU/网络，再 SIGINT visual_a_app 走 shutdownAndSave()
+# （合并整图 + NN 染色），全程独占全核。若仍是默认 KillMode=control-group，
+# systemd 会给整个 cgroup 同时发 SIGINT，这里的顺序就形同虚设。
+stop_sensors() {
+  pkill -INT -f '[l]ivox_ros_driver2_node' 2>/dev/null
+  pkill -INT -f '[m]sg_MID360_launch' 2>/dev/null
+  pkill -INT -f '[h]ik_camera_publisher\.py' 2>/dev/null
+  sleep 2
+  # 实测 livox 驱动收 SIGINT 后 10 s 不退出，直接兜底强杀，别占着 CPU
+  pkill -9 -f '[l]ivox_ros_driver2_node' 2>/dev/null
+  pkill -9 -f '[m]sg_MID360_launch' 2>/dev/null
+  pkill -9 -f '[h]ik_camera_publisher\.py' 2>/dev/null
+}
+trap 'stop_sensors; [ -n "$APP_PID" ] && kill -INT "$APP_PID" 2>/dev/null' INT TERM
 
 ros2 run super_livo_visual_a visual_a_app --ros-args \
   --params-file "$ROOT/common/super_livo_common/config/lio_move.yaml" \

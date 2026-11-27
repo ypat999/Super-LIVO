@@ -134,6 +134,12 @@ struct VisualPipelineOptions {
   /// 每个彩色分片同时落盘移交时刻的最新去畸变帧：frame_%05zu.jpg（与
   /// colored_%05zu.pcd 同编号），便于核对色温/曝光/视场覆盖。
   bool save_frame_jpg{true};
+  /// 退出时对未染色地图做最近邻染色：每个未染色点在彩色地图中找最近彩色点，
+  /// 距离 <= nn_color_transfer_max_dist 则借用其色写入结果，超界的点不写入
+  /// （nn 图只含借色成功的点），另存 super_livo_visual_a_nn_colored.pcd。
+  bool nn_color_transfer{true};
+  /// 最近邻染色搜索半径上限（米），默认 10 cm。
+  double nn_color_transfer_max_dist{0.10};
 
   // ---- 轨迹 / 图像落盘（参照 FAST-LIVO2 的 evo / image_save 开关） ----
   /// 轨迹输出开关：TUM 格式（timestamp tx ty tz qx qy qz qw），
@@ -296,6 +302,9 @@ class VisualPipeline {
                        const ColorSnapshot& snap);
   void saveColoredMap();
   void saveUncoloredMap();
+  /// 未染色地图最近邻染色后另存 super_livo_visual_a_nn_colored.pcd
+  /// （在 saveColoredMap/saveUncoloredMap 之后调用，复用已回填中位色的彩色地图）。
+  void saveNNColoredMap();
   void savePose(const Eigen::Matrix4d& T_wl, double stamp);
   void saveImage(const cv::Mat& bgr, double stamp);
   void publishColoredCloud(const std::vector<colorizer::ColoredPoint>& points, double stamp);
