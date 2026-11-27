@@ -177,11 +177,15 @@ def configure_camera(
                 )
             except RuntimeError:
                 print("[WARN] {} 不可设置（固件不支持），AE 快门不夹范围".format(node))
-        # 增益锁死：防止自动增益引入噪点和帧间亮度跳变
+        # 自动增益：暗光下快门到顶后继续提亮（CB013 增益上限 16.4dB≈ISO660）。
+        # 代价是帧间亮度可能跳变 + 噪点，用户确认接受（"太暗"优先）。
         try:
-            set_enum_string(cam, "GainAuto", "Off")
+            set_enum_string(cam, "GainAuto", "Continuous")
         except RuntimeError:
-            pass
+            try:
+                set_enum_string(cam, "GainAuto", "Off")
+            except RuntimeError:
+                pass
         # Gamma > 1 提亮中间调、压缩高光，缓解"又暗又过曝"的高动态场景
         # MV-CB013 固件 Gamma 节点只读（0x80000106），改用软件 Gamma（publisher 内 LUT）
         if gamma > 1.0:
